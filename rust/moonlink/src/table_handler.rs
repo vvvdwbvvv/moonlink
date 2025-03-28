@@ -13,9 +13,9 @@ use tokio::time::{self, Duration};
 #[derive(Debug)]
 pub enum TableEvent {
     /// Append a row to the table
-    Append { primary_key: i64, row: TableRow },
+    Append { row: TableRow },
     /// Delete a row from the table
-    Delete { primary_key: i64, lsn: u64 },
+    Delete { row: TableRow, lsn: u64 },
     /// Commit all pending operations with a given LSN
     Commit { lsn: u64 },
     /// Prepare the table for reading
@@ -90,14 +90,14 @@ impl TableHandler {
                 // Process events from the queue
                 Some(event) = event_receiver.recv() => {
                     match event {
-                        TableEvent::Append { primary_key, row } => {
-                            if let Err(e) = table.append(primary_key, row) {
+                        TableEvent::Append { row } => {
+                            if let Err(e) = table.append(row) {
                                 println!("Append failed: {}", e);
                             }
                         }
 
-                        TableEvent::Delete { primary_key, lsn } => {
-                            table.delete(primary_key, lsn);
+                        TableEvent::Delete { row, lsn } => {
+                            table.delete(row, lsn);
                         }
 
                         TableEvent::Commit { lsn } => {
@@ -234,10 +234,7 @@ mod tests {
         };
 
         event_sender
-            .send(TableEvent::Append {
-                primary_key: 1,
-                row: row1,
-            })
+            .send(TableEvent::Append { row: row1 })
             .await
             .unwrap();
 
@@ -315,41 +312,29 @@ mod tests {
         let event_sender = handler.get_event_sender();
 
         // Test append operations - add multiple rows
-        let rows = vec![
-            (
-                1,
-                TableRow {
-                    values: vec![
-                        Cell::I32(1),
-                        Cell::String("John".to_string()),
-                        Cell::I32(30),
-                    ],
-                },
-            ),
-            (
-                2,
-                TableRow {
-                    values: vec![
-                        Cell::I32(2),
-                        Cell::String("Jane".to_string()),
-                        Cell::I32(25),
-                    ],
-                },
-            ),
-            (
-                3,
-                TableRow {
-                    values: vec![Cell::I32(3), Cell::String("Bob".to_string()), Cell::I32(40)],
-                },
-            ),
+        let rows: Vec<TableRow> = vec![
+            TableRow {
+                values: vec![
+                    Cell::I32(1),
+                    Cell::String("John".to_string()),
+                    Cell::I32(30),
+                ],
+            },
+            TableRow {
+                values: vec![
+                    Cell::I32(2),
+                    Cell::String("Jane".to_string()),
+                    Cell::I32(25),
+                ],
+            },
+            TableRow {
+                values: vec![Cell::I32(3), Cell::String("Bob".to_string()), Cell::I32(40)],
+            },
         ];
 
         // Send append events for all rows
-        for (primary_key, row) in rows {
-            event_sender
-                .send(TableEvent::Append { primary_key, row })
-                .await
-                .unwrap();
+        for row in rows {
+            event_sender.send(TableEvent::Append { row }).await.unwrap();
         }
 
         // Commit the appended rows

@@ -1,7 +1,6 @@
 use crate::table_handler::{TableEvent, TableEventSender, TableHandler};
 use crate::util::table_schema_to_arrow_schema;
 use async_trait::async_trait;
-use pg_replicate::conversions::Cell;
 use pg_replicate::{
     conversions::{cdc_event::CdcEvent, table_row::TableRow},
     pipeline::{
@@ -71,17 +70,7 @@ impl BatchSink for Sink {
     ) -> Result<(), Self::Error> {
         let event_sender = self.event_senders.get_mut(&table_id).unwrap();
         for row in rows {
-            if let Cell::I64(id) = row.values[0] {
-                event_sender
-                    .send(TableEvent::Append {
-                        primary_key: id,
-                        row,
-                    })
-                    .await
-                    .unwrap();
-            } else {
-                eprintln!("Invalid primary key type: {:?}", row.values[0]);
-            }
+            event_sender.send(TableEvent::Append { row }).await.unwrap();
         }
         event_sender
             .send(TableEvent::Commit { lsn: 0 })
@@ -122,18 +111,11 @@ impl BatchSink for Sink {
                         );
                     }
                     table_id_in_transaction = Some(table_id);
-                    if let Cell::I64(id) = table_row.values[0] {
-                        let event_sender = self.event_senders.get_mut(&table_id).unwrap();
-                        event_sender
-                            .send(TableEvent::Append {
-                                primary_key: (id),
-                                row: (table_row),
-                            })
-                            .await
-                            .unwrap();
-                    } else {
-                        println!("Invalid primary key type: {:?}", table_row.values[0]);
-                    }
+                    let event_sender = self.event_senders.get_mut(&table_id).unwrap();
+                    event_sender
+                        .send(TableEvent::Append { row: (table_row) })
+                        .await
+                        .unwrap();
                 }
                 CdcEvent::Update((table_id, old_table_row, new_table_row)) => {
                     if let Some(prev_id) = table_id_in_transaction {
@@ -143,28 +125,20 @@ impl BatchSink for Sink {
                         );
                     }
                     table_id_in_transaction = Some(table_id);
-                    if let Cell::I64(id) = old_table_row.as_ref().unwrap().values[0] {
-                        let event_sender = self.event_senders.get_mut(&table_id).unwrap();
-                        event_sender
-                            .send(TableEvent::Delete {
-                                primary_key: (id),
-                                lsn: (lsn_in_transaction.unwrap()),
-                            })
-                            .await
-                            .unwrap();
-                        event_sender
-                            .send(TableEvent::Append {
-                                primary_key: (id),
-                                row: (new_table_row),
-                            })
-                            .await
-                            .unwrap();
-                    } else {
-                        println!(
-                            "Invalid primary key type: {:?}",
-                            old_table_row.as_ref().unwrap().values[0]
-                        );
-                    }
+                    let event_sender = self.event_senders.get_mut(&table_id).unwrap();
+                    event_sender
+                        .send(TableEvent::Delete {
+                            row: (old_table_row.unwrap()),
+                            lsn: (lsn_in_transaction.unwrap()),
+                        })
+                        .await
+                        .unwrap();
+                    event_sender
+                        .send(TableEvent::Append {
+                            row: (new_table_row),
+                        })
+                        .await
+                        .unwrap();
                 }
                 CdcEvent::Delete((table_id, table_row)) => {
                     if let Some(prev_id) = table_id_in_transaction {
@@ -174,18 +148,14 @@ impl BatchSink for Sink {
                         );
                     }
                     table_id_in_transaction = Some(table_id);
-                    if let Cell::I64(id) = table_row.values[0] {
-                        let event_sender = self.event_senders.get_mut(&table_id).unwrap();
-                        event_sender
-                            .send(TableEvent::Delete {
-                                primary_key: (id),
-                                lsn: (lsn_in_transaction.unwrap()),
-                            })
-                            .await
-                            .unwrap();
-                    } else {
-                        println!("Invalid primary key type: {:?}", table_row.values[0]);
-                    }
+                    let event_sender = self.event_senders.get_mut(&table_id).unwrap();
+                    event_sender
+                        .send(TableEvent::Delete {
+                            row: (table_row),
+                            lsn: (lsn_in_transaction.unwrap()),
+                        })
+                        .await
+                        .unwrap();
                 }
                 CdcEvent::Relation(relation_body) => println!("Relation {relation_body:?}"),
                 CdcEvent::Type(type_body) => println!("Type {type_body:?}"),

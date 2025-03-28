@@ -1,16 +1,16 @@
 use crate::error::Result;
 use crate::storage::data_batches::{BatchEntry, ColumnStoreBuffer, CommitCheckPoint};
-use crate::storage::delete_buffer::{DeletionBuffer, DeletionRecord};
-use crate::storage::index::test_in_memory_index::MemIndex;
+use crate::storage::index::index_util::{create_index, Index};
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use pg_replicate::conversions::table_row::TableRow;
 use std::mem::swap;
 use std::sync::Arc;
 
+use super::index::index_util::RawDeletionRecord;
+
 /// MemSlice is a table slice that is stored in memory.
 /// It contains a column store buffer for storing data
-/// and a delete buffer for tracking deletions from the stream.
 ///
 /// MemSlice is Copy-On-Read
 /// Reader will create a snapshot of the current state of the table,
@@ -21,30 +21,25 @@ pub struct MemSlice {
     ///
     column_store: ColumnStoreBuffer,
 
-    /// Delete buffer for tracking deletions from the stream
-    ///
-    delete_buffer: DeletionBuffer,
-
     /// Mem index for the table
     ///
-    mem_index: MemIndex,
+    mem_index: Box<dyn Index>,
 }
 
 impl MemSlice {
     pub fn new(schema: Arc<Schema>, max_rows_per_buffer: usize) -> Self {
         Self {
             column_store: ColumnStoreBuffer::new(schema, max_rows_per_buffer),
-            delete_buffer: DeletionBuffer::new(),
-            mem_index: MemIndex::new(),
+            mem_index: create_index(),
         }
     }
 
-    pub fn delete(&mut self, primary_key: i64, lsn: u64) {
-        let pos: Option<(usize, usize)> = self.mem_index.remove(&primary_key).map(Into::into);
-        self.delete_buffer.delete(primary_key, pos, lsn);
-        if let Some(pos) = pos {
+    pub fn delete(&mut self, record: &RawDeletionRecord) -> Option<(usize, usize)> {
+        let res: Option<(usize, usize)> = self.mem_index.find_record(&record).map(Into::into);
+        if let Some(pos) = res {
             self.column_store.delete(pos);
         }
+        res
     }
 
     pub fn append(
@@ -64,20 +59,20 @@ impl MemSlice {
 
     pub fn flush(
         &mut self,
-    ) -> Result<(Option<(usize, Arc<RecordBatch>)>, Vec<BatchEntry>, MemIndex)> {
+    ) -> Result<(
+        Option<(usize, Arc<RecordBatch>)>,
+        Vec<BatchEntry>,
+        Box<dyn Index>,
+    )> {
         let batch = self.column_store.finalize_current_batch()?;
         let entries = self.column_store.flush();
-        let mut index = MemIndex::new();
+        let mut index = create_index();
         swap(&mut index, &mut self.mem_index);
         Ok((batch, entries, index))
     }
 
     pub fn get_commit_check_point(&self) -> CommitCheckPoint {
         self.column_store.get_commit_check_point()
-    }
-
-    pub fn get_deletions(&self, start_lsn: u64, end_lsn: u64) -> &[DeletionRecord] {
-        self.delete_buffer.get_deletions(start_lsn, end_lsn)
     }
 }
 
@@ -133,16 +128,32 @@ mod tests {
                 },
             )
             .unwrap();
-        mem_table.delete(2, 1);
-        mem_table.delete(3, 1);
-        mem_table.delete(1, 2);
-
-        println!("delete_buffer: {:?}", mem_table.delete_buffer);
-        println!("get_deletions: {:?}", mem_table.get_deletions(0, 1));
-        assert_eq!(mem_table.get_deletions(0, 0).len(), 0);
-        assert_eq!(mem_table.get_deletions(0, 1).len(), 2);
-        assert_eq!(mem_table.get_deletions(0, 2).len(), 3);
-
-        assert_eq!(mem_table.mem_index.len(), 0);
+        assert_eq!(
+            mem_table.delete(&RawDeletionRecord {
+                lookup_key: 2,
+                lsn: 0,
+                pos: None,
+                row_identity: None
+            }),
+            Some((0, 1))
+        );
+        assert_eq!(
+            mem_table.delete(&RawDeletionRecord {
+                lookup_key: 3,
+                lsn: 0,
+                pos: None,
+                row_identity: None
+            }),
+            Some((0, 2))
+        );
+        assert_eq!(
+            mem_table.delete(&RawDeletionRecord {
+                lookup_key: 1,
+                lsn: 0,
+                pos: None,
+                row_identity: None
+            }),
+            Some((0, 0))
+        );
     }
 }

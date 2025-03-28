@@ -1,9 +1,11 @@
-use super::index::index_util::RecordLocation;
-use super::index::test_in_memory_index::InMemoryIndex;
+use super::index::index_util::{create_index, get_lookup_key, Index};
 use crate::error::Result;
 use crate::storage::data_batches::{CommitCheckPoint, InMemoryBatch};
-use crate::storage::delete_buffer::{BatchDeletionVector, DeletionRecord};
+use crate::storage::delete_vector::BatchDeletionVector;
 use crate::storage::disk_slice::DiskSliceWriter;
+use crate::storage::index::index_util::{
+    ProcessedDeletionRecord, RawDeletionRecord, RecordLocation,
+};
 use crate::storage::mem_slice::MemSlice;
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
@@ -52,6 +54,8 @@ struct TableMetadata {
     config: TableConfig,
     /// storage path
     path: PathBuf,
+    /// function to get lookup key from row
+    pub(crate) get_lookup_key: fn(&TableRow) -> i64,
 }
 
 /// Snapshot contains state of the table at a given time.
@@ -65,7 +69,7 @@ pub struct Snapshot {
     /// Current snapshot version
     snapshot_version: u64,
     /// Index  UNDONE (UPDATE_DELETE) implement index for rows not in memslice
-    indices: InMemoryIndex,
+    _indices: Box<dyn Index>,
 }
 
 impl Snapshot {
@@ -74,7 +78,7 @@ impl Snapshot {
             metadata,
             disk_files: HashMap::new(),
             snapshot_version: 0,
-            indices: InMemoryIndex::new(),
+            _indices: create_index(),
         }
     }
 
@@ -93,7 +97,7 @@ pub struct SnapshotTask {
     /// Current task
     ///
     new_disk_slices: Vec<Arc<DiskSliceWriter>>,
-    new_deletions: Vec<DeletionRecord>,
+    new_deletions: Vec<RawDeletionRecord>,
     new_record_batches: Vec<(usize, Arc<RecordBatch>)>,
     new_rows: Vec<TableRow>,
     new_lsn: u64,
@@ -126,7 +130,7 @@ impl SnapshotTask {
         self.new_rows = take(&mut other.new_rows);
     }
 }
-pub struct SnapshotCreatorState {
+pub struct SnapshotTableState {
     /// Current snapshot
     current_snapshot: Snapshot,
 
@@ -140,8 +144,12 @@ pub struct SnapshotCreatorState {
     // Track uncommited disk files/ batches from big batch insert
 
     // UNDONE(UPDATE_DELETE):
-    // Track a log of commited position deletions on disk_files,
+    // Track a log of position deletions on disk_files,
     // since last iceberg snapshot
+    committed_deletion_log: Vec<ProcessedDeletionRecord>,
+    uncommitted_deletion_log: Vec<Option<ProcessedDeletionRecord>>,
+
+    // UNDONE(UPDATE_DELETE):u
     /// Last commit point
     last_commit: CommitCheckPoint,
 
@@ -150,7 +158,7 @@ pub struct SnapshotCreatorState {
     next_snapshot_task: SnapshotTask,
 }
 
-impl SnapshotCreatorState {
+impl SnapshotTableState {
     fn new(metadata: Arc<TableMetadata>) -> Self {
         let mut batches = BTreeMap::new();
         batches.insert(0, InMemoryBatch::new(metadata.config.batch_size));
@@ -162,6 +170,8 @@ impl SnapshotCreatorState {
                 batch_id: 0,
                 row_id: 0,
             },
+            committed_deletion_log: Vec::new(),
+            uncommitted_deletion_log: Vec::new(),
             next_snapshot_task: SnapshotTask::new(),
         }
     }
@@ -183,7 +193,7 @@ pub struct MooncakeTable {
     mem_slice: MemSlice,
 
     // Current snapshot of the table
-    snapshot: Arc<Mutex<SnapshotCreatorState>>,
+    snapshot: Arc<Mutex<SnapshotTableState>>,
     next_snapshot_task: SnapshotTask,
 }
 
@@ -193,25 +203,28 @@ impl MooncakeTable {
     pub fn new(schema: Schema, table_name: String, table_id: u64, path: PathBuf) -> Self {
         let table_config = TableConfig::new();
         let schema = Arc::new(schema);
+        let get_lookup_key = get_lookup_key;
         let metadata = Arc::new(TableMetadata {
             name: table_name,
             id: table_id,
             schema,
             config: table_config,
             path,
+            get_lookup_key,
         });
         let table = Self {
             mem_slice: MemSlice::new(metadata.schema.clone(), metadata.config.batch_size),
             metadata: metadata.clone(),
-            snapshot: Arc::new(Mutex::new(SnapshotCreatorState::new(metadata))),
+            snapshot: Arc::new(Mutex::new(SnapshotTableState::new(metadata))),
             next_snapshot_task: SnapshotTask::new(),
         };
 
         table
     }
 
-    pub fn append(&mut self, primary_key: i64, row: TableRow) -> Result<()> {
-        if let Some(batch) = self.mem_slice.append(primary_key, &row)? {
+    pub fn append(&mut self, row: TableRow) -> Result<()> {
+        let lookup_key = (self.metadata.get_lookup_key)(&row);
+        if let Some(batch) = self.mem_slice.append(lookup_key, &row)? {
             self.next_snapshot_task.new_record_batches.push(batch);
             self.next_snapshot_task.new_rows = vec![];
         }
@@ -219,8 +232,17 @@ impl MooncakeTable {
         Ok(())
     }
 
-    pub fn delete(&mut self, primary_key: i64, lsn: u64) {
-        self.mem_slice.delete(primary_key, lsn);
+    pub fn delete(&mut self, row: TableRow, lsn: u64) {
+        let lookup_key = (self.metadata.get_lookup_key)(&row);
+        let mut record = RawDeletionRecord {
+            lookup_key,
+            lsn,
+            pos: None,
+            row_identity: None,
+        };
+        let pos = self.mem_slice.delete(&record);
+        record.pos = pos;
+        self.next_snapshot_task.new_deletions.push(record);
     }
 
     pub fn commit(&mut self, lsn: u64) {
@@ -270,115 +292,9 @@ impl MooncakeTable {
         snapshot
             .next_snapshot_task
             .take_task(&mut self.next_snapshot_task);
-        if snapshot.next_snapshot_task.new_lsn > 0 {
-            let last_lsn = snapshot.current_snapshot.snapshot_version;
-            assert!(last_lsn < snapshot.next_snapshot_task.new_lsn);
-            snapshot.next_snapshot_task.new_deletions = self
-                .mem_slice
-                .get_deletions(last_lsn, snapshot.next_snapshot_task.new_lsn)
-                .to_vec();
-        }
 
         Some(spawn(Self::create_snapshot_async(self.snapshot.clone())))
     }
-
-    async fn create_snapshot_async(snapshot_state: Arc<Mutex<SnapshotCreatorState>>) {
-        let mut snapshot = snapshot_state.lock().unwrap();
-        let mut next_snapshot_task = SnapshotTask::new();
-        let batch_size = snapshot.current_snapshot.metadata.config.batch_size;
-        swap(&mut snapshot.next_snapshot_task, &mut next_snapshot_task);
-        if next_snapshot_task.new_record_batches.len() > 0 {
-            let new_batches = take(&mut next_snapshot_task.new_record_batches);
-            // previous unfinished batch is finished
-            assert!(snapshot.batches.values().last().unwrap().data.is_none());
-            assert!(snapshot.batches.keys().last().unwrap() == &new_batches.first().unwrap().0);
-            snapshot.batches.last_entry().unwrap().get_mut().data =
-                Some(new_batches.first().unwrap().1.clone());
-            // insert the last unfinished batch
-            let last_batch_id = new_batches.last().unwrap().0 + 1;
-            snapshot
-                .batches
-                .insert(last_batch_id, InMemoryBatch::new(batch_size));
-            // copy the rest of the batches
-
-            snapshot
-                .batches
-                .extend(new_batches.iter().skip(1).map(|(id, batch)| {
-                    (
-                        *id,
-                        InMemoryBatch {
-                            data: Some(batch.clone()),
-                            deletions: BatchDeletionVector::new(batch.num_rows()),
-                        },
-                    )
-                }));
-            snapshot.rows.clear();
-        }
-        if next_snapshot_task.new_disk_slices.len() > 0 {
-            let new_disk_slices = take(&mut next_snapshot_task.new_disk_slices);
-            new_disk_slices.iter().for_each(|slice| {
-                snapshot.current_snapshot.disk_files.extend(
-                    slice
-                        .output_files()
-                        .into_iter()
-                        .map(|file| (file.clone(), BatchDeletionVector::new(10))),
-                );
-                slice.input_batches().iter().for_each(|batch| {
-                    snapshot.batches.remove(&batch.id);
-                });
-            });
-        }
-        if next_snapshot_task.new_rows.len() > 0 {
-            let new_rows = take(&mut next_snapshot_task.new_rows);
-            snapshot.rows.extend(new_rows.into_iter());
-        }
-        if next_snapshot_task.new_deletions.len() > 0 {
-            let new_deletions = take(&mut next_snapshot_task.new_deletions);
-            // apply deletion records to deletion vectors
-            for deletion in new_deletions {
-                if deletion.pos.is_some() {
-                    let (batch_id, row_offset) = deletion.pos.unwrap();
-                    snapshot
-                        .batches
-                        .get_mut(&batch_id)
-                        .unwrap()
-                        .deletions
-                        .delete_row(row_offset);
-                } else {
-                    let pos = snapshot
-                        .current_snapshot
-                        .indices
-                        .lookup(deletion.primary_key);
-                    assert!(pos.is_some());
-                    match pos.unwrap() {
-                        RecordLocation::MemoryBatch(batch_id, row_offset) => {
-                            snapshot
-                                .batches
-                                .get_mut(&batch_id)
-                                .unwrap()
-                                .deletions
-                                .delete_row(row_offset);
-                        }
-                        RecordLocation::DiskFile(file_path, row_offset) => {
-                            snapshot
-                                .current_snapshot
-                                .disk_files
-                                .get_mut(&file_path)
-                                .unwrap()
-                                .delete_row(row_offset);
-                        }
-                    }
-                    // UNDONE(UPDATE_DELETE):
-                    todo!("Index for rows not in memory is not implemented yet");
-                }
-            }
-        }
-        if next_snapshot_task.new_lsn != 0 {
-            snapshot.last_commit = next_snapshot_task.new_commit_point.unwrap();
-            snapshot.current_snapshot.snapshot_version = next_snapshot_task.new_lsn;
-        }
-    }
-
     pub fn request_read(&self) -> Result<Vec<PathBuf>> {
         // UNDONE(UPDATE_DELETE):
         // return deletions since last iceberg snapshot
@@ -431,6 +347,119 @@ impl MooncakeTable {
             file_paths.push(file_path);
         }
         Ok(file_paths)
+    }
+
+    async fn create_snapshot_async(snapshot_state: Arc<Mutex<SnapshotTableState>>) {
+        let mut snapshot = snapshot_state.lock().unwrap();
+        let mut next_snapshot_task = SnapshotTask::new();
+        let batch_size = snapshot.current_snapshot.metadata.config.batch_size;
+        swap(&mut snapshot.next_snapshot_task, &mut next_snapshot_task);
+        if next_snapshot_task.new_record_batches.len() > 0 {
+            let new_batches = take(&mut next_snapshot_task.new_record_batches);
+            // previous unfinished batch is finished
+            assert!(snapshot.batches.values().last().unwrap().data.is_none());
+            assert!(snapshot.batches.keys().last().unwrap() == &new_batches.first().unwrap().0);
+            snapshot.batches.last_entry().unwrap().get_mut().data =
+                Some(new_batches.first().unwrap().1.clone());
+            // insert the last unfinished batch
+            let last_batch_id = new_batches.last().unwrap().0 + 1;
+            snapshot
+                .batches
+                .insert(last_batch_id, InMemoryBatch::new(batch_size));
+            // copy the rest of the batches
+
+            snapshot
+                .batches
+                .extend(new_batches.iter().skip(1).map(|(id, batch)| {
+                    (
+                        *id,
+                        InMemoryBatch {
+                            data: Some(batch.clone()),
+                            deletions: BatchDeletionVector::new(batch.num_rows()),
+                        },
+                    )
+                }));
+            snapshot.rows.clear();
+        }
+        if next_snapshot_task.new_disk_slices.len() > 0 {
+            let new_disk_slices = take(&mut next_snapshot_task.new_disk_slices);
+            new_disk_slices.iter().for_each(|slice| {
+                snapshot.current_snapshot.disk_files.extend(
+                    slice
+                        .output_files()
+                        .into_iter()
+                        .map(|file| (file.clone(), BatchDeletionVector::new(10))),
+                );
+                slice.input_batches().iter().for_each(|batch| {
+                    snapshot.batches.remove(&batch.id);
+                });
+            });
+        }
+        if next_snapshot_task.new_rows.len() > 0 {
+            let new_rows = take(&mut next_snapshot_task.new_rows);
+            snapshot.rows.extend(new_rows.into_iter());
+        }
+        Self::process_deletion_log(&mut snapshot, &mut next_snapshot_task);
+        if next_snapshot_task.new_lsn != 0 {
+            snapshot.last_commit = next_snapshot_task.new_commit_point.unwrap();
+            snapshot.current_snapshot.snapshot_version = next_snapshot_task.new_lsn;
+        }
+    }
+
+    fn commit_deletion(snapshot: &mut SnapshotTableState, deletion: ProcessedDeletionRecord) {
+        match deletion.pos {
+            RecordLocation::MemoryBatch(batch_id, offset) => {
+                snapshot
+                    .batches
+                    .get_mut(&batch_id)
+                    .unwrap()
+                    .deletions
+                    .delete_row(offset);
+            }
+            RecordLocation::DiskFile(_file_path, _offset) => {
+                todo!("Index for rows not in memory is not implemented yet");
+            }
+        }
+        snapshot.committed_deletion_log.push(deletion);
+    }
+    fn process_deletion_log(
+        snapshot: &mut SnapshotTableState,
+        next_snapshot_task: &mut SnapshotTask,
+    ) {
+        let mut new_commited_deletion = vec![];
+        snapshot.uncommitted_deletion_log.retain_mut(|deletion| {
+            if deletion.as_ref().unwrap().lsn <= next_snapshot_task.new_lsn {
+                new_commited_deletion.push(deletion.take().unwrap());
+                false
+            } else {
+                true
+            }
+        });
+        for deletion in new_commited_deletion {
+            Self::commit_deletion(snapshot, deletion);
+        }
+        // Move committed deletions (lsn <= new_lsn) to committed deletion log
+        // add raw deletion records, use index to find position and add to deletion buffer
+        let new_deletions = take(&mut next_snapshot_task.new_deletions);
+        // apply deletion records to deletion vectors
+        for deletion in new_deletions {
+            let processed_deletion = if deletion.pos.is_some() {
+                ProcessedDeletionRecord {
+                    lookup_key: deletion.lookup_key,
+                    pos: deletion.pos.unwrap().into(),
+                    lsn: deletion.lsn,
+                }
+            } else {
+                todo!("Search the index to find position of raw deletion record");
+            };
+            if deletion.lsn <= snapshot.current_snapshot.snapshot_version {
+                Self::commit_deletion(snapshot, processed_deletion);
+            } else {
+                snapshot
+                    .uncommitted_deletion_log
+                    .push(Some(processed_deletion));
+            }
+        }
     }
 }
 
@@ -504,8 +533,8 @@ mod tests {
         };
 
         // Append rows to the table
-        table.append(1, row1)?;
-        table.append(2, row2)?;
+        table.append(row1)?;
+        table.append(row2)?;
 
         // Commit the changes
         table.commit(1);
@@ -614,24 +643,32 @@ mod tests {
                 Cell::I32(25),
             ],
         };
-
         let row3 = TableRow {
             values: vec![Cell::I32(3), Cell::String("Bob".to_string()), Cell::I32(40)],
         };
 
-        table.append(1, row1)?;
-        table.append(2, row2)?;
+        table.append(row1)?;
+        table.append(row2)?;
 
         // 2. Test commit operation
         println!("Testing commit operation...");
         table.commit(1);
 
         // 3. Test delete operation
+
+        let row2: TableRow = TableRow {
+            values: vec![
+                Cell::I32(2),
+                Cell::String("Jane".to_string()),
+                Cell::I32(25),
+            ],
+        };
+
         println!("Testing delete operation...");
-        table.delete(2, 2);
+        table.delete(row2, 2);
 
         // Append another row after delete
-        table.append(3, row3)?;
+        table.append(row3)?;
 
         // Commit again
         table.commit(2);
@@ -670,14 +707,21 @@ mod tests {
             ],
         };
 
-        table.append(4, row4)?;
+        table.append(row4)?;
         // Commit
         table.commit(3);
 
-        table.append(5, row5)?;
+        table.append(row5)?;
 
+        let row4 = TableRow {
+            values: vec![
+                Cell::I32(4),
+                Cell::String("Alice".to_string()),
+                Cell::I32(35),
+            ],
+        };
         // Delete one of the new rows
-        table.delete(4, 4);
+        table.delete(row4, 4);
 
         // Testing snapshot before commit
         let snapshot_handle = table.create_snapshot().unwrap();
@@ -737,6 +781,7 @@ mod tests {
             schema: Arc::new(schema),
             config: TableConfig::new(),
             path: PathBuf::new(),
+            get_lookup_key: get_lookup_key,
         });
         let snapshot = Snapshot::new(metadata);
         snapshot.export_to_iceberg().await?;

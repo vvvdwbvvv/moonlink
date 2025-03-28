@@ -1,4 +1,4 @@
-use crate::storage::index::index_util::RecordLocation;
+use crate::storage::index::index_util::{Index, RawDeletionRecord, RecordLocation};
 use std::collections::HashMap;
 /// Type for primary keys
 pub type PrimaryKey = i64;
@@ -8,6 +8,15 @@ pub type MemIndex = HashMap<PrimaryKey, RecordLocation>; // key -> (batch_id, ro
 /// Index containing records in files
 pub type FileIndex = HashMap<PrimaryKey, RecordLocation>; // key -> (batch_id, row_offset)
 
+impl Index for MemIndex {
+    fn find_record(&self, raw_record: &RawDeletionRecord) -> Option<RecordLocation> {
+        self.get(&raw_record.lookup_key).cloned()
+    }
+
+    fn insert(&mut self, key: PrimaryKey, location: RecordLocation) {
+        self.insert(key, location);
+    }
+}
 /// A simple in-memory index that maps primary keys to record locations
 pub struct InMemoryIndex {
     /// Map for records in memory batches

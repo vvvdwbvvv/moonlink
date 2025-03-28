@@ -1,6 +1,6 @@
 use crate::error::Result;
 use crate::storage::column_array_builder::ColumnArrayBuilder;
-use crate::storage::delete_buffer::BatchDeletionVector;
+use crate::storage::delete_vector::BatchDeletionVector;
 use arrow::array::{ArrayRef, RecordBatch};
 use arrow::datatypes::Schema;
 use pg_replicate::conversions::table_row::TableRow;
