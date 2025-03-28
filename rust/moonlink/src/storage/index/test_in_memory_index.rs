@@ -1,4 +1,5 @@
-use crate::storage::index::index_util::{Index, RawDeletionRecord, RecordLocation};
+use crate::storage::index::index_util::Index;
+use crate::storage::table_utils::{RawDeletionRecord, RecordLocation};
 use std::collections::HashMap;
 /// Type for primary keys
 pub type PrimaryKey = i64;
@@ -76,7 +77,9 @@ impl InMemoryIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::table_utils::FileId;
     use std::path::PathBuf;
+    use std::sync::Arc;
     #[test]
     fn test_in_memory_index_basic() {
         let mut index = InMemoryIndex::new();
@@ -96,24 +99,19 @@ mod tests {
 
         // Insert file records as a batch
         let mut file_index = FileIndex::new();
-        file_index.insert(
-            4,
-            RecordLocation::DiskFile(PathBuf::from("file1.parquet"), 0),
-        );
-        file_index.insert(
-            5,
-            RecordLocation::DiskFile(PathBuf::from("file1.parquet"), 1),
-        );
+        let path = Arc::new(PathBuf::from("test.parquet"));
+        file_index.insert(4, RecordLocation::DiskFile(FileId(path.clone()), 0));
+        file_index.insert(5, RecordLocation::DiskFile(FileId(path.clone()), 1));
         index.insert_file_index(file_index);
 
         // Look up file records
         assert_eq!(
             index.lookup(4),
-            Some(RecordLocation::DiskFile(PathBuf::from("file1.parquet"), 0))
+            Some(RecordLocation::DiskFile(FileId(path.clone()), 0))
         );
         assert_eq!(
             index.lookup(5),
-            Some(RecordLocation::DiskFile(PathBuf::from("file1.parquet"), 1))
+            Some(RecordLocation::DiskFile(FileId(path.clone()), 1))
         );
     }
 }

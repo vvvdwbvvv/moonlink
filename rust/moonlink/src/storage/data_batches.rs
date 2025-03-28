@@ -1,6 +1,7 @@
 use crate::error::Result;
 use crate::storage::column_array_builder::ColumnArrayBuilder;
 use crate::storage::delete_vector::BatchDeletionVector;
+use crate::storage::table_utils::RecordLocation;
 use arrow::array::{ArrayRef, RecordBatch};
 use arrow::datatypes::Schema;
 use pg_replicate::conversions::table_row::TableRow;
@@ -41,15 +42,8 @@ impl InMemoryBatch {
 
 #[derive(Debug)]
 pub struct BatchEntry {
-    pub(crate) id: usize,
+    pub(crate) id: u64,
     pub(crate) batch: InMemoryBatch,
-}
-
-#[derive(Debug)]
-pub struct CommitCheckPoint {
-    /// commit point
-    pub(crate) batch_id: usize,
-    pub(crate) row_id: usize,
 }
 
 /// A streaming buffered writer for column-oriented data.
@@ -65,7 +59,7 @@ pub struct ColumnStoreBuffer {
     current_rows: Vec<Box<ColumnArrayBuilder>>,
     /// Start index of the unflushed batches
     _unflushed_batch_start: usize,
-    next_batch_id: usize,
+    next_batch_id: u64,
     /// Current row count in the current buffer
     current_row_count: usize,
 }
@@ -105,7 +99,7 @@ impl ColumnStoreBuffer {
     pub fn append_row(
         &mut self,
         row: &TableRow,
-    ) -> Result<(usize, usize, Option<(usize, Arc<RecordBatch>)>)> {
+    ) -> Result<(u64, usize, Option<(u64, Arc<RecordBatch>)>)> {
         let mut new_batch = None;
         // Check if we need to finalize the current batch
         if self.current_row_count >= self.max_rows_per_buffer {
@@ -126,7 +120,7 @@ impl ColumnStoreBuffer {
 
     /// Finalize the current batch, adding it to filled_batches and preparing for a new batch
     ///
-    pub fn finalize_current_batch(&mut self) -> Result<Option<(usize, Arc<RecordBatch>)>> {
+    pub fn finalize_current_batch(&mut self) -> Result<Option<(u64, Arc<RecordBatch>)>> {
         if self.current_row_count == 0 {
             return Ok(None);
         }
@@ -155,11 +149,15 @@ impl ColumnStoreBuffer {
         Ok(Some((self.next_batch_id - 1, batch)))
     }
 
-    pub fn delete(&mut self, (seg_idx, row_idx): (usize, usize)) {
-        self.in_memory_batches[seg_idx]
+    pub fn delete(&mut self, (batch_id, row_offset): (u64, usize)) {
+        let idx = self
+            .in_memory_batches
+            .binary_search_by_key(&batch_id, |x| x.id)
+            .unwrap();
+        self.in_memory_batches[idx]
             .batch
             .deletions
-            .delete_row(row_idx);
+            .delete_row(row_offset);
     }
 
     pub fn flush(&mut self) -> Vec<BatchEntry> {
@@ -174,11 +172,11 @@ impl ColumnStoreBuffer {
         (self.in_memory_batches.len() - 1) * self.max_rows_per_buffer + self.current_row_count
     }
 
-    pub fn get_commit_check_point(&self) -> CommitCheckPoint {
-        CommitCheckPoint {
-            batch_id: self.in_memory_batches.last().unwrap().id,
-            row_id: self.current_row_count,
-        }
+    pub fn get_commit_check_point(&self) -> RecordLocation {
+        RecordLocation::MemoryBatch(
+            self.in_memory_batches.last().unwrap().id,
+            self.current_row_count,
+        )
     }
 }
 

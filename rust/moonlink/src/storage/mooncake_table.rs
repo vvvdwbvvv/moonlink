@@ -1,12 +1,10 @@
 use super::index::index_util::{create_index, get_lookup_key, Index};
 use crate::error::Result;
-use crate::storage::data_batches::{CommitCheckPoint, InMemoryBatch};
+use crate::storage::data_batches::InMemoryBatch;
 use crate::storage::delete_vector::BatchDeletionVector;
 use crate::storage::disk_slice::DiskSliceWriter;
-use crate::storage::index::index_util::{
-    ProcessedDeletionRecord, RawDeletionRecord, RecordLocation,
-};
 use crate::storage::mem_slice::MemSlice;
+use crate::storage::table_utils::{ProcessedDeletionRecord, RawDeletionRecord, RecordLocation};
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
@@ -98,10 +96,10 @@ pub struct SnapshotTask {
     ///
     new_disk_slices: Vec<Arc<DiskSliceWriter>>,
     new_deletions: Vec<RawDeletionRecord>,
-    new_record_batches: Vec<(usize, Arc<RecordBatch>)>,
+    new_record_batches: Vec<(u64, Arc<RecordBatch>)>,
     new_rows: Vec<TableRow>,
     new_lsn: u64,
-    new_commit_point: Option<CommitCheckPoint>,
+    new_commit_point: Option<RecordLocation>,
 }
 
 impl SnapshotTask {
@@ -135,7 +133,7 @@ pub struct SnapshotTableState {
     current_snapshot: Snapshot,
 
     /// In memory RecordBatches
-    batches: BTreeMap<usize, InMemoryBatch>,
+    batches: BTreeMap<u64, InMemoryBatch>,
 
     /// Latest rows
     rows: Vec<TableRow>,
@@ -151,7 +149,7 @@ pub struct SnapshotTableState {
 
     // UNDONE(UPDATE_DELETE):u
     /// Last commit point
-    last_commit: CommitCheckPoint,
+    last_commit: RecordLocation,
 
     // Next snapshot task
     //
@@ -166,10 +164,7 @@ impl SnapshotTableState {
             current_snapshot: Snapshot::new(metadata),
             batches,
             rows: Vec::new(),
-            last_commit: CommitCheckPoint {
-                batch_id: 0,
-                row_id: 0,
-            },
+            last_commit: RecordLocation::MemoryBatch(0, 0),
             committed_deletion_log: Vec::new(),
             uncommitted_deletion_log: Vec::new(),
             next_snapshot_task: SnapshotTask::new(),
@@ -195,6 +190,10 @@ pub struct MooncakeTable {
     // Current snapshot of the table
     snapshot: Arc<Mutex<SnapshotTableState>>,
     next_snapshot_task: SnapshotTask,
+
+    // UNDONE(BATCH_INSERT):
+    // a memslice per transaction?
+    stream_write_mem_slices: HashMap<u64, MemSlice>,
 }
 
 impl MooncakeTable {
@@ -217,6 +216,7 @@ impl MooncakeTable {
             metadata: metadata.clone(),
             snapshot: Arc::new(Mutex::new(SnapshotTableState::new(metadata))),
             next_snapshot_task: SnapshotTask::new(),
+            stream_write_mem_slices: HashMap::new(),
         };
 
         table
@@ -252,6 +252,21 @@ impl MooncakeTable {
 
     pub fn should_flush(&self) -> bool {
         self.mem_slice.get_num_rows() >= self.metadata.config.batch_size
+    }
+
+    pub fn append_in_stream_batch(&mut self, row: TableRow, xact_id: u64) -> Result<()> {
+        todo!("Implement append in stream batch");
+    }
+    pub fn delete_in_stream_batch(&mut self, row: TableRow, xact_id: u64) -> Result<()> {
+        todo!("Implement delete in stream batch");
+    }
+
+    pub fn commit_in_stream_batch(&mut self, xact_id: u64) -> Result<()> {
+        todo!("Implement commit in stream batch");
+    }
+
+    pub fn abort_in_stream_batch(&mut self, xact_id: u64) -> Result<()> {
+        todo!("Implement abort in stream batch");
     }
 
     // UNDONE(BATCH_INSERT):
@@ -306,45 +321,56 @@ impl MooncakeTable {
             file_paths.push(file_path);
             return Ok(file_paths);
         }
-        if snapshot.last_commit.batch_id > 0 || snapshot.last_commit.row_id > 0 {
-            let schema = self.metadata.schema.clone();
-            let mut filtered_batches = Vec::new();
-            // add all batches
-            for (id, batch) in snapshot.batches.iter() {
-                if *id < snapshot.last_commit.batch_id {
-                    if let Some(batch) = batch.get_filtered_batch().unwrap() {
-                        filtered_batches.push(batch);
+        match &snapshot.last_commit {
+            RecordLocation::MemoryBatch(batch_id, row_id) => {
+                if *batch_id > 0 || *row_id > 0 {
+                    // add all batches
+                    let mut filtered_batches = Vec::new();
+                    let schema = self.metadata.schema.clone();
+                    for (id, batch) in snapshot.batches.iter() {
+                        if *id < *batch_id {
+                            if let Some(batch) = batch.get_filtered_batch().unwrap() {
+                                filtered_batches.push(batch);
+                            }
+                        } else if *id == *batch_id && *row_id > 0 {
+                            if batch.data.is_some() {
+                                let filtered_batch = batch
+                                    .get_filtered_batch_with_limit(*row_id)
+                                    .unwrap()
+                                    .unwrap();
+                                filtered_batches.push(filtered_batch);
+                            } else {
+                                let rows = &snapshot.rows[..*row_id];
+                                let deletions =
+                                    &snapshot.batches.values().last().unwrap().deletions;
+                                let batch = crate::storage::data_batches::create_batch_from_rows(
+                                    rows,
+                                    schema.clone(),
+                                    deletions,
+                                );
+                                filtered_batches.push(batch);
+                            }
+                        }
                     }
-                } else if *id == snapshot.last_commit.batch_id && snapshot.last_commit.row_id > 0 {
-                    if batch.data.is_some() {
-                        let filtered_batch = batch
-                            .get_filtered_batch_with_limit(snapshot.last_commit.row_id as usize)
-                            .unwrap()
-                            .unwrap();
-                        filtered_batches.push(filtered_batch);
-                    } else {
-                        let rows = &snapshot.rows[..snapshot.last_commit.row_id as usize];
-                        let deletions = &snapshot.batches.values().last().unwrap().deletions;
-                        let batch = crate::storage::data_batches::create_batch_from_rows(
-                            rows,
-                            schema.clone(),
-                            deletions,
-                        );
-                        filtered_batches.push(batch);
+
+                    // Build a parquet file from current record batches
+                    //
+                    let mut parquet_writer = ArrowWriter::try_new(
+                        std::fs::File::create(&file_path).unwrap(),
+                        schema,
+                        None,
+                    )
+                    .unwrap();
+                    for batch in filtered_batches.iter() {
+                        parquet_writer.write(batch)?;
                     }
+                    parquet_writer.close()?;
+                    file_paths.push(file_path);
                 }
             }
-
-            // Build a parquet file from current record batches
-            //
-            let mut parquet_writer =
-                ArrowWriter::try_new(std::fs::File::create(&file_path).unwrap(), schema, None)
-                    .unwrap();
-            for batch in filtered_batches.iter() {
-                parquet_writer.write(batch)?;
+            RecordLocation::DiskFile(_file_id, _offset) => {
+                panic!("Disk files should all be commited");
             }
-            parquet_writer.close()?;
-            file_paths.push(file_path);
         }
         Ok(file_paths)
     }
@@ -390,6 +416,9 @@ impl MooncakeTable {
                         .into_iter()
                         .map(|file| (file.clone(), BatchDeletionVector::new(10))),
                 );
+                // UNDONE(UPDATE_DELETE):
+                // remap all deletions on the input batches after flushing to the new disk slice
+                //
                 slice.input_batches().iter().for_each(|batch| {
                     snapshot.batches.remove(&batch.id);
                 });

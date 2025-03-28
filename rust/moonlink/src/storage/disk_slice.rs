@@ -1,13 +1,14 @@
 use crate::error::{Error, Result};
 use crate::storage::data_batches::BatchEntry;
+use crate::storage::table_utils::RecordLocation;
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
+use std::collections::HashMap;
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::Arc;
 use uuid::Uuid;
-
 pub struct DiskSliceWriter {
     /// The schema of the DiskSlice.
     ///
@@ -18,6 +19,8 @@ pub struct DiskSliceWriter {
     batches: Vec<BatchEntry>,
 
     writer_lsn: u64,
+
+    row_offset_mapping: HashMap<RecordLocation, RecordLocation>,
     /// The list of parquet files. These are immutable once the slice is created.
     ///
     files: Vec<PathBuf>,
@@ -42,6 +45,7 @@ impl DiskSliceWriter {
             batches,
             files: vec![],
             writer_lsn,
+            row_offset_mapping: HashMap::new(),
         }
     }
 

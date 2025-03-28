@@ -6,3 +6,4 @@ pub mod iceberg;
 pub mod index;
 pub mod mem_slice;
 pub mod mooncake_table;
+pub mod table_utils;

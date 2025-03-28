@@ -1,13 +1,12 @@
 use crate::error::Result;
-use crate::storage::data_batches::{BatchEntry, ColumnStoreBuffer, CommitCheckPoint};
+use crate::storage::data_batches::{BatchEntry, ColumnStoreBuffer};
 use crate::storage::index::index_util::{create_index, Index};
+use crate::storage::table_utils::{RawDeletionRecord, RecordLocation};
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use pg_replicate::conversions::table_row::TableRow;
 use std::mem::swap;
 use std::sync::Arc;
-
-use super::index::index_util::RawDeletionRecord;
 
 /// MemSlice is a table slice that is stored in memory.
 /// It contains a column store buffer for storing data
@@ -34,8 +33,8 @@ impl MemSlice {
         }
     }
 
-    pub fn delete(&mut self, record: &RawDeletionRecord) -> Option<(usize, usize)> {
-        let res: Option<(usize, usize)> = self.mem_index.find_record(&record).map(Into::into);
+    pub fn delete(&mut self, record: &RawDeletionRecord) -> Option<(u64, usize)> {
+        let res: Option<(u64, usize)> = self.mem_index.find_record(&record).map(Into::into);
         if let Some(pos) = res {
             self.column_store.delete(pos);
         }
@@ -46,7 +45,7 @@ impl MemSlice {
         &mut self,
         primary_key: i64,
         row: &TableRow,
-    ) -> Result<Option<(usize, Arc<RecordBatch>)>> {
+    ) -> Result<Option<(u64, Arc<RecordBatch>)>> {
         let (seg_idx, row_idx, new_batch) = self.column_store.append_row(row)?;
         self.mem_index
             .insert(primary_key, (seg_idx, row_idx).into());
@@ -60,7 +59,7 @@ impl MemSlice {
     pub fn flush(
         &mut self,
     ) -> Result<(
-        Option<(usize, Arc<RecordBatch>)>,
+        Option<(u64, Arc<RecordBatch>)>,
         Vec<BatchEntry>,
         Box<dyn Index>,
     )> {
@@ -71,7 +70,7 @@ impl MemSlice {
         Ok((batch, entries, index))
     }
 
-    pub fn get_commit_check_point(&self) -> CommitCheckPoint {
+    pub fn get_commit_check_point(&self) -> RecordLocation {
         self.column_store.get_commit_check_point()
     }
 }
