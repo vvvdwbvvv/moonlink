@@ -20,7 +20,7 @@ pub enum TableEvent {
     Commit { lsn: u64 },
     /// Prepare the table for reading
     PrepareRead {
-        response_channel: oneshot::Sender<Vec<PathBuf>>,
+        response_channel: oneshot::Sender<(Vec<PathBuf>, Vec<(usize, usize)>)>,
     },
     /// Flush the table to disk
     Flush { lsn: u64 },
@@ -124,13 +124,11 @@ impl TableHandler {
 
                             // Request read and return the file path
                             match table.request_read() {
-                                Ok(paths) => {
-                                    let _ = response_channel.send(paths);
+                                Ok((file_paths, deletions)) => {
+                                    let _ = response_channel.send((file_paths, deletions));
                                 }
                                 Err(e) => {
                                     println!("Failed to prepare read: {}", e);
-                                    // Return an empty path on error - caller will need to handle this
-                                    let _ = response_channel.send(Vec::new());
                                 }
                             }
                         }
@@ -258,7 +256,7 @@ mod tests {
 
         // Wait for the response
         match tokio::time::timeout(Duration::from_secs(1), rx).await {
-            Ok(Ok(paths)) => {
+            Ok(Ok((paths, _deletions))) => {
                 println!("Received snapshot paths: {:?}", paths);
 
                 if paths.is_empty() {
@@ -373,7 +371,7 @@ mod tests {
 
         // Wait for the response with a longer timeout to ensure it completes
         match tokio::time::timeout(Duration::from_secs(5), rx).await {
-            Ok(Ok(paths)) => {
+            Ok(Ok((paths, _deletions))) => {
                 println!("Received snapshot paths: {:?}", paths);
 
                 // Check if we received any paths

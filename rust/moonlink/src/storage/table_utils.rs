@@ -1,8 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-// UNDONE(UPDATE_DELETE):
-// Figure out the best way to handle file ids
+// UNDONE(UPDATE_DELETE): a better way to handle file ids
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileId(pub(crate) Arc<PathBuf>);
 
@@ -17,20 +16,27 @@ pub enum RecordLocation {
     DiskFile(FileId, usize),
 }
 
+impl RecordLocation {
+    pub fn new_disk_file(path: &PathBuf, row_offset: usize) -> Self {
+        RecordLocation::DiskFile(FileId(Arc::new(path.to_path_buf())), row_offset)
+    }
+}
+
+// UNDONE(REPLICATION IDENTITY):
 #[derive(Debug, Clone, PartialEq)]
 pub struct RecordIdentity {}
 
 #[derive(Clone, Debug)]
 pub struct RawDeletionRecord {
     pub(crate) lookup_key: i64,
-    pub(crate) row_identity: Option<RecordIdentity>,
+    pub(crate) _row_identity: Option<RecordIdentity>,
     pub(crate) pos: Option<(u64, usize)>,
     pub(crate) lsn: u64,
 }
 
 #[derive(Clone, Debug)]
 pub struct ProcessedDeletionRecord {
-    pub(crate) lookup_key: i64,
+    pub(crate) _lookup_key: i64,
     pub(crate) pos: RecordLocation,
     pub(crate) lsn: u64,
 }

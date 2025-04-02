@@ -23,7 +23,7 @@ impl BatchDeletionVector {
     }
 
     /// Mark a row as deleted
-    pub fn delete_row(&mut self, row_idx: usize) {
+    pub fn delete_row(&mut self, row_idx: usize) -> bool {
         // Set the bit at row_idx to 1 (deleted)
         if self.deletion_vector.is_none() {
             self.deletion_vector = Some(vec![0xFF; self.max_rows / 8 + 1]);
@@ -31,7 +31,11 @@ impl BatchDeletionVector {
                 bit_util::unset_bit(self.deletion_vector.as_mut().unwrap(), i);
             }
         }
-        bit_util::unset_bit(self.deletion_vector.as_mut().unwrap(), row_idx);
+        let exist = bit_util::get_bit(self.deletion_vector.as_ref().unwrap(), row_idx);
+        if exist {
+            bit_util::unset_bit(self.deletion_vector.as_mut().unwrap(), row_idx);
+        }
+        exist
     }
 
     /// Apply the deletion vector to filter a record batch
@@ -52,6 +56,15 @@ impl BatchDeletionVector {
         } else {
             !bit_util::get_bit(self.deletion_vector.as_ref().unwrap(), row_idx)
         }
+    }
+
+    pub fn collect_active_rows(&self) -> Vec<usize> {
+        let Some(bitmap) = &self.deletion_vector else {
+            return (0..self.max_rows).collect();
+        };
+        (0..self.max_rows)
+            .filter(move |i| bit_util::get_bit(bitmap, *i))
+            .collect()
     }
 }
 
@@ -113,5 +126,20 @@ mod tests {
         assert_eq!(filtered_ages.value(2), 50);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_into_iter() {
+        // Create a delete vector
+        let mut buffer = BatchDeletionVector::new(10);
+
+        // Delete rows 1, 3, and 8
+        buffer.delete_row(1);
+        buffer.delete_row(3);
+        buffer.delete_row(8);
+
+        // Check that the iterator returns those positions
+        let deleted_rows: Vec<usize> = buffer.collect_active_rows();
+        assert_eq!(deleted_rows, vec![0, 2, 4, 5, 6, 7, 9]);
     }
 }

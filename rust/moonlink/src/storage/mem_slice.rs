@@ -1,6 +1,6 @@
 use crate::error::Result;
 use crate::storage::data_batches::{BatchEntry, ColumnStoreBuffer};
-use crate::storage::index::index_util::{create_index, Index};
+use crate::storage::index::index_util::{Index, MemIndex};
 use crate::storage::table_utils::{RawDeletionRecord, RecordLocation};
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
@@ -22,23 +22,29 @@ pub struct MemSlice {
 
     /// Mem index for the table
     ///
-    mem_index: Box<dyn Index>,
+    mem_index: MemIndex,
 }
 
 impl MemSlice {
     pub fn new(schema: Arc<Schema>, max_rows_per_buffer: usize) -> Self {
         Self {
             column_store: ColumnStoreBuffer::new(schema, max_rows_per_buffer),
-            mem_index: create_index(),
+            mem_index: MemIndex::new(),
         }
     }
 
     pub fn delete(&mut self, record: &RawDeletionRecord) -> Option<(u64, usize)> {
-        let res: Option<(u64, usize)> = self.mem_index.find_record(&record).map(Into::into);
-        if let Some(pos) = res {
-            self.column_store.delete(pos);
+        let locations = self.mem_index.find_record(&record)?;
+
+        for location in locations {
+            // Clone the reference to create an owned copy
+            let location = location.clone();
+            let location_tuple: (u64, usize) = location.into();
+            if self.column_store.delete_if_exists(location_tuple) {
+                return Some(location_tuple);
+            }
         }
-        res
+        None
     }
 
     pub fn append(
@@ -58,14 +64,10 @@ impl MemSlice {
 
     pub fn flush(
         &mut self,
-    ) -> Result<(
-        Option<(u64, Arc<RecordBatch>)>,
-        Vec<BatchEntry>,
-        Box<dyn Index>,
-    )> {
+    ) -> Result<(Option<(u64, Arc<RecordBatch>)>, Vec<BatchEntry>, MemIndex)> {
         let batch = self.column_store.finalize_current_batch()?;
         let entries = self.column_store.flush();
-        let mut index = create_index();
+        let mut index = MemIndex::new();
         swap(&mut index, &mut self.mem_index);
         Ok((batch, entries, index))
     }
@@ -132,7 +134,7 @@ mod tests {
                 lookup_key: 2,
                 lsn: 0,
                 pos: None,
-                row_identity: None
+                _row_identity: None
             }),
             Some((0, 1))
         );
@@ -141,7 +143,7 @@ mod tests {
                 lookup_key: 3,
                 lsn: 0,
                 pos: None,
-                row_identity: None
+                _row_identity: None
             }),
             Some((0, 2))
         );
@@ -150,7 +152,7 @@ mod tests {
                 lookup_key: 1,
                 lsn: 0,
                 pos: None,
-                row_identity: None
+                _row_identity: None
             }),
             Some((0, 0))
         );

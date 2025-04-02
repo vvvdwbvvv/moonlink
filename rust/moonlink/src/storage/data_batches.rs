@@ -57,11 +57,10 @@ pub struct ColumnStoreBuffer {
     in_memory_batches: Vec<BatchEntry>,
     /// Current batch being built
     current_rows: Vec<Box<ColumnArrayBuilder>>,
-    /// Start index of the unflushed batches
-    _unflushed_batch_start: usize,
-    next_batch_id: u64,
     /// Current row count in the current buffer
     current_row_count: usize,
+    /// Next batch id, each batch is assigned a unique id
+    next_batch_id: u64,
 }
 
 impl ColumnStoreBuffer {
@@ -88,7 +87,6 @@ impl ColumnStoreBuffer {
             }],
             current_rows,
             current_row_count: 0,
-            _unflushed_batch_start: 0,
             next_batch_id: 0,
         }
     }
@@ -149,7 +147,7 @@ impl ColumnStoreBuffer {
         Ok(Some((self.next_batch_id - 1, batch)))
     }
 
-    pub fn delete(&mut self, (batch_id, row_offset): (u64, usize)) {
+    pub fn delete_if_exists(&mut self, (batch_id, row_offset): (u64, usize)) -> bool {
         let idx = self
             .in_memory_batches
             .binary_search_by_key(&batch_id, |x| x.id)
@@ -157,7 +155,7 @@ impl ColumnStoreBuffer {
         self.in_memory_batches[idx]
             .batch
             .deletions
-            .delete_row(row_offset);
+            .delete_row(row_offset)
     }
 
     pub fn flush(&mut self) -> Vec<BatchEntry> {

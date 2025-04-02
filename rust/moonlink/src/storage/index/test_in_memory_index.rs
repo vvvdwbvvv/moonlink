@@ -1,117 +1,110 @@
-use crate::storage::index::index_util::Index;
+use crate::storage::index::index_util::{Index, MemIndex, MooncakeIndex, ParquetFileIndex};
 use crate::storage::table_utils::{RawDeletionRecord, RecordLocation};
-use std::collections::HashMap;
-/// Type for primary keys
-pub type PrimaryKey = i64;
-
-/// Index containing records in memory
-pub type MemIndex = HashMap<PrimaryKey, RecordLocation>; // key -> (batch_id, row_offset)
-/// Index containing records in files
-pub type FileIndex = HashMap<PrimaryKey, RecordLocation>; // key -> (batch_id, row_offset)
-
+use std::sync::Arc;
 impl Index for MemIndex {
-    fn find_record(&self, raw_record: &RawDeletionRecord) -> Option<RecordLocation> {
-        self.get(&raw_record.lookup_key).cloned()
-    }
-
-    fn insert(&mut self, key: PrimaryKey, location: RecordLocation) {
-        self.insert(key, location);
+    fn find_record(&self, raw_record: &RawDeletionRecord) -> Option<Vec<&RecordLocation>> {
+        self.get_vec(&raw_record.lookup_key)
+            .map(|v| v.iter().collect())
     }
 }
-/// A simple in-memory index that maps primary keys to record locations
-pub struct InMemoryIndex {
-    /// Map for records in memory batches
-    memory_index: MemIndex,
 
-    /// Map for records in files that have been flushed to disk
-    /// Organized by file batch for efficient updates and lookups
-    file_indices: Vec<FileIndex>,
-}
-
-impl InMemoryIndex {
+// UNDONE(The index is just a placeholder, it is all in memory and not persisted)
+impl MooncakeIndex {
     /// Create a new, empty in-memory index
     pub fn new() -> Self {
         Self {
-            memory_index: HashMap::new(),
+            in_memory_index: None,
             file_indices: Vec::new(),
         }
     }
 
     /// Insert a memory index (batch of in-memory records)
     ///
-    /// This replaces the current memory index
-    pub fn insert_memory_index(&mut self, mem_index: MemIndex) {
-        assert!(self.memory_index.is_empty());
-        self.memory_index = mem_index;
+    pub fn insert_memory_index(&mut self, mem_index: Arc<MemIndex>) {
+        assert!(
+            self.in_memory_index.is_none(),
+            "Currently we don't allow multiple concurrent flushes,
+            so there should be only one memory index at a time"
+        );
+        self.in_memory_index = Some(mem_index);
     }
 
     pub fn delete_memory_index(&mut self) {
-        self.memory_index.clear();
+        self.in_memory_index = None;
     }
 
     /// Insert a file index (batch of on-disk records)
     ///
     /// This adds a new file index to the collection of file indices
-    pub fn insert_file_index(&mut self, file_index: FileIndex) {
+    pub fn insert_file_index(&mut self, file_index: ParquetFileIndex) {
         self.file_indices.push(file_index);
     }
+}
 
-    /// Look up a record location by primary key
-    /// Returns the location if found, None if the record doesn't exist
-    pub fn lookup(&self, key: PrimaryKey) -> Option<RecordLocation> {
-        if let Some(location) = self.memory_index.get(&key) {
-            return Some(location.clone());
-        }
-        // Finally check all file indices, from newest to oldest
-        for index in self.file_indices.iter().rev() {
-            if let Some(location) = index.get(&key) {
-                return Some(location.clone());
+impl Index for MooncakeIndex {
+    fn find_record(&self, raw_record: &RawDeletionRecord) -> Option<Vec<&RecordLocation>> {
+        let mut res = Vec::new();
+
+        // Check in-memory index
+        if self.in_memory_index.is_some() {
+            if let Some(locations) = self
+                .in_memory_index
+                .as_ref()
+                .unwrap()
+                .get_vec(&raw_record.lookup_key)
+            {
+                res.extend(locations.iter());
             }
         }
 
-        // Record not found
-        None
+        // Check file indices
+        for file_index_meta in &self.file_indices {
+            if let Some(locations) = file_index_meta.index.get_vec(&raw_record.lookup_key) {
+                res.extend(locations.iter());
+            }
+        }
+
+        if res.is_empty() {
+            None
+        } else {
+            Some(res)
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::table_utils::FileId;
-    use std::path::PathBuf;
-    use std::sync::Arc;
     #[test]
     fn test_in_memory_index_basic() {
-        let mut index = InMemoryIndex::new();
+        let mut index = MooncakeIndex::new();
 
         // Insert memory records as a batch
         let mut mem_index = MemIndex::new();
         mem_index.insert(1, RecordLocation::MemoryBatch(0, 5));
         mem_index.insert(2, RecordLocation::MemoryBatch(0, 10));
         mem_index.insert(3, RecordLocation::MemoryBatch(1, 3));
-        index.insert_memory_index(mem_index);
+        index.insert_memory_index(Arc::new(mem_index));
 
-        // Look up records
-        assert_eq!(index.lookup(1), Some(RecordLocation::MemoryBatch(0, 5)));
-        assert_eq!(index.lookup(2), Some(RecordLocation::MemoryBatch(0, 10)));
-        assert_eq!(index.lookup(3), Some(RecordLocation::MemoryBatch(1, 3)));
-        assert_eq!(index.lookup(4), None);
+        let record = RawDeletionRecord {
+            lookup_key: 1,
+            _row_identity: None,
+            pos: None,
+            lsn: 1,
+        };
 
-        // Insert file records as a batch
-        let mut file_index = FileIndex::new();
-        let path = Arc::new(PathBuf::from("test.parquet"));
-        file_index.insert(4, RecordLocation::DiskFile(FileId(path.clone()), 0));
-        file_index.insert(5, RecordLocation::DiskFile(FileId(path.clone()), 1));
-        index.insert_file_index(file_index);
+        // Test direct field access
+        let direct_locations = index
+            .in_memory_index
+            .as_ref()
+            .unwrap()
+            .get_vec(&record.lookup_key);
+        assert!(direct_locations.is_some());
+        assert_eq!(direct_locations.unwrap().len(), 1);
 
-        // Look up file records
-        assert_eq!(
-            index.lookup(4),
-            Some(RecordLocation::DiskFile(FileId(path.clone()), 0))
-        );
-        assert_eq!(
-            index.lookup(5),
-            Some(RecordLocation::DiskFile(FileId(path.clone()), 1))
-        );
+        // Test the Index trait implementation
+        let trait_locations = index.find_record(&record);
+        assert!(trait_locations.is_some());
+        assert_eq!(trait_locations.unwrap().len(), 1);
     }
 }
