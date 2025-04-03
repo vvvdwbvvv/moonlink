@@ -1,15 +1,11 @@
-mod error;
-mod sink;
-mod storage;
-mod table_handler;
-mod util;
+
 
 use pg_replicate::pipeline::{
     batching::{data_pipeline::BatchDataPipeline, BatchConfig},
     sources::postgres::{PostgresSource, TableNamesFrom},
     PipelineAction,
 };
-use sink::Sink;
+use moonlink_connectors::Sink;
 use std::{error::Error, time::Duration};
 
 async fn main_impl() -> Result<(), Box<dyn Error>> {

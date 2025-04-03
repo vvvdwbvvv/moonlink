@@ -1,9 +1,12 @@
-pub mod column_array_builder;
-pub mod data_batches;
-pub mod delete_vector;
-pub mod disk_slice;
-pub mod iceberg;
-pub mod index;
-pub mod mem_slice;
-pub mod mooncake_table;
-pub mod table_utils;
+mod column_array_builder;
+mod data_batches;
+mod delete_vector;
+mod disk_slice;
+mod iceberg;
+mod index;
+mod mem_slice;
+mod table_utils;
+mod mooncake_table;
+
+pub use disk_slice::DiskSliceWriter;
+pub use mooncake_table::MooncakeTable;

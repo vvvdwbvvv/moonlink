@@ -7,13 +7,11 @@ edition.workspace = true
 async-trait.workspace = true
 pg_replicate.workspace = true
 tokio.workspace = true
-tokio-postgres.workspace = true
 arrow.workspace = true
 thiserror.workspace = true
 parquet.workspace = true
 uuid.workspace = true
 futures.workspace = true
 multimap.workspace = true
-
 [dev-dependencies]
 tempfile.workspace = true

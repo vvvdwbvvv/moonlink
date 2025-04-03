@@ -1,5 +1,5 @@
-use crate::table_handler::{TableEvent, TableEventSender, TableHandler};
-use crate::util::table_schema_to_arrow_schema;
+use crate::postgres::util::table_schema_to_arrow_schema;
+use moonlink::{TableEvent, TableHandler};
 use async_trait::async_trait;
 use pg_replicate::{
     conversions::{cdc_event::CdcEvent, table_row::TableRow},
@@ -14,17 +14,19 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_postgres::types::PgLsn;
+use tokio::sync::mpsc::Sender;
+
 
 pub struct Sink {
     table_handlers: Arc<Mutex<HashMap<TableId, TableHandler>>>,
-    event_senders: HashMap<TableId, TableEventSender>,
+    event_senders: HashMap<TableId, Sender<TableEvent>>,
 }
 
 impl Sink {
     pub fn new() -> Self {
         let table_handlers: Arc<Mutex<HashMap<u32, TableHandler>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let event_senders: HashMap<TableId, TableEventSender> = HashMap::new();
+        let event_senders = HashMap::new();
         Self {
             table_handlers,
             event_senders,

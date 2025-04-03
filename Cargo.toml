@@ -1,6 +1,8 @@
 [workspace]
 members = [
     "rust/moonlink",
+    "rust/moonlink_connectors",
+    "rust/pg_moonlink_test",
 ]
 resolver = "2"
 

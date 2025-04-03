@@ -1,6 +1,6 @@
 use crate::error::Result;
-use crate::storage::disk_slice::DiskSliceWriter;
-use crate::storage::mooncake_table::MooncakeTable;
+use crate::storage::DiskSliceWriter;
+use crate::storage::MooncakeTable;
 use arrow::datatypes::Schema;
 use pg_replicate::conversions::table_row::TableRow;
 use std::path::PathBuf;
@@ -37,7 +37,6 @@ pub struct TableHandler {
     event_sender: Sender<TableEvent>,
 }
 
-pub type TableEventSender = Sender<TableEvent>;
 
 impl TableHandler {
     /// Create a new TableHandler for the given schema and table name
