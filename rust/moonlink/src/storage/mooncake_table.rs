@@ -1,5 +1,6 @@
 use super::index::index_util::{get_lookup_key, Index, MemIndex, MooncakeIndex};
 use crate::error::Result;
+use crate::row::MoonlinkRow;
 use crate::storage::data_batches::InMemoryBatch;
 use crate::storage::delete_vector::BatchDeletionVector;
 use crate::storage::disk_slice::DiskSliceWriter;
@@ -8,7 +9,6 @@ use crate::storage::table_utils::{ProcessedDeletionRecord, RawDeletionRecord, Re
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
-use pg_replicate::conversions::table_row::TableRow;
 use std::collections::{BTreeMap, HashMap};
 use std::mem::{swap, take};
 use std::path::{Path, PathBuf};
@@ -53,7 +53,7 @@ struct TableMetadata {
     /// storage path
     path: PathBuf,
     /// function to get lookup key from row
-    pub(crate) get_lookup_key: fn(&TableRow) -> i64,
+    pub(crate) get_lookup_key: fn(&MoonlinkRow) -> i64,
 }
 
 /// Snapshot contains state of the table at a given time.
@@ -97,7 +97,7 @@ pub struct SnapshotTask {
     new_disk_slices: Vec<DiskSliceWriter>,
     new_deletions: Vec<RawDeletionRecord>,
     new_record_batches: Vec<(u64, Arc<RecordBatch>)>,
-    new_rows: Vec<TableRow>,
+    new_rows: Vec<MoonlinkRow>,
     new_mem_indices: Vec<Arc<MemIndex>>,
     new_lsn: u64,
     new_commit_point: Option<RecordLocation>,
@@ -139,7 +139,7 @@ pub struct SnapshotTableState {
     batches: BTreeMap<u64, InMemoryBatch>,
 
     /// Latest rows
-    rows: Vec<TableRow>,
+    rows: Vec<MoonlinkRow>,
 
     // UNDONE(BATCH_INSERT):
     // Track uncommited disk files/ batches from big batch insert
@@ -200,16 +200,15 @@ pub struct MooncakeTable {
 impl MooncakeTable {
     /// foreground functions
     ///
-    pub fn new(schema: Schema, table_name: String, table_id: u64, path: PathBuf) -> Self {
+    pub fn new(schema: Schema, name: String, version: u64, base_path: PathBuf) -> Self {
         let table_config = TableConfig::new();
         let schema = Arc::new(schema);
-        let get_lookup_key = get_lookup_key;
         let metadata = Arc::new(TableMetadata {
-            name: table_name,
-            id: table_id,
+            name,
+            id: version,
             schema,
             config: table_config,
-            path,
+            path: base_path,
             get_lookup_key,
         });
         let table = Self {
@@ -223,7 +222,7 @@ impl MooncakeTable {
         table
     }
 
-    pub fn append(&mut self, row: TableRow) -> Result<()> {
+    pub fn append(&mut self, row: MoonlinkRow) -> Result<()> {
         let lookup_key = (self.metadata.get_lookup_key)(&row);
         if let Some(batch) = self.mem_slice.append(lookup_key, &row)? {
             self.next_snapshot_task.new_record_batches.push(batch);
@@ -233,7 +232,7 @@ impl MooncakeTable {
         Ok(())
     }
 
-    pub fn delete(&mut self, row: TableRow, lsn: u64) {
+    pub fn delete(&mut self, row: MoonlinkRow, lsn: u64) {
         let lookup_key = (self.metadata.get_lookup_key)(&row);
         let mut record = RawDeletionRecord {
             lookup_key,
@@ -255,11 +254,11 @@ impl MooncakeTable {
         self.mem_slice.get_num_rows() >= self.metadata.config.batch_size
     }
 
-    pub fn _append_in_stream_batch(&mut self, _row: TableRow, _xact_id: u64) -> Result<()> {
+    pub fn _append_in_stream_batch(&mut self, _row: MoonlinkRow, _xact_id: u64) -> Result<()> {
         todo!("Implement append in stream batch");
     }
 
-    pub fn _delete_in_stream_batch(&mut self, _row: TableRow, _xact_id: u64) -> Result<()> {
+    pub fn _delete_in_stream_batch(&mut self, _row: MoonlinkRow, _xact_id: u64) -> Result<()> {
         todo!("Implement delete in stream batch");
     }
 
@@ -588,10 +587,10 @@ impl MooncakeTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::row::RowValue;
     use arrow::array::{Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-    use pg_replicate::conversions::Cell;
     use std::collections::HashSet;
     use std::fs::create_dir_all;
     use std::fs::File;
@@ -637,21 +636,17 @@ mod tests {
             MooncakeTable::new(schema, "flush_test_table".to_string(), 1, test_dir.clone());
 
         // Append some rows
-        let row1 = TableRow {
-            values: vec![
-                Cell::I32(1),
-                Cell::String("John".to_string()),
-                Cell::I32(30),
-            ],
-        };
+        let row1 = MoonlinkRow::new(vec![
+            RowValue::Int32(1),
+            RowValue::ByteArray("John".as_bytes().to_vec()),
+            RowValue::Int32(30),
+        ]);
 
-        let row2 = TableRow {
-            values: vec![
-                Cell::I32(2),
-                Cell::String("Jane".to_string()),
-                Cell::I32(25),
-            ],
-        };
+        let row2 = MoonlinkRow::new(vec![
+            RowValue::Int32(2),
+            RowValue::ByteArray("Jane".as_bytes().to_vec()),
+            RowValue::Int32(25),
+        ]);
 
         // Append rows to the table
         table.append(row1)?;
@@ -749,24 +744,22 @@ mod tests {
         println!("Testing append operations...");
 
         // Append some rows
-        let row1 = TableRow {
-            values: vec![
-                Cell::I32(1),
-                Cell::String("John".to_string()),
-                Cell::I32(30),
-            ],
-        };
+        let row1 = MoonlinkRow::new(vec![
+            RowValue::Int32(1),
+            RowValue::ByteArray("John".as_bytes().to_vec()),
+            RowValue::Int32(30),
+        ]);
 
-        let row2 = TableRow {
-            values: vec![
-                Cell::I32(2),
-                Cell::String("Jane".to_string()),
-                Cell::I32(25),
-            ],
-        };
-        let row3 = TableRow {
-            values: vec![Cell::I32(3), Cell::String("Bob".to_string()), Cell::I32(40)],
-        };
+        let row2 = MoonlinkRow::new(vec![
+            RowValue::Int32(2),
+            RowValue::ByteArray("Jane".as_bytes().to_vec()),
+            RowValue::Int32(25),
+        ]);
+        let row3 = MoonlinkRow::new(vec![
+            RowValue::Int32(3),
+            RowValue::ByteArray("Bob".as_bytes().to_vec()),
+            RowValue::Int32(40),
+        ]);
 
         table.append(row1)?;
         table.append(row2)?;
@@ -777,13 +770,11 @@ mod tests {
 
         // 3. Test delete operation
 
-        let row2: TableRow = TableRow {
-            values: vec![
-                Cell::I32(2),
-                Cell::String("Jane".to_string()),
-                Cell::I32(25),
-            ],
-        };
+        let row2: MoonlinkRow = MoonlinkRow::new(vec![
+            RowValue::Int32(2),
+            RowValue::ByteArray("Jane".as_bytes().to_vec()),
+            RowValue::Int32(25),
+        ]);
 
         println!("Testing delete operation...");
         table.delete(row2, 2);
@@ -812,21 +803,17 @@ mod tests {
         drop(snapshot);
 
         // Append more rows
-        let row4 = TableRow {
-            values: vec![
-                Cell::I32(4),
-                Cell::String("Alice".to_string()),
-                Cell::I32(35),
-            ],
-        };
+        let row4 = MoonlinkRow::new(vec![
+            RowValue::Int32(4),
+            RowValue::ByteArray("Alice".as_bytes().to_vec()),
+            RowValue::Int32(35),
+        ]);
 
-        let row5 = TableRow {
-            values: vec![
-                Cell::I32(5),
-                Cell::String("Charlie".to_string()),
-                Cell::I32(45),
-            ],
-        };
+        let row5 = MoonlinkRow::new(vec![
+            RowValue::Int32(5),
+            RowValue::ByteArray("Charlie".as_bytes().to_vec()),
+            RowValue::Int32(45),
+        ]);
 
         table.append(row4)?;
         // Commit
@@ -834,13 +821,11 @@ mod tests {
 
         table.append(row5)?;
 
-        let row4 = TableRow {
-            values: vec![
-                Cell::I32(4),
-                Cell::String("Alice".to_string()),
-                Cell::I32(35),
-            ],
-        };
+        let row4 = MoonlinkRow::new(vec![
+            RowValue::Int32(4),
+            RowValue::ByteArray("Alice".as_bytes().to_vec()),
+            RowValue::Int32(35),
+        ]);
         // Delete one of the new rows
         table.delete(row4, 4);
 
@@ -933,34 +918,26 @@ mod tests {
         // Phase 1: Initial data load and first flush
         println!("Phase 1: Initial data load and first flush");
         let initial_rows = vec![
-            TableRow {
-                values: vec![
-                    Cell::I32(1),
-                    Cell::String("Row 1".to_string()),
-                    Cell::I32(31),
-                ],
-            },
-            TableRow {
-                values: vec![
-                    Cell::I32(2),
-                    Cell::String("Row 2".to_string()),
-                    Cell::I32(32),
-                ],
-            },
-            TableRow {
-                values: vec![
-                    Cell::I32(3),
-                    Cell::String("Row 3".to_string()),
-                    Cell::I32(33),
-                ],
-            },
-            TableRow {
-                values: vec![
-                    Cell::I32(4),
-                    Cell::String("Row 4".to_string()),
-                    Cell::I32(34),
-                ],
-            },
+            MoonlinkRow::new(vec![
+                RowValue::Int32(1),
+                RowValue::ByteArray("Row 1".as_bytes().to_vec()),
+                RowValue::Int32(31),
+            ]),
+            MoonlinkRow::new(vec![
+                RowValue::Int32(2),
+                RowValue::ByteArray("Row 2".as_bytes().to_vec()),
+                RowValue::Int32(32),
+            ]),
+            MoonlinkRow::new(vec![
+                RowValue::Int32(3),
+                RowValue::ByteArray("Row 3".as_bytes().to_vec()),
+                RowValue::Int32(33),
+            ]),
+            MoonlinkRow::new(vec![
+                RowValue::Int32(4),
+                RowValue::ByteArray("Row 4".as_bytes().to_vec()),
+                RowValue::Int32(34),
+            ]),
         ];
 
         for row in initial_rows {
@@ -983,20 +960,16 @@ mod tests {
         // Phase 2: Add more rows and delete some before flush
         println!("Phase 2: Add more rows and delete before flush");
         let additional_rows = vec![
-            TableRow {
-                values: vec![
-                    Cell::I32(5),
-                    Cell::String("Row 5".to_string()),
-                    Cell::I32(35),
-                ],
-            },
-            TableRow {
-                values: vec![
-                    Cell::I32(6),
-                    Cell::String("Row 6".to_string()),
-                    Cell::I32(36),
-                ],
-            },
+            MoonlinkRow::new(vec![
+                RowValue::Int32(5),
+                RowValue::ByteArray("Row 5".as_bytes().to_vec()),
+                RowValue::Int32(35),
+            ]),
+            MoonlinkRow::new(vec![
+                RowValue::Int32(6),
+                RowValue::ByteArray("Row 6".as_bytes().to_vec()),
+                RowValue::Int32(36),
+            ]),
         ];
 
         for row in additional_rows {
@@ -1005,20 +978,16 @@ mod tests {
 
         // Delete some rows before flush
         let delete_rows = vec![
-            TableRow {
-                values: vec![
-                    Cell::I32(2),
-                    Cell::String("Row 2".to_string()),
-                    Cell::I32(32),
-                ],
-            },
-            TableRow {
-                values: vec![
-                    Cell::I32(4),
-                    Cell::String("Row 4".to_string()),
-                    Cell::I32(34),
-                ],
-            },
+            MoonlinkRow::new(vec![
+                RowValue::Int32(2),
+                RowValue::ByteArray("Row 2".as_bytes().to_vec()),
+                RowValue::Int32(32),
+            ]),
+            MoonlinkRow::new(vec![
+                RowValue::Int32(4),
+                RowValue::ByteArray("Row 4".as_bytes().to_vec()),
+                RowValue::Int32(34),
+            ]),
         ];
 
         for row in delete_rows {
@@ -1057,20 +1026,16 @@ mod tests {
 
         // Add more rows and delete some from both old and new data
         let more_rows = vec![
-            TableRow {
-                values: vec![
-                    Cell::I32(7),
-                    Cell::String("Row 7".to_string()),
-                    Cell::I32(37),
-                ],
-            },
-            TableRow {
-                values: vec![
-                    Cell::I32(8),
-                    Cell::String("Row 8".to_string()),
-                    Cell::I32(38),
-                ],
-            },
+            MoonlinkRow::new(vec![
+                RowValue::Int32(7),
+                RowValue::ByteArray("Row 7".as_bytes().to_vec()),
+                RowValue::Int32(37),
+            ]),
+            MoonlinkRow::new(vec![
+                RowValue::Int32(8),
+                RowValue::ByteArray("Row 8".as_bytes().to_vec()),
+                RowValue::Int32(38),
+            ]),
         ];
 
         for row in more_rows {
@@ -1079,20 +1044,16 @@ mod tests {
 
         // Delete rows from both old and new data
         let delete_more_rows = vec![
-            TableRow {
-                values: vec![
-                    Cell::I32(1),
-                    Cell::String("Row 1".to_string()),
-                    Cell::I32(31),
-                ],
-            },
-            TableRow {
-                values: vec![
-                    Cell::I32(6),
-                    Cell::String("Row 6".to_string()),
-                    Cell::I32(36),
-                ],
-            },
+            MoonlinkRow::new(vec![
+                RowValue::Int32(1),
+                RowValue::ByteArray("Row 1".as_bytes().to_vec()),
+                RowValue::Int32(31),
+            ]),
+            MoonlinkRow::new(vec![
+                RowValue::Int32(6),
+                RowValue::ByteArray("Row 6".as_bytes().to_vec()),
+                RowValue::Int32(36),
+            ]),
         ];
 
         for row in delete_more_rows {

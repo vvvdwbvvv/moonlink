@@ -168,12 +168,13 @@ impl DiskSliceWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::row::{MoonlinkRow, RowValue};
     use crate::storage::mem_slice::MemSlice;
     use crate::storage::table_utils::RawDeletionRecord;
     use arrow::datatypes::{DataType, Field, Schema};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-    use pg_replicate::conversions::{table_row::TableRow, Cell};
     use tempfile::tempdir;
+
     #[test]
     fn test_disk_slice_builder() -> Result<()> {
         // Create a temporary directory for the test
@@ -188,12 +189,14 @@ mod tests {
         let mut mem_slice = MemSlice::new(schema.clone(), 100);
 
         // Add some test rows
-        let row1 = TableRow {
-            values: vec![Cell::I32(1), Cell::String("Alice".to_string())],
-        };
-        let row2 = TableRow {
-            values: vec![Cell::I32(2), Cell::String("Bob".to_string())],
-        };
+        let row1 = MoonlinkRow::new(vec![
+            RowValue::Int32(1),
+            RowValue::ByteArray("Alice".as_bytes().to_vec()),
+        ]);
+        let row2 = MoonlinkRow::new(vec![
+            RowValue::Int32(2),
+            RowValue::ByteArray("Bob".as_bytes().to_vec()),
+        ]);
 
         mem_slice.append(1, &row1)?;
         mem_slice.append(2, &row2)?;
@@ -246,27 +249,32 @@ mod tests {
 
         // Add several test rows
         let rows = vec![
-            TableRow {
-                values: vec![Cell::I32(1), Cell::String("Alice".to_string())],
-            },
-            TableRow {
-                values: vec![Cell::I32(2), Cell::String("Bob".to_string())],
-            },
-            TableRow {
-                values: vec![Cell::I32(3), Cell::String("Charlie".to_string())],
-            },
-            TableRow {
-                values: vec![Cell::I32(4), Cell::String("David".to_string())],
-            },
-            TableRow {
-                values: vec![Cell::I32(5), Cell::String("Eve".to_string())],
-            },
+            MoonlinkRow::new(vec![
+                RowValue::Int32(1),
+                RowValue::ByteArray("Alice".as_bytes().to_vec()),
+            ]),
+            MoonlinkRow::new(vec![
+                RowValue::Int32(2),
+                RowValue::ByteArray("Bob".as_bytes().to_vec()),
+            ]),
+            MoonlinkRow::new(vec![
+                RowValue::Int32(3),
+                RowValue::ByteArray("Charlie".as_bytes().to_vec()),
+            ]),
+            MoonlinkRow::new(vec![
+                RowValue::Int32(4),
+                RowValue::ByteArray("David".as_bytes().to_vec()),
+            ]),
+            MoonlinkRow::new(vec![
+                RowValue::Int32(5),
+                RowValue::ByteArray("Eve".as_bytes().to_vec()),
+            ]),
         ];
 
         // Insert original keys into the index
         for row in rows.iter() {
             let key = match row.values[0] {
-                Cell::I32(v) => v as i64,
+                RowValue::Int32(v) => v as i64,
                 _ => panic!("Expected i32"),
             };
             mem_slice.append(key, row)?;

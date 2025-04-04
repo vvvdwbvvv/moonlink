@@ -1,10 +1,10 @@
 use crate::error::Result;
+use crate::row::MoonlinkRow;
 use crate::storage::column_array_builder::ColumnArrayBuilder;
 use crate::storage::delete_vector::BatchDeletionVector;
 use crate::storage::table_utils::RecordLocation;
 use arrow::array::{ArrayRef, RecordBatch};
 use arrow::datatypes::Schema;
-use pg_replicate::conversions::table_row::TableRow;
 use std::sync::Arc;
 
 #[derive(Debug)]
@@ -96,7 +96,7 @@ impl ColumnStoreBuffer {
     ///
     pub fn append_row(
         &mut self,
-        row: &TableRow,
+        row: &MoonlinkRow,
     ) -> Result<(u64, usize, Option<(u64, Arc<RecordBatch>)>)> {
         let mut new_batch = None;
         // Check if we need to finalize the current batch
@@ -105,7 +105,8 @@ impl ColumnStoreBuffer {
         }
 
         row.values.iter().enumerate().for_each(|(i, cell)| {
-            self.current_rows[i].append_value(cell);
+            let _res = self.current_rows[i].append_value(cell);
+            assert!(_res.is_ok());
         });
         self.current_row_count += 1;
 
@@ -179,11 +180,11 @@ impl ColumnStoreBuffer {
 }
 
 pub fn create_batch_from_rows(
-    rows: &[TableRow],
+    rows: &[MoonlinkRow],
     schema: Arc<Schema>,
     deletions: &BatchDeletionVector,
 ) -> RecordBatch {
-    let mut row_builders: Vec<Box<ColumnArrayBuilder>> = schema
+    let mut builders: Vec<Box<ColumnArrayBuilder>> = schema
         .fields()
         .iter()
         .map(|field| {
@@ -196,11 +197,12 @@ pub fn create_batch_from_rows(
     for (i, row) in rows.iter().enumerate() {
         if !deletions.is_deleted(i) {
             for (j, _field) in schema.fields().iter().enumerate() {
-                row_builders[j].append_value(&row.values[j]);
+                let _res = builders[j].append_value(&row.values[j]);
+                assert!(_res.is_ok());
             }
         }
     }
-    let columns: Vec<ArrayRef> = row_builders
+    let columns: Vec<ArrayRef> = builders
         .iter_mut()
         .map(|builder| builder.finish())
         .collect();
@@ -210,30 +212,36 @@ pub fn create_batch_from_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::row::RowValue;
     use arrow::datatypes::{DataType, Field};
-    use pg_replicate::conversions::table_row::TableRow;
-    use pg_replicate::conversions::Cell;
 
     #[test]
     fn test_column_store_buffer() -> Result<()> {
-        // Create a schema
-        let schema = Arc::new(Schema::new(vec![
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
             Field::new("name", DataType::Utf8, true),
             Field::new("age", DataType::Int32, false),
-        ]));
+        ]);
 
-        let mut buffer = ColumnStoreBuffer::new(schema.clone(), 2);
+        let mut buffer = ColumnStoreBuffer::new(Arc::new(schema), 2);
 
-        // Create some test data and append rows
-        let row1 = TableRow {
-            values: vec![Cell::String("John".to_string()), Cell::I32(25)],
-        };
-        let row2 = TableRow {
-            values: vec![Cell::String("Jane".to_string()), Cell::I32(30)],
-        };
-        let row3 = TableRow {
-            values: vec![Cell::String("Bob".to_string()), Cell::I32(40)],
-        };
+        let row1 = MoonlinkRow::new(vec![
+            RowValue::Int32(1),
+            RowValue::ByteArray("John".as_bytes().to_vec()),
+            RowValue::Int32(30),
+        ]);
+
+        let row2 = MoonlinkRow::new(vec![
+            RowValue::Int32(2),
+            RowValue::ByteArray("Jane".as_bytes().to_vec()),
+            RowValue::Int32(25),
+        ]);
+
+        let row3 = MoonlinkRow::new(vec![
+            RowValue::Int32(3),
+            RowValue::ByteArray("Bob".as_bytes().to_vec()),
+            RowValue::Int32(40),
+        ]);
 
         buffer.append_row(&row1)?;
         buffer.append_row(&row2)?;

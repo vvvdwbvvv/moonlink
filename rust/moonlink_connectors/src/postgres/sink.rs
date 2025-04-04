@@ -1,4 +1,5 @@
 use crate::postgres::util::table_schema_to_arrow_schema;
+use crate::postgres::util::PostgresTableRow;
 use async_trait::async_trait;
 use moonlink::{TableEvent, TableHandler};
 use pg_replicate::{
@@ -85,7 +86,12 @@ impl BatchSink for Sink {
     ) -> Result<(), Self::Error> {
         let event_sender = self.event_senders.get_mut(&table_id).unwrap();
         for row in rows {
-            event_sender.send(TableEvent::Append { row }).await.unwrap();
+            event_sender
+                .send(TableEvent::Append {
+                    row: PostgresTableRow(row).into(),
+                })
+                .await
+                .unwrap();
         }
         event_sender
             .send(TableEvent::Commit { lsn: 0 })
@@ -128,7 +134,9 @@ impl BatchSink for Sink {
                     table_id_in_transaction = Some(table_id);
                     let event_sender = self.event_senders.get_mut(&table_id).unwrap();
                     event_sender
-                        .send(TableEvent::Append { row: (table_row) })
+                        .send(TableEvent::Append {
+                            row: PostgresTableRow(table_row).into(),
+                        })
                         .await
                         .unwrap();
                 }
@@ -143,14 +151,14 @@ impl BatchSink for Sink {
                     let event_sender = self.event_senders.get_mut(&table_id).unwrap();
                     event_sender
                         .send(TableEvent::Delete {
-                            row: (old_table_row.unwrap()),
+                            row: PostgresTableRow(old_table_row.unwrap()).into(),
                             lsn: (lsn_in_transaction.unwrap()),
                         })
                         .await
                         .unwrap();
                     event_sender
                         .send(TableEvent::Append {
-                            row: (new_table_row),
+                            row: PostgresTableRow(new_table_row).into(),
                         })
                         .await
                         .unwrap();
@@ -166,7 +174,7 @@ impl BatchSink for Sink {
                     let event_sender = self.event_senders.get_mut(&table_id).unwrap();
                     event_sender
                         .send(TableEvent::Delete {
-                            row: (table_row),
+                            row: PostgresTableRow(table_row).into(),
                             lsn: (lsn_in_transaction.unwrap()),
                         })
                         .await

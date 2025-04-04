@@ -1,10 +1,10 @@
 use crate::error::Result;
+use crate::row::MoonlinkRow;
 use crate::storage::data_batches::{BatchEntry, ColumnStoreBuffer};
 use crate::storage::index::index_util::{Index, MemIndex};
 use crate::storage::table_utils::{RawDeletionRecord, RecordLocation};
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
-use pg_replicate::conversions::table_row::TableRow;
 use std::mem::swap;
 use std::sync::Arc;
 
@@ -50,7 +50,7 @@ impl MemSlice {
     pub fn append(
         &mut self,
         primary_key: i64,
-        row: &TableRow,
+        row: &MoonlinkRow,
     ) -> Result<Option<(u64, Arc<RecordBatch>)>> {
         let (seg_idx, row_idx, new_batch) = self.column_store.append_row(row)?;
         self.mem_index
@@ -81,9 +81,9 @@ impl MemSlice {
 mod tests {
 
     use super::*;
+    use crate::row::RowValue;
     use arrow::datatypes::Schema;
     use arrow::datatypes::{DataType, Field};
-    use pg_replicate::conversions::Cell;
 
     #[test]
     fn test_mem_slice() {
@@ -98,35 +98,33 @@ mod tests {
         mem_table
             .append(
                 1,
-                &TableRow {
-                    values: vec![
-                        Cell::I32(1),
-                        Cell::String("John".to_string()),
-                        Cell::I32(30),
-                    ],
-                },
+                &MoonlinkRow::new(vec![
+                    RowValue::Int32(1),
+                    RowValue::ByteArray("John".as_bytes().to_vec()),
+                    RowValue::Int32(30),
+                ]),
             )
             .unwrap();
 
         mem_table
             .append(
                 2,
-                &TableRow {
-                    values: vec![
-                        Cell::I32(2),
-                        Cell::String("Jane".to_string()),
-                        Cell::I32(25),
-                    ],
-                },
+                &MoonlinkRow::new(vec![
+                    RowValue::Int32(2),
+                    RowValue::ByteArray("Jane".as_bytes().to_vec()),
+                    RowValue::Int32(25),
+                ]),
             )
             .unwrap();
 
         mem_table
             .append(
                 3,
-                &TableRow {
-                    values: vec![Cell::I32(3), Cell::String("foo".to_string()), Cell::I32(40)],
-                },
+                &MoonlinkRow::new(vec![
+                    RowValue::Int32(3),
+                    RowValue::ByteArray("Bob".as_bytes().to_vec()),
+                    RowValue::Int32(40),
+                ]),
             )
             .unwrap();
         assert_eq!(

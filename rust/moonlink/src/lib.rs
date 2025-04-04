@@ -1,4 +1,5 @@
 mod error;
+pub mod row;
 mod storage;
 mod table_handler;
 

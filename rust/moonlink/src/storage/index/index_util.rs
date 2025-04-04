@@ -1,7 +1,6 @@
+use crate::row::{MoonlinkRow, RowValue};
 use crate::storage::table_utils::{RawDeletionRecord, RecordLocation};
 use multimap::MultiMap;
-use pg_replicate::conversions::table_row::TableRow;
-use pg_replicate::conversions::Cell;
 use std::sync::Arc;
 pub trait Index: Send + Sync {
     fn find_record(&self, raw_record: &RawDeletionRecord) -> Option<Vec<&RecordLocation>>;
@@ -24,13 +23,15 @@ pub struct MooncakeIndex {
     pub file_indices: Vec<ParquetFileIndex>,
 }
 
-pub fn get_lookup_key(row: &TableRow) -> i64 {
+pub fn get_lookup_key(row: &MoonlinkRow) -> i64 {
     // UNDONE(REPLICATION IDENTITY):
     // For now in testing, we assume the primary key is the first column!
-    //
+
     match row.values[0] {
-        Cell::I32(value) => value as i64,
-        Cell::I64(value) => value,
+        RowValue::Int32(value) => value as i64,
+
+        RowValue::Int64(value) => value,
+
         _ => todo!("Handle other types of primary keys"),
     }
 }
