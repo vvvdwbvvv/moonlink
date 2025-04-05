@@ -15,21 +15,25 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_postgres::types::PgLsn;
 use tokio::sync::mpsc::Sender;
-
+use std::fs::create_dir_all;
 
 pub struct Sink {
     table_handlers: Arc<Mutex<HashMap<TableId, TableHandler>>>,
     event_senders: HashMap<TableId, Sender<TableEvent>>,
+    reader_notifier: Option<Sender<Sender<TableEvent>>>,
+    base_path: PathBuf,
 }
 
 impl Sink {
-    pub fn new() -> Self {
+    pub fn new(reader_notifier: Option<Sender<Sender<TableEvent>>>, base_path: PathBuf) -> Self {
         let table_handlers: Arc<Mutex<HashMap<u32, TableHandler>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let event_senders = HashMap::new();
         Self {
             table_handlers,
             event_senders,
+            reader_notifier,
+            base_path,
         }
     }
 }
@@ -51,14 +55,17 @@ impl BatchSink for Sink {
     ) -> Result<(), Self::Error> {
         let mut table_handlers = self.table_handlers.lock().await;
         for (table_id, table_schema) in table_schemas {
+            let table_path = PathBuf::from(&self.base_path).join(table_schema.table_name.to_string());
+            create_dir_all(&table_path).unwrap();
             let table_handler = TableHandler::new(
                 table_schema_to_arrow_schema(&table_schema),
                 table_schema.table_name.to_string(),
                 table_id as u64,
-                PathBuf::from("mooncake_test/"),
+                table_path,
             );
             self.event_senders
                 .insert(table_id, table_handler.get_event_sender());
+            self.reader_notifier.as_ref().unwrap().send(table_handler.get_event_sender()).await.unwrap();
             table_handlers.insert(table_id, table_handler);
         }
 

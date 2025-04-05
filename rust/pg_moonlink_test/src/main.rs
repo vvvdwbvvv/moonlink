@@ -6,7 +6,7 @@ use pg_replicate::pipeline::{
     PipelineAction,
 };
 use moonlink_connectors::Sink;
-use std::{error::Error, time::Duration};
+use std::{error::Error, time::Duration, path::PathBuf};
 
 async fn main_impl() -> Result<(), Box<dyn Error>> {
     let source = PostgresSource::new(
@@ -19,7 +19,7 @@ async fn main_impl() -> Result<(), Box<dyn Error>> {
         TableNamesFrom::Publication("moonlink_pub".to_string()),
     )
     .await?;
-    let sink = Sink::new();
+    let sink = Sink::new(None, PathBuf::from("/home/vscode/moonlink_test/"));
     let batch_config = BatchConfig::new(1000, Duration::from_secs(1));
     let mut pipeline = BatchDataPipeline::new(source, sink, PipelineAction::Both, batch_config);
     pipeline.start().await?;

@@ -382,11 +382,6 @@ impl MooncakeTable {
 // Helper functions
 impl MooncakeTable {
     fn get_deletion_records(snapshot: &SnapshotTableState) -> Vec<(usize, usize)> {
-        println!("Committed deletions: {:?}", snapshot.committed_deletion_log);
-        println!(
-            "Uncommitted deletions: {:?}",
-            snapshot.uncommitted_deletion_log
-        );
         let mut ret = Vec::new();
         for deletion in snapshot.committed_deletion_log.iter() {
             if let RecordLocation::DiskFile(file_name, row_id) = &deletion.pos {
