@@ -37,7 +37,6 @@ pub struct TableHandler {
     event_sender: Sender<TableEvent>,
 }
 
-
 impl TableHandler {
     /// Create a new TableHandler for the given schema and table name
     pub fn new(schema: Schema, table_name: String, table_id: u64, path: PathBuf) -> Self {

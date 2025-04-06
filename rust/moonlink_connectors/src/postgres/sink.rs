@@ -1,6 +1,6 @@
 use crate::postgres::util::table_schema_to_arrow_schema;
-use moonlink::{TableEvent, TableHandler};
 use async_trait::async_trait;
+use moonlink::{TableEvent, TableHandler};
 use pg_replicate::{
     conversions::{cdc_event::CdcEvent, table_row::TableRow},
     pipeline::{
@@ -10,12 +10,12 @@ use pg_replicate::{
     table::{TableId, TableSchema},
 };
 use std::collections::{HashMap, HashSet};
+use std::fs::create_dir_all;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::mpsc::Sender;
 use tokio::sync::Mutex;
 use tokio_postgres::types::PgLsn;
-use tokio::sync::mpsc::Sender;
-use std::fs::create_dir_all;
 
 pub struct Sink {
     table_handlers: Arc<Mutex<HashMap<TableId, TableHandler>>>,
@@ -55,7 +55,8 @@ impl BatchSink for Sink {
     ) -> Result<(), Self::Error> {
         let mut table_handlers = self.table_handlers.lock().await;
         for (table_id, table_schema) in table_schemas {
-            let table_path = PathBuf::from(&self.base_path).join(table_schema.table_name.to_string());
+            let table_path =
+                PathBuf::from(&self.base_path).join(table_schema.table_name.to_string());
             create_dir_all(&table_path).unwrap();
             let table_handler = TableHandler::new(
                 table_schema_to_arrow_schema(&table_schema),
@@ -65,7 +66,12 @@ impl BatchSink for Sink {
             );
             self.event_senders
                 .insert(table_id, table_handler.get_event_sender());
-            self.reader_notifier.as_ref().unwrap().send(table_handler.get_event_sender()).await.unwrap();
+            self.reader_notifier
+                .as_ref()
+                .unwrap()
+                .send(table_handler.get_event_sender())
+                .await
+                .unwrap();
             table_handlers.insert(table_id, table_handler);
         }
 

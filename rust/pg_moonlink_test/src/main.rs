@@ -1,12 +1,10 @@
-
-
+use moonlink_connectors::Sink;
 use pg_replicate::pipeline::{
     batching::{data_pipeline::BatchDataPipeline, BatchConfig},
     sources::postgres::{PostgresSource, TableNamesFrom},
     PipelineAction,
 };
-use moonlink_connectors::Sink;
-use std::{error::Error, time::Duration, path::PathBuf};
+use std::{error::Error, path::PathBuf, time::Duration};
 
 async fn main_impl() -> Result<(), Box<dyn Error>> {
     let source = PostgresSource::new(

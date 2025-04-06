@@ -5,8 +5,8 @@ mod disk_slice;
 mod iceberg;
 mod index;
 mod mem_slice;
-mod table_utils;
 mod mooncake_table;
+mod table_utils;
 
 pub use disk_slice::DiskSliceWriter;
 pub use mooncake_table::MooncakeTable;
