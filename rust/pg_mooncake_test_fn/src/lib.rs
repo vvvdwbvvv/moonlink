@@ -72,9 +72,13 @@ pub fn replicate_pg_table_and_create_parquet(
     let metadata = rt
         .block_on(replicate_pg_table_and_create_parquet_async(
             table_name, output_dir,
-        ))
-        .unwrap();
-    metadata
+        ));
+    if let Err(e) = metadata {
+        panic!("Error: {:?}", e)
+    }
+    else {
+        metadata.unwrap()
+    }
 }
 
 #[cfg(test)]
