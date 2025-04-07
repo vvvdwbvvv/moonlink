@@ -21,9 +21,9 @@ pub async fn replicate_pg_table_and_create_parquet_async(
 ) -> Result<MooncakeTableMetadata, Box<dyn Error>> {
     let source = PostgresSource::new(
         "localhost",
-        5432,
-        "postgres",
-        "postgres",
+        28817,
+        "pg_mooncake",
+        "vscode",
         Some("password".to_string()),
         Some("moonlink_slot".to_string()),
         TableNamesFrom::Publication("moonlink_pub".to_string()),
@@ -36,7 +36,7 @@ pub async fn replicate_pg_table_and_create_parquet_async(
         PathBuf::from("/home/vscode/mooncake_test/"),
     );
     let batch_config = BatchConfig::new(1000, Duration::from_secs(1));
-    let mut pipeline = BatchDataPipeline::new(source, sink, PipelineAction::Both, batch_config);
+    let mut pipeline = BatchDataPipeline::new(source, sink, PipelineAction::CdcOnly, batch_config);
     let fut = tokio::spawn(async move { pipeline.start().await });
 
     let res = reader_notifier_receiver.recv().await;

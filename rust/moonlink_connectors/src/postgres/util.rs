@@ -44,7 +44,7 @@ pub fn table_schema_to_arrow_schema(table_schema: &TableSchema) -> Schema {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pg_replicate::table::{ColumnSchema, TableName, TableSchema};
+    use pg_replicate::table::{ColumnSchema, LookupKey, TableName, TableSchema};
 
     #[test]
     fn test_table_schema_to_arrow_schema() {
@@ -60,23 +60,24 @@ mod tests {
                     typ: Type::INT4,
                     modifier: 0,
                     nullable: false,
-                    primary: true,
                 },
                 ColumnSchema {
                     name: "name".to_string(),
                     typ: Type::TEXT,
                     modifier: 0,
                     nullable: true,
-                    primary: false,
                 },
                 ColumnSchema {
                     name: "created_at".to_string(),
                     typ: Type::TIMESTAMP,
                     modifier: 0,
                     nullable: true,
-                    primary: false,
                 },
             ],
+            lookup_key: LookupKey::Key {
+                name: "id".to_string(),
+                columns: vec!["id".to_string()],
+            },
         };
 
         let arrow_schema = table_schema_to_arrow_schema(&table_schema);
