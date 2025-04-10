@@ -1,156 +1,127 @@
+use crate::error::Error;
 use crate::row::RowValue;
-use arrow::array::builder::{ArrayBuilder, BooleanBuilder, PrimitiveBuilder, StringBuilder};
+use arrow::array::builder::{BooleanBuilder, PrimitiveBuilder, StringBuilder};
 use arrow::array::types::{Float32Type, Float64Type, Int32Type, Int64Type};
 use arrow::array::{ArrayRef, FixedSizeBinaryBuilder};
 use arrow::datatypes::DataType;
-
+use std::sync::Arc;
 /// A column array builder that can handle different types
-pub struct ColumnArrayBuilder {
-    builder: Box<dyn ArrayBuilder>,
-    data_type: DataType,
+pub enum ColumnArrayBuilder {
+    Boolean(BooleanBuilder),
+    Int32(PrimitiveBuilder<Int32Type>),
+    Int64(PrimitiveBuilder<Int64Type>),
+    Float32(PrimitiveBuilder<Float32Type>),
+    Float64(PrimitiveBuilder<Float64Type>),
+    Utf8(StringBuilder),
+    FixedSizeBinary(FixedSizeBinaryBuilder),
 }
 
 impl ColumnArrayBuilder {
     /// Create a new column array builder for a specific data type
     pub fn new(data_type: DataType, capacity: usize) -> Self {
-        let builder: Box<dyn ArrayBuilder> = match &data_type {
-            DataType::Boolean => Box::new(BooleanBuilder::with_capacity(capacity)),
+        match &data_type {
+            DataType::Boolean => {
+                ColumnArrayBuilder::Boolean(BooleanBuilder::with_capacity(capacity))
+            }
             DataType::Int16 | DataType::Int32 | DataType::Date32 => {
-                Box::new(PrimitiveBuilder::<Int32Type>::with_capacity(capacity))
+                ColumnArrayBuilder::Int32(PrimitiveBuilder::<Int32Type>::with_capacity(capacity))
             }
             DataType::Timestamp(_, _) | DataType::Int64 | DataType::Time64(_) => {
-                Box::new(PrimitiveBuilder::<Int64Type>::with_capacity(capacity))
+                ColumnArrayBuilder::Int64(PrimitiveBuilder::<Int64Type>::with_capacity(capacity))
             }
-            DataType::Float32 => Box::new(PrimitiveBuilder::<Float32Type>::with_capacity(capacity)),
-            DataType::Float64 => Box::new(PrimitiveBuilder::<Float64Type>::with_capacity(capacity)),
-            DataType::Utf8 => Box::new(StringBuilder::with_capacity(capacity, capacity * 10)),
+            DataType::Float32 => ColumnArrayBuilder::Float32(
+                PrimitiveBuilder::<Float32Type>::with_capacity(capacity),
+            ),
+            DataType::Float64 => ColumnArrayBuilder::Float64(
+                PrimitiveBuilder::<Float64Type>::with_capacity(capacity),
+            ),
+            DataType::Utf8 => {
+                ColumnArrayBuilder::Utf8(StringBuilder::with_capacity(capacity, capacity * 10))
+            }
             DataType::FixedSizeBinary(_size) => {
                 assert_eq!(*_size, 16);
-                Box::new(FixedSizeBinaryBuilder::with_capacity(capacity, 16))
+                ColumnArrayBuilder::FixedSizeBinary(FixedSizeBinaryBuilder::with_capacity(
+                    capacity, 16,
+                ))
             }
             _ => panic!("data type: {:?}", data_type),
-        };
-
-        Self { builder, data_type }
+        }
     }
 
     /// Append a value to this builder
-    pub fn append_value(&mut self, value: &RowValue) -> Result<(), String> {
-        match value {
-            RowValue::Int32(v) => {
-                self.builder
-                    .as_any_mut()
-                    .downcast_mut::<PrimitiveBuilder<Int32Type>>()
-                    .unwrap()
-                    .append_value(*v);
+    pub fn append_value(&mut self, value: &RowValue) -> Result<(), Error> {
+        match self {
+            ColumnArrayBuilder::Boolean(builder) => {
+                match value {
+                    RowValue::Bool(v) => builder.append_value(*v),
+                    RowValue::Null => builder.append_null(),
+                    _ => unreachable!("Bool expected from well-typed input"),
+                };
+                Ok(())
             }
-            RowValue::Int64(v) => {
-                self.builder
-                    .as_any_mut()
-                    .downcast_mut::<PrimitiveBuilder<Int64Type>>()
-                    .unwrap()
-                    .append_value(*v);
+            ColumnArrayBuilder::Int32(builder) => {
+                match value {
+                    RowValue::Int32(v) => builder.append_value(*v),
+                    RowValue::Null => builder.append_null(),
+                    _ => unreachable!("Int32 expected from well-typed input"),
+                };
+                Ok(())
             }
-            RowValue::Float32(v) => {
-                self.builder
-                    .as_any_mut()
-                    .downcast_mut::<PrimitiveBuilder<Float32Type>>()
-                    .unwrap()
-                    .append_value(*v);
+            ColumnArrayBuilder::Int64(builder) => {
+                match value {
+                    RowValue::Int64(v) => builder.append_value(*v),
+                    RowValue::Null => builder.append_null(),
+                    _ => unreachable!("Int64 expected from well-typed input"),
+                };
+                Ok(())
             }
-            RowValue::Float64(v) => {
-                self.builder
-                    .as_any_mut()
-                    .downcast_mut::<PrimitiveBuilder<Float64Type>>()
-                    .unwrap()
-                    .append_value(*v);
+            ColumnArrayBuilder::Float32(builder) => {
+                match value {
+                    RowValue::Float32(v) => builder.append_value(*v),
+                    RowValue::Null => builder.append_null(),
+                    _ => unreachable!("Float32 expected from well-typed input"),
+                };
+                Ok(())
             }
-            RowValue::Decimal(_v) => {
-                todo!("implementdecimal: {:?}", _v);
+            ColumnArrayBuilder::Float64(builder) => {
+                match value {
+                    RowValue::Float64(v) => builder.append_value(*v),
+                    RowValue::Null => builder.append_null(),
+                    _ => unreachable!("Float64 expected from well-typed input"),
+                };
+                Ok(())
             }
-            RowValue::Bool(v) => {
-                self.builder
-                    .as_any_mut()
-                    .downcast_mut::<BooleanBuilder>()
-                    .unwrap()
-                    .append_value(*v);
+            ColumnArrayBuilder::Utf8(builder) => {
+                match value {
+                    RowValue::ByteArray(v) => {
+                        builder.append_value(unsafe { std::str::from_utf8_unchecked(&v) })
+                    }
+                    RowValue::Null => builder.append_null(),
+                    _ => unreachable!("ByteArray expected from well-typed input"),
+                };
+                Ok(())
             }
-            RowValue::ByteArray(v) => {
-                let s = unsafe { std::str::from_utf8_unchecked(&v) };
-                self.builder
-                    .as_any_mut()
-                    .downcast_mut::<StringBuilder>()
-                    .unwrap()
-                    .append_value(s);
-            }
-            RowValue::FixedLenByteArray(v) => {
-                let _ret = self
-                    .builder
-                    .as_any_mut()
-                    .downcast_mut::<FixedSizeBinaryBuilder>()
-                    .unwrap()
-                    .append_value(v);
-                assert!(_ret.is_ok());
-            }
-            RowValue::Null => {
-                self.append_null();
+            ColumnArrayBuilder::FixedSizeBinary(builder) => {
+                match value {
+                    RowValue::FixedLenByteArray(v) => builder.append_value(v)?,
+                    RowValue::Null => builder.append_null(),
+                    _ => unreachable!("FixedLenByteArray expected from well-typed input"),
+                };
+                Ok(())
             }
         }
-        Ok(())
     }
-
-    /// Append a null value to this builder
-    pub fn append_null(&mut self) {
-        match self.data_type {
-            DataType::Boolean => self
-                .builder
-                .as_any_mut()
-                .downcast_mut::<BooleanBuilder>()
-                .unwrap()
-                .append_null(),
-            DataType::Int16 | DataType::Int32 | DataType::Date32 => self
-                .builder
-                .as_any_mut()
-                .downcast_mut::<PrimitiveBuilder<Int32Type>>()
-                .unwrap()
-                .append_null(),
-            DataType::Int64 | DataType::Timestamp(_, _) => self
-                .builder
-                .as_any_mut()
-                .downcast_mut::<PrimitiveBuilder<Int64Type>>()
-                .unwrap()
-                .append_null(),
-            DataType::Float32 => self
-                .builder
-                .as_any_mut()
-                .downcast_mut::<PrimitiveBuilder<Float32Type>>()
-                .unwrap()
-                .append_null(),
-            DataType::Float64 => self
-                .builder
-                .as_any_mut()
-                .downcast_mut::<PrimitiveBuilder<Float64Type>>()
-                .unwrap()
-                .append_null(),
-            DataType::Utf8 => self
-                .builder
-                .as_any_mut()
-                .downcast_mut::<StringBuilder>()
-                .unwrap()
-                .append_null(),
-            DataType::FixedSizeBinary(_) => self
-                .builder
-                .as_any_mut()
-                .downcast_mut::<FixedSizeBinaryBuilder>()
-                .unwrap()
-                .append_null(),
-            _ => todo!("data type: {:?}", self.data_type),
-        }
-    }
-
     /// Finish building and return the array
     pub fn finish(&mut self) -> ArrayRef {
-        self.builder.finish()
+        match self {
+            ColumnArrayBuilder::Boolean(builder) => Arc::new(builder.finish()),
+            ColumnArrayBuilder::Int32(builder) => Arc::new(builder.finish()),
+            ColumnArrayBuilder::Int64(builder) => Arc::new(builder.finish()),
+            ColumnArrayBuilder::Float32(builder) => Arc::new(builder.finish()),
+            ColumnArrayBuilder::Float64(builder) => Arc::new(builder.finish()),
+            ColumnArrayBuilder::Utf8(builder) => Arc::new(builder.finish()),
+            ColumnArrayBuilder::FixedSizeBinary(builder) => Arc::new(builder.finish()),
+        }
     }
 }
 
@@ -251,7 +222,7 @@ mod tests {
         // Test null values
         let mut builder = ColumnArrayBuilder::new(DataType::Int32, 3);
         builder.append_value(&RowValue::Int32(1)).unwrap();
-        builder.append_null();
+        builder.append_value(&RowValue::Null).unwrap();
         builder.append_value(&RowValue::Int32(3)).unwrap();
         let array = builder.finish();
         assert_eq!(array.len(), 3);
