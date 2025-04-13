@@ -5,7 +5,7 @@ use pg_replicate::pipeline::{
     PipelineAction,
 };
 use std::{error::Error, path::PathBuf, time::Duration};
-
+use tokio::sync::mpsc;
 async fn main_impl() -> Result<(), Box<dyn Error>> {
     let source = PostgresSource::new(
         "localhost",
@@ -17,7 +17,11 @@ async fn main_impl() -> Result<(), Box<dyn Error>> {
         TableNamesFrom::Publication("moonlink_pub".to_string()),
     )
     .await?;
-    let sink = Sink::new(None, PathBuf::from("/home/vscode/moonlink_test/"));
+    let (reader_notifier, mut _reader_notifier_receiver) = mpsc::channel(1);
+    let sink = Sink::new(
+        reader_notifier,
+        PathBuf::from("/home/vscode/moonlink_test/"),
+    );
     let batch_config = BatchConfig::new(1000, Duration::from_secs(1));
     let mut pipeline = BatchDataPipeline::new(source, sink, PipelineAction::Both, batch_config);
     pipeline.start().await?;

@@ -1,5 +1,6 @@
-use crate::storage::index::index_util::{Index, MemIndex, MooncakeIndex, ParquetFileIndex};
+use crate::storage::index::*;
 use crate::storage::table_utils::{RawDeletionRecord, RecordLocation};
+use std::collections::HashSet;
 use std::sync::Arc;
 impl Index for MemIndex {
     fn find_record(&self, raw_record: &RawDeletionRecord) -> Option<Vec<&RecordLocation>> {
@@ -13,7 +14,7 @@ impl MooncakeIndex {
     /// Create a new, empty in-memory index
     pub fn new() -> Self {
         Self {
-            in_memory_index: None,
+            in_memory_index: HashSet::new(),
             file_indices: Vec::new(),
         }
     }
@@ -21,16 +22,11 @@ impl MooncakeIndex {
     /// Insert a memory index (batch of in-memory records)
     ///
     pub fn insert_memory_index(&mut self, mem_index: Arc<MemIndex>) {
-        assert!(
-            self.in_memory_index.is_none(),
-            "Currently we don't allow multiple concurrent flushes,
-            so there should be only one memory index at a time"
-        );
-        self.in_memory_index = Some(mem_index);
+        self.in_memory_index.insert(IndexPtr(mem_index));
     }
 
-    pub fn delete_memory_index(&mut self) {
-        self.in_memory_index = None;
+    pub fn delete_memory_index(&mut self, mem_index: &Arc<MemIndex>) {
+        self.in_memory_index.remove(&IndexPtr(mem_index.clone()));
     }
 
     /// Insert a file index (batch of on-disk records)
@@ -45,14 +41,9 @@ impl Index for MooncakeIndex {
     fn find_record(&self, raw_record: &RawDeletionRecord) -> Option<Vec<&RecordLocation>> {
         let mut res = Vec::new();
 
-        // Check in-memory index
-        if self.in_memory_index.is_some() {
-            if let Some(locations) = self
-                .in_memory_index
-                .as_ref()
-                .unwrap()
-                .get_vec(&raw_record.lookup_key)
-            {
+        // Check in-memory indices
+        for index in self.in_memory_index.iter() {
+            if let Some(locations) = index.0.get_vec(&raw_record.lookup_key) {
                 res.extend(locations.iter());
             }
         }
@@ -92,15 +83,6 @@ mod tests {
             pos: None,
             lsn: 1,
         };
-
-        // Test direct field access
-        let direct_locations = index
-            .in_memory_index
-            .as_ref()
-            .unwrap()
-            .get_vec(&record.lookup_key);
-        assert!(direct_locations.is_some());
-        assert_eq!(direct_locations.unwrap().len(), 1);
 
         // Test the Index trait implementation
         let trait_locations = index.find_record(&record);

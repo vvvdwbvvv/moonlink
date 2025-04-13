@@ -32,7 +32,7 @@ pub async fn replicate_pg_table_and_create_parquet_async(
     let (reader_notifier, mut reader_notifier_receiver) = mpsc::channel(1);
 
     let sink = Sink::new(
-        Some(reader_notifier),
+        reader_notifier,
         PathBuf::from("/home/vscode/mooncake_test/"),
     );
     let batch_config = BatchConfig::new(1000, Duration::from_secs(1));

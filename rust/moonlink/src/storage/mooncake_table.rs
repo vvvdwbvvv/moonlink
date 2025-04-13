@@ -1,4 +1,4 @@
-use super::index::index_util::{get_lookup_key, Index, MemIndex, MooncakeIndex};
+use super::index::{get_lookup_key, Index, MemIndex, MooncakeIndex};
 use crate::error::Result;
 use crate::row::MoonlinkRow;
 use crate::storage::data_batches::InMemoryBatch;
@@ -12,7 +12,7 @@ use parquet::arrow::ArrowWriter;
 use std::collections::{BTreeMap, HashMap};
 use std::mem::{swap, take};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 use tokio::spawn;
 use tokio::task::JoinHandle;
 struct TableConfig {
@@ -189,7 +189,7 @@ pub struct MooncakeTable {
     mem_slice: MemSlice,
 
     // Current snapshot of the table
-    snapshot: Arc<Mutex<SnapshotTableState>>,
+    snapshot: Arc<RwLock<SnapshotTableState>>,
     next_snapshot_task: SnapshotTask,
 
     // UNDONE(BATCH_INSERT):
@@ -214,7 +214,7 @@ impl MooncakeTable {
         let table = Self {
             mem_slice: MemSlice::new(metadata.schema.clone(), metadata.config.batch_size),
             metadata: metadata.clone(),
-            snapshot: Arc::new(Mutex::new(SnapshotTableState::new(metadata))),
+            snapshot: Arc::new(RwLock::new(SnapshotTableState::new(metadata))),
             next_snapshot_task: SnapshotTask::new(),
             _stream_write_mem_slices: HashMap::new(),
         };
@@ -308,7 +308,7 @@ impl MooncakeTable {
         if !self.next_snapshot_task.should_create_snapshot() {
             return None;
         }
-        let mut snapshot = self.snapshot.lock().unwrap();
+        let mut snapshot = self.snapshot.write().unwrap();
         snapshot
             .next_snapshot_task
             .take_task(&mut self.next_snapshot_task);
@@ -317,7 +317,7 @@ impl MooncakeTable {
     }
 
     pub fn request_read(&self) -> Result<(Vec<PathBuf>, Vec<(usize, usize)>)> {
-        let snapshot = self.snapshot.lock().unwrap();
+        let snapshot = self.snapshot.read().unwrap();
         let mut file_paths: Vec<PathBuf> = Vec::new();
         let deletions = Self::get_deletion_records(&snapshot);
         file_paths.extend(snapshot.current_snapshot.disk_files.keys().cloned());
@@ -395,8 +395,8 @@ impl MooncakeTable {
         ret
     }
 
-    async fn create_snapshot_async(snapshot_state: Arc<Mutex<SnapshotTableState>>) {
-        let mut snapshot = snapshot_state.lock().unwrap();
+    async fn create_snapshot_async(snapshot_state: Arc<RwLock<SnapshotTableState>>) {
+        let mut snapshot = snapshot_state.write().unwrap();
         let mut next_snapshot_task = SnapshotTask::new();
         let batch_size = snapshot.current_snapshot.metadata.config.batch_size;
         swap(&mut snapshot.next_snapshot_task, &mut next_snapshot_task);
@@ -439,10 +439,9 @@ impl MooncakeTable {
             let mut new_disk_slices = take(&mut next_snapshot_task.new_disk_slices);
             for slice in new_disk_slices.iter_mut() {
                 snapshot.current_snapshot.disk_files.extend(
-                    slice
-                        .output_files()
-                        .into_iter()
-                        .map(|file| (file.clone(), BatchDeletionVector::new(10))),
+                    slice.output_files().into_iter().map(|(file, row_count)| {
+                        (file.clone(), BatchDeletionVector::new(*row_count))
+                    }),
                 );
                 let write_lsn = slice.lsn();
                 let pos = snapshot
@@ -460,7 +459,10 @@ impl MooncakeTable {
                     .current_snapshot
                     .indices
                     .insert_file_index(slice.take_index().unwrap());
-                snapshot.current_snapshot.indices.delete_memory_index();
+                snapshot
+                    .current_snapshot
+                    .indices
+                    .delete_memory_index(slice.old_index());
                 slice.input_batches().iter().for_each(|batch| {
                     snapshot.batches.remove(&batch.id);
                 });
@@ -683,7 +685,7 @@ mod tests {
         );
 
         // Verify disk files were created
-        let snapshot = table.snapshot.lock().unwrap();
+        let snapshot = table.snapshot.read().unwrap();
         assert!(
             snapshot.current_snapshot.disk_files.len() > 0,
             "Expected disk files to be created"
@@ -793,7 +795,7 @@ mod tests {
         assert!(snapshot_handle.await.is_ok());
 
         // Verify snapshot was created
-        let snapshot = table.snapshot.lock().unwrap();
+        let snapshot = table.snapshot.read().unwrap();
         assert!(
             snapshot.current_snapshot.snapshot_version > 0,
             "Expected read version to be updated"
@@ -832,7 +834,7 @@ mod tests {
         // Testing snapshot before commit
         let snapshot_handle = table.create_snapshot().unwrap();
         assert!(snapshot_handle.await.is_ok());
-        let snapshot = table.snapshot.lock().unwrap();
+        let snapshot = table.snapshot.read().unwrap();
         assert!(snapshot.current_snapshot.snapshot_version > 0);
         drop(snapshot);
 
@@ -853,7 +855,7 @@ mod tests {
         assert!(snapshot_handle.await.is_ok());
 
         // Verify snapshot was created
-        let snapshot = table.snapshot.lock().unwrap();
+        let snapshot = table.snapshot.read().unwrap();
         assert!(
             snapshot.current_snapshot.snapshot_version > 0,
             "Expected read version to be updated"

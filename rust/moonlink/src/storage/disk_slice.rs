@@ -1,6 +1,6 @@
 use crate::error::{Error, Result};
 use crate::storage::data_batches::BatchEntry;
-use crate::storage::index::index_util::{FileIndex, MemIndex, ParquetFileIndex};
+use crate::storage::index::{FileIndex, MemIndex, ParquetFileIndex};
 use crate::storage::table_utils::{FileId, ProcessedDeletionRecord, RecordLocation};
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
@@ -31,7 +31,7 @@ pub struct DiskSliceWriter {
 
     new_index: Option<ParquetFileIndex>,
 
-    files: Vec<PathBuf>,
+    files: Vec<(PathBuf /* file path */, usize /* row count */)>,
 }
 
 impl DiskSliceWriter {
@@ -83,8 +83,12 @@ impl DiskSliceWriter {
         &self.batches
     }
     /// Get the list of files in the DiskSlice
-    pub fn output_files(&self) -> &[PathBuf] {
+    pub fn output_files(&self) -> &[(PathBuf, usize)] {
         self.files.as_slice()
+    }
+
+    pub fn old_index(&self) -> &Arc<MemIndex> {
+        &self.old_index
     }
     /// Write record batches to parquet files
     fn write_batch_to_parquet(
@@ -96,15 +100,15 @@ impl DiskSliceWriter {
         let mut out_file_idx = 0;
         let mut out_row_idx = 0;
         let dir_path = &self.dir_path;
+        let mut file_path = None;
         for (batch_id, batch, row_indices) in record_batches {
             if writer.is_none() {
                 // Generate a unique file name
-                let file_name: String = format!("{}.parquet", Uuid::new_v4());
-                let file_path = dir_path.join(file_name);
                 // Create the file
-                let file = File::create(&file_path).map_err(|e| Error::Io(e))?;
-                files.push(file_path);
-                out_file_idx = files.len() - 1;
+                let file_name = format!("{}.parquet", Uuid::new_v4());
+                file_path = Some(dir_path.join(file_name));
+                let file = File::create(file_path.as_ref().unwrap()).map_err(|e| Error::Io(e))?;
+                out_file_idx = files.len();
                 writer = Some(ArrowWriter::try_new(file, self.schema.clone(), None)?);
                 out_row_idx = 0;
             }
@@ -119,10 +123,13 @@ impl DiskSliceWriter {
                 // Finalize the writer
                 writer.unwrap().close()?;
                 writer = None;
+                files.push((file_path.unwrap(), out_row_idx));
+                file_path = None;
             }
         }
         if let Some(writer) = writer {
             writer.close()?;
+            files.push((file_path.unwrap(), out_row_idx));
         }
         self.files = files;
         Ok(())
@@ -139,7 +146,7 @@ impl DiskSliceWriter {
             if let Some(new_location) = new_location {
                 new_index.insert(
                     *key,
-                    RecordLocation::new_disk_file(&self.files[new_location.0], new_location.1),
+                    RecordLocation::new_disk_file(&self.files[new_location.0].0, new_location.1),
                 );
             }
         }
@@ -157,7 +164,7 @@ impl DiskSliceWriter {
                 let old_location = (*self.batch_id_to_idx.get(batch_id).unwrap(), *row_idx);
                 let new_location = self.row_offset_mapping.get(&old_location).unwrap();
                 deletion.pos = RecordLocation::DiskFile(
-                    FileId(Arc::new(self.files[new_location.0].clone())),
+                    FileId(Arc::new(self.files[new_location.0].0.clone())),
                     new_location.1,
                 );
             }
@@ -218,7 +225,7 @@ mod tests {
         println!("Files: {:?}", disk_slice.output_files());
 
         // Read the files and verify the data
-        for file in disk_slice.output_files() {
+        for (file, _rows) in disk_slice.output_files() {
             let file = File::open(file).map_err(|e| Error::Io(e))?;
             let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
             println!("Converted arrow schema is: {}", builder.schema());
@@ -333,7 +340,10 @@ mod tests {
                         // Verify the file exists in our output files
                         let file_path = &file_id.0;
                         assert!(
-                            disk_slice.output_files().contains(file_path.as_ref()),
+                            disk_slice
+                                .output_files()
+                                .iter()
+                                .any(|(path, _)| path == file_path.as_ref()),
                             "Referenced file path should exist in output files"
                         );
                     }

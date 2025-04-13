@@ -1,7 +1,7 @@
 use crate::error::Result;
 use crate::row::MoonlinkRow;
 use crate::storage::data_batches::{BatchEntry, ColumnStoreBuffer};
-use crate::storage::index::index_util::{Index, MemIndex};
+use crate::storage::index::{Index, MemIndex};
 use crate::storage::table_utils::{RawDeletionRecord, RecordLocation};
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;

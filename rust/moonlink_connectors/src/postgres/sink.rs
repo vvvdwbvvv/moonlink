@@ -13,25 +13,21 @@ use pg_replicate::{
 use std::collections::{HashMap, HashSet};
 use std::fs::create_dir_all;
 use std::path::PathBuf;
-use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
-use tokio::sync::Mutex;
 use tokio_postgres::types::PgLsn;
 
 pub struct Sink {
-    table_handlers: Arc<Mutex<HashMap<TableId, TableHandler>>>,
+    table_handlers: HashMap<TableId, TableHandler>,
     event_senders: HashMap<TableId, Sender<TableEvent>>,
-    reader_notifier: Option<Sender<Sender<TableEvent>>>,
+    reader_notifier: Sender<Sender<TableEvent>>,
     base_path: PathBuf,
 }
 
 impl Sink {
-    pub fn new(reader_notifier: Option<Sender<Sender<TableEvent>>>, base_path: PathBuf) -> Self {
-        let table_handlers: Arc<Mutex<HashMap<u32, TableHandler>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+    pub fn new(reader_notifier: Sender<Sender<TableEvent>>, base_path: PathBuf) -> Self {
         let event_senders = HashMap::new();
         Self {
-            table_handlers,
+            table_handlers: HashMap::new(),
             event_senders,
             reader_notifier,
             base_path,
@@ -54,7 +50,7 @@ impl BatchSink for Sink {
         &mut self,
         table_schemas: HashMap<TableId, TableSchema>,
     ) -> Result<(), Self::Error> {
-        let mut table_handlers = self.table_handlers.lock().await;
+        let table_handlers = &mut self.table_handlers;
         for (table_id, table_schema) in table_schemas {
             let table_path =
                 PathBuf::from(&self.base_path).join(table_schema.table_name.to_string());
@@ -68,14 +64,11 @@ impl BatchSink for Sink {
             self.event_senders
                 .insert(table_id, table_handler.get_event_sender());
             self.reader_notifier
-                .as_ref()
-                .unwrap()
                 .send(table_handler.get_event_sender())
                 .await
                 .unwrap();
             table_handlers.insert(table_id, table_handler);
         }
-
         Ok(())
     }
 
