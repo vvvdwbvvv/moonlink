@@ -1,3 +1,3 @@
 mod postgres;
 
-pub use postgres::Sink;
+pub use postgres::{MoonlinkPostgresSource, PostgresSourceMetadata};

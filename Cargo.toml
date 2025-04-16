@@ -2,8 +2,7 @@
 members = [
     "rust/moonlink",
     "rust/moonlink_connectors",
-    "rust/pg_moonlink_test",
-    "rust/pg_mooncake_test_fn",
+    "rust/moonlink_service",
 ]
 resolver = "2"
 
