@@ -3,19 +3,17 @@ mod error;
 use error::Result;
 use moonlink::TableEvent;
 use moonlink_connectors::{MoonlinkPostgresSource, PostgresSourceMetadata};
-use std::collections::HashMap;
-use tokio::sync::mpsc::Sender;
-use tokio::sync::oneshot;
-use tokio::sync::RwLock;
+use std::{collections::HashMap, hash::Hash};
+use tokio::sync::{mpsc::Sender, oneshot, RwLock};
 
-pub trait TableIdentifier: Eq + std::hash::Hash + Clone + Send + Sync + 'static {}
+pub use error::Error;
 
-pub struct MoonlinkBackend<T: TableIdentifier> {
+pub struct MoonlinkBackend<T: Eq + Hash> {
     ingest_sources: RwLock<Vec<MoonlinkPostgresSource>>,
     table_readers: RwLock<HashMap<T, Sender<TableEvent>>>,
 }
 
-impl<T: TableIdentifier> MoonlinkBackend<T> {
+impl<T: Eq + Hash> MoonlinkBackend<T> {
     pub fn new() -> Self {
         Self {
             ingest_sources: RwLock::new(Vec::new()),
@@ -63,7 +61,7 @@ impl<T: TableIdentifier> MoonlinkBackend<T> {
         todo!()
     }
 
-    pub async fn scan_table_begin(&self, table_id: T) -> Result<(Vec<String>, Vec<(u32, u32)>)> {
+    pub async fn scan_table(&self, table_id: T) -> Result<(Vec<String>, Vec<(u32, u32)>)> {
         let table_readers = self.table_readers.read().await;
         let reader = table_readers.get(&table_id).unwrap();
         let (sender, receiver) = oneshot::channel();
@@ -88,17 +86,12 @@ impl<T: TableIdentifier> MoonlinkBackend<T> {
         );
         Ok(result)
     }
-
-    pub async fn scan_table_end(&self, _table_id: T, _lsn: u64) -> Result<()> {
-        todo!()
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    impl TableIdentifier for &'static str {}
     #[tokio::test]
     async fn test_moonlink_service() {
         let service = MoonlinkBackend::<&'static str>::new();
@@ -143,7 +136,7 @@ mod tests {
             .unwrap();
         // wait 2 second
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        let (columns, deletions) = service.scan_table_begin("test").await.unwrap();
+        let (columns, deletions) = service.scan_table("test").await.unwrap();
         println!("columns: {:?}", columns);
         println!("deletions: {:?}", deletions);
     }
