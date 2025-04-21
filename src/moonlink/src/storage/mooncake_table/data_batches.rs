@@ -128,9 +128,10 @@ impl ColumnStoreBuffer {
         let columns: Vec<ArrayRef> = self
             .current_rows
             .iter_mut()
-            .map(|builder| {
+            .zip(self.schema.fields())
+            .map(|(builder, field)| {
                 // Finish the builder to get an array
-                Arc::new(builder.finish()) as ArrayRef
+                Arc::new(builder.finish(field.data_type())) as ArrayRef
             })
             .collect();
 
@@ -204,7 +205,8 @@ pub(super) fn create_batch_from_rows(
     }
     let columns: Vec<ArrayRef> = builders
         .iter_mut()
-        .map(|builder| builder.finish())
+        .zip(schema.fields())
+        .map(|(builder, field)| builder.finish(field.data_type()))
         .collect();
     RecordBatch::try_new(Arc::clone(&schema), columns).unwrap()
 }
@@ -221,6 +223,11 @@ mod tests {
             Field::new("id", DataType::Int32, false),
             Field::new("name", DataType::Utf8, true),
             Field::new("age", DataType::Int32, false),
+            Field::new(
+                "event_date",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+                false,
+            ),
         ]);
 
         let mut buffer = ColumnStoreBuffer::new(Arc::new(schema), 2);
@@ -229,18 +236,21 @@ mod tests {
             RowValue::Int32(1),
             RowValue::ByteArray("John".as_bytes().to_vec()),
             RowValue::Int32(30),
+            RowValue::Int64(1618876800000000),
         ]);
 
         let row2 = MoonlinkRow::new(vec![
             RowValue::Int32(2),
             RowValue::ByteArray("Jane".as_bytes().to_vec()),
             RowValue::Int32(25),
+            RowValue::Int64(1618876800000000),
         ]);
 
         let row3 = MoonlinkRow::new(vec![
             RowValue::Int32(3),
             RowValue::ByteArray("Bob".as_bytes().to_vec()),
             RowValue::Int32(40),
+            RowValue::Int64(1618876800000000),
         ]);
 
         buffer.append_row(&row1)?;
