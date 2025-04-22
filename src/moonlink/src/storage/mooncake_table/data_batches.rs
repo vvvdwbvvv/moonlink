@@ -4,7 +4,7 @@ use crate::error::Result;
 use crate::row::MoonlinkRow;
 use crate::storage::storage_utils::RecordLocation;
 use arrow::array::{ArrayRef, RecordBatch};
-use arrow::datatypes::Schema;
+use arrow_schema::Schema;
 use std::sync::Arc;
 
 #[derive(Debug)]

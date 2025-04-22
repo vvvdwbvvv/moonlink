@@ -9,8 +9,8 @@ use super::index::{get_lookup_key, MemIndex, MooncakeIndex};
 use super::storage_utils::{RawDeletionRecord, RecordLocation};
 use crate::error::Result;
 use crate::row::MoonlinkRow;
-use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
+use arrow_schema::Schema;
 use delete_vector::BatchDeletionVector;
 pub(crate) use disk_slice::DiskSliceWriter;
 use mem_slice::MemSlice;
@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use tokio::spawn;
 use tokio::task::JoinHandle;
-struct TableConfig {
+pub(crate) struct TableConfig {
     /// mem slice size
     ///
     _mem_slice_size: usize,
@@ -47,17 +47,17 @@ impl TableConfig {
     }
 }
 
-struct TableMetadata {
+pub struct TableMetadata {
     /// table name
-    name: String,
+    pub(crate) name: String,
     /// table id
-    id: u64,
+    pub(crate) id: u64,
     /// table schema
-    schema: Arc<Schema>,
+    pub(crate) schema: Arc<Schema>,
     /// table config
-    config: TableConfig,
+    pub(crate) config: TableConfig,
     /// storage path
-    path: PathBuf,
+    pub(crate) path: PathBuf,
     /// function to get lookup key from row
     pub(crate) get_lookup_key: fn(&MoonlinkRow) -> i64,
 }
@@ -67,9 +67,9 @@ struct TableMetadata {
 ///
 pub struct Snapshot {
     /// table metadata
-    metadata: Arc<TableMetadata>,
+    pub(crate) metadata: Arc<TableMetadata>,
     /// datafile and their deletion vectors
-    disk_files: HashMap<PathBuf, BatchDeletionVector>,
+    pub(crate) disk_files: HashMap<PathBuf, BatchDeletionVector>,
     /// Current snapshot version
     snapshot_version: u64,
     /// indices
@@ -77,7 +77,7 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    fn new(metadata: Arc<TableMetadata>) -> Self {
+    pub(crate) fn new(metadata: Arc<TableMetadata>) -> Self {
         Self {
             metadata,
             disk_files: HashMap::new(),
