@@ -11,3 +11,7 @@ services:
     environment:
       POSTGRES_PASSWORD: postgres
     command: ["-c", "wal_level=logical"]
+
+  iceberg:
+    image: tabulario/iceberg-rest:latest
+    network_mode: service:postgres

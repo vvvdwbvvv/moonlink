@@ -1,11 +1,11 @@
 use crate::storage::mooncake_table::Snapshot;
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use arrow::datatypes::DataType as ArrowType;
 use arrow_schema::Schema as ArrowSchema;
-use iceberg::io::FileIOBuilder;
 use iceberg::spec::{DataFile, DataFileFormat};
 use iceberg::spec::{
     NestedField, NestedFieldRef, PrimitiveType, Schema as IcebergSchema, Type as IcebergType,
@@ -21,17 +21,17 @@ use iceberg::writer::IcebergWriterBuilder;
 use iceberg::NamespaceIdent;
 use iceberg::TableCreation;
 use iceberg::{Catalog, Result as IcebergResult, TableIdent};
-use iceberg_catalog_memory::MemoryCatalog;
+use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::file::properties::WriterProperties;
-use std::path::PathBuf;
 
 // UNDONE(Iceberg):
 // 1. Implement deletion file related load and store operations.
 // 2. Implement store and load for manifest files, manifest lists, and catalog metadata, which is not supported in iceberg-rust.
 // 3. Current implementation only works for in-memory catalog, we need to support remote access.
 // 3.1 Before development, setup local minio for integration testing purpose.
-// (unrelated) 4. Support all data types, other than major primitive types.
+// (unrelated to functionality) 4. Support all data types, other than major primitive types.
+// (unrelated to functionality) 5. Update rest catalog service ip/port, which should be parsed from env variable or config files.
 
 // Convert arrow schema to icerberg schema.
 fn arrow_to_iceberg_schema(arrow_schema: &ArrowSchema) -> IcebergSchema {
@@ -77,8 +77,8 @@ fn arrow_type_to_iceberg_type(data_type: &ArrowType) -> IcebergType {
 }
 
 // Get or create an iceberg table in the given catalog from the given namespace and table name.
-async fn get_or_create_iceberg_table(
-    catalog: &MemoryCatalog,
+async fn get_or_create_iceberg_table<C: Catalog>(
+    catalog: &C,
     namespace: &[&str],
     table_name: &str,
     arrow_schema: &ArrowSchema,
@@ -102,7 +102,7 @@ async fn get_or_create_iceberg_table(
             let tbl_creation = TableCreation::builder()
                 .name(table_name.to_string())
                 .location(format!(
-                    "memory://{}/{}",
+                    "file:///tmp/iceberg-test/{}/{}",
                     namespace_ident.to_url_string(),
                     table_name
                 ))
@@ -144,8 +144,11 @@ async fn write_record_batch_to_iceberg(
     );
 
     // TOOD(hjiang): Add support for partition values.
-    let data_file_writer_builder =
-        DataFileWriterBuilder::new(parquet_writer_builder, /*partition_valu=*/ None);
+    let data_file_writer_builder = DataFileWriterBuilder::new(
+        parquet_writer_builder,
+        /*partition_value=*/ None,
+        /*partition_spec_id=*/ 0,
+    );
     let mut data_file_writer = data_file_writer_builder.build().await?;
 
     while let Some(record_batch) = arrow_reader.next().transpose()? {
@@ -175,8 +178,11 @@ impl IcebergSnapshot for Snapshot {
         let table_name = self.metadata.name.clone();
         let namespace = vec!["default"];
         let arrow_schema = self.metadata.schema.as_ref();
-        let file_io = FileIOBuilder::new("memory").build()?;
-        let catalog = MemoryCatalog::new(file_io.clone(), None);
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder()
+                .uri("http://localhost:8181".to_string())
+                .build(),
+        );
         let iceberg_table =
             get_or_create_iceberg_table(&catalog, &namespace, &table_name, arrow_schema).await?;
 
@@ -202,6 +208,34 @@ impl IcebergSnapshot for Snapshot {
 mod tests {
     use super::*;
 
+    async fn delete_all_tables<C: Catalog>(catalog: &C) -> IcebergResult<()> {
+        let namespaces = catalog.list_namespaces(/*parent=*/ None).await?;
+        for namespace in namespaces {
+            let tables = catalog.list_tables(&namespace).await?;
+            for table in tables {
+                // Purge the table (delete all data and metadata)
+                catalog.drop_table(&table).await?;
+                println!("Deleted table: {:?} in namespace {:?}", table, namespace);
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn delete_all_namespaces<C: Catalog>(catalog: &C) -> IcebergResult<()> {
+        let namespaces = catalog.list_namespaces(/*parent=*/ None).await?;
+        for namespace in namespaces {
+            // Skip default namespace if it exists.
+            if namespace.len() == 1 && namespace[0] == "default" {
+                continue;
+            }
+            catalog.drop_namespace(&namespace).await?;
+            println!("Deleted namespace: {:?}", namespace);
+        }
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_write_record_batch_to_iceberg() -> IcebergResult<()> {
         use std::collections::HashMap;
@@ -211,10 +245,8 @@ mod tests {
 
         use arrow_array::{Int32Array, RecordBatch};
         use arrow_schema::{DataType, Field, Schema as ArrowSchema};
-        use iceberg::io::FileIOBuilder;
         use iceberg::table::Table;
         use iceberg::{NamespaceIdent, TableCreation};
-        use iceberg_catalog_memory::MemoryCatalog;
         use parquet::arrow::ArrowWriter;
 
         // Create Arrow schema and record batch.
@@ -222,7 +254,11 @@ mod tests {
             "id",
             DataType::Int32,
             false,
-        )]));
+        )
+        .with_metadata(HashMap::from([(
+            "PARQUET:field_id".to_string(),
+            "1".to_string(),
+        )]))]));
         let batch = RecordBatch::try_new(
             arrow_schema.clone(),
             vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
@@ -239,9 +275,16 @@ mod tests {
         // Build Iceberg schema.
         let iceberg_schema = arrow_to_iceberg_schema(&arrow_schema);
 
-        // Create in-memory catalog and table.
-        let file_io = FileIOBuilder::new("memory").build()?;
-        let catalog = MemoryCatalog::new(file_io.clone(), None);
+        // Create rest catalog and table.
+        let catalog = RestCatalog::new(
+            RestCatalogConfig::builder()
+                .uri("http://localhost:8181".to_string())
+                .build(),
+        );
+        // Cleanup states before testing.
+        delete_all_tables(&catalog).await?;
+        delete_all_namespaces(&catalog).await?;
+
         let namespace_ident = NamespaceIdent::from_strs(&["default"])?;
         let table_name = "test_table";
 
@@ -254,7 +297,7 @@ mod tests {
         let tbl_creation = TableCreation::builder()
             .name(table_name.to_string())
             .location(format!(
-                "memory://{}/{}",
+                "file:///tmp/iceberg-test/{}/{}",
                 namespace_ident.to_url_string(),
                 table_name
             ))
