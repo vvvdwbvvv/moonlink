@@ -13,37 +13,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tokio_postgres::{config::ReplicationMode, Client, Config, NoTls};
-
-#[derive(Debug, PartialEq, Eq)]
-pub struct PostgresSourceMetadata {
-    host: String,
-    port: u16,
-    database: String,
-    username: String,
-    password: String,
-}
-
-impl PostgresSourceMetadata {
-    pub fn new(
-        host: String,
-        port: u16,
-        database: String,
-        username: String,
-        password: String,
-    ) -> Self {
-        Self {
-            host,
-            port,
-            database,
-            username,
-            password,
-        }
-    }
-}
+use tokio_postgres::{connect, Client, NoTls};
 
 pub struct MoonlinkPostgresSource {
-    metadata: PostgresSourceMetadata,
+    uri: String,
     postgres_client: Client,
     handle: Option<
         JoinHandle<
@@ -53,17 +26,8 @@ pub struct MoonlinkPostgresSource {
 }
 
 impl MoonlinkPostgresSource {
-    pub async fn new(metadata: PostgresSourceMetadata) -> Result<Self, PostgresSourceError> {
-        let mut config = Config::new();
-        config
-            .host(&metadata.host)
-            .port(metadata.port)
-            .dbname(&metadata.database)
-            .user(&metadata.username)
-            .password(&metadata.password)
-            .replication_mode(ReplicationMode::Logical);
-
-        let (postgres_client, connection) = config.connect(NoTls).await.unwrap();
+    pub async fn new(uri: String) -> Result<Self, PostgresSourceError> {
+        let (postgres_client, connection) = connect(&uri, NoTls).await.unwrap();
         tokio::spawn(async move {
             if let Err(e) = connection.await {
                 panic!("connection error: {}", e);
@@ -76,7 +40,7 @@ impl MoonlinkPostgresSource {
             .await
             .unwrap();
         Ok(Self {
-            metadata,
+            uri,
             postgres_client,
             handle: None,
         })
@@ -84,22 +48,17 @@ impl MoonlinkPostgresSource {
 
     pub async fn add_table(
         &mut self,
-        schema: &str,
         table: &str,
     ) -> Result<mpsc::Sender<moonlink::TableEvent>, PostgresSourceError> {
         self.postgres_client
             .simple_query(&format!(
-                "ALTER PUBLICATION moonlink_pub ADD TABLE {}.{};",
-                schema, table
+                "ALTER PUBLICATION moonlink_pub ADD TABLE {};",
+                table
             ))
             .await
             .unwrap();
         let source = PostgresSource::new(
-            &self.metadata.host,
-            self.metadata.port,
-            &self.metadata.database,
-            &self.metadata.username,
-            Some(self.metadata.password.clone()),
+            &self.uri,
             Some("moonlink_slot".to_string()),
             TableNamesFrom::Publication("moonlink_pub".to_string()),
         )
@@ -119,7 +78,7 @@ impl MoonlinkPostgresSource {
         Ok(res.unwrap())
     }
 
-    pub fn check_table_belongs_to_source(&self, metadata: &PostgresSourceMetadata) -> bool {
-        self.metadata == *metadata
+    pub fn check_table_belongs_to_source(&self, uri: &str) -> bool {
+        self.uri == uri
     }
 }

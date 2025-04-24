@@ -57,27 +57,11 @@ pub enum ReplicationClientError {
 
 impl ReplicationClient {
     /// Connect to a postgres database in logical replication mode without TLS
-    pub async fn connect_no_tls(
-        host: &str,
-        port: u16,
-        database: &str,
-        username: &str,
-        password: Option<String>,
-    ) -> Result<ReplicationClient, ReplicationClientError> {
+    pub async fn connect_no_tls(uri: &str) -> Result<ReplicationClient, ReplicationClientError> {
         info!("connecting to postgres");
 
-        let mut config = Config::new();
-        config
-            .host(host)
-            .port(port)
-            .dbname(database)
-            .user(username)
-            .replication_mode(ReplicationMode::Logical);
-
-        if let Some(password) = password {
-            config.password(password);
-        }
-
+        let mut config = uri.parse::<Config>()?;
+        config.replication_mode(ReplicationMode::Logical);
         let (postgres_client, connection) = config.connect(NoTls).await?;
 
         tokio::spawn(async move {

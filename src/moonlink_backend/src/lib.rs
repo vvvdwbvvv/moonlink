@@ -2,7 +2,7 @@ mod error;
 
 use error::Result;
 use moonlink::TableEvent;
-use moonlink_connectors::{MoonlinkPostgresSource, PostgresSourceMetadata};
+use moonlink_connectors::MoonlinkPostgresSource;
 use std::{collections::HashMap, hash::Hash};
 use tokio::sync::{mpsc::Sender, oneshot, RwLock};
 
@@ -21,40 +21,20 @@ impl<T: Eq + Hash> MoonlinkBackend<T> {
         }
     }
 
-    pub async fn create_table(
-        &self,
-        table_id: T,
-        host: &str,
-        port: u16,
-        username: &str,
-        password: &str,
-        database: &str,
-        schema: &str,
-        table: &str,
-    ) -> Result<()> {
-        let metadata = PostgresSourceMetadata::new(
-            host.to_string(),
-            port,
-            database.to_string(),
-            username.to_string(),
-            password.to_string(),
-        );
-        {
-            let mut ingest_sources = self.ingest_sources.write().await;
-            for ingest_source in ingest_sources.iter_mut() {
-                if ingest_source.check_table_belongs_to_source(&metadata) {
-                    let sender = ingest_source.add_table(schema, table).await?;
-                    self.table_readers.write().await.insert(table_id, sender);
-                    return Ok(());
-                }
+    pub async fn create_table(&self, table_id: T, table: &str, uri: &str) -> Result<()> {
+        let mut ingest_sources = self.ingest_sources.write().await;
+        for ingest_source in ingest_sources.iter_mut() {
+            if ingest_source.check_table_belongs_to_source(uri) {
+                let sender = ingest_source.add_table(table).await?;
+                self.table_readers.write().await.insert(table_id, sender);
+                return Ok(());
             }
-            let mut ingest_source = MoonlinkPostgresSource::new(metadata).await?;
-            let sender = ingest_source.add_table(schema, table).await?;
-            ingest_sources.push(ingest_source);
-            self.table_readers.write().await.insert(table_id, sender);
         }
-
-        return Ok(());
+        let mut ingest_source = MoonlinkPostgresSource::new(uri.to_owned()).await?;
+        let sender = ingest_source.add_table(table).await?;
+        ingest_sources.push(ingest_source);
+        self.table_readers.write().await.insert(table_id, sender);
+        Ok(())
     }
 
     pub async fn drop_table(&self, _table_id: T) -> Result<()> {
@@ -91,20 +71,14 @@ impl<T: Eq + Hash> MoonlinkBackend<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio_postgres::{connect, NoTls};
 
     #[tokio::test]
     async fn test_moonlink_service() {
+        let uri = "postgresql://postgres:postgres@localhost:5432/postgres";
         let service = MoonlinkBackend::<&'static str>::new();
         // connect to postgres and create a table
-        let (client, connection) = tokio_postgres::Config::new()
-            .host("localhost")
-            .port(5432)
-            .user("postgres")
-            .password("postgres")
-            .dbname("postgres")
-            .connect(tokio_postgres::NoTls)
-            .await
-            .unwrap();
+        let (client, connection) = connect(uri, NoTls).await.unwrap();
         tokio::spawn(async move {
             if let Err(e) = connection.await {
                 eprintln!("connection error: {}", e);
@@ -114,16 +88,7 @@ mod tests {
         client.simple_query("DROP TABLE IF EXISTS test; CREATE TABLE test (id bigint PRIMARY KEY, name VARCHAR(255));").await.unwrap();
         println!("created table");
         service
-            .create_table(
-                "test",
-                "localhost",
-                5432,
-                "postgres",
-                "postgres",
-                "postgres",
-                "public",
-                "test",
-            )
+            .create_table("test", "public.test", uri)
             .await
             .unwrap();
         client

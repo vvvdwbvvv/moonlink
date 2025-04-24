@@ -31,14 +31,17 @@ pub enum TableNamesFrom {
 
 #[derive(Debug, Error)]
 pub enum PostgresSourceError {
-    #[error("replication client error: {0}")]
-    ReplicationClient(#[from] ReplicationClientError),
-
     #[error("cdc stream can only be started with a publication")]
     MissingPublication,
 
     #[error("cdc stream can only be started with a slot_name")]
     MissingSlotName,
+
+    #[error("replication client error: {0}")]
+    ReplicationClient(#[from] ReplicationClientError),
+
+    #[error("tokio postgres error: {0}")]
+    TokioPostgres(#[from] tokio_postgres::Error),
 }
 
 impl SourceError for PostgresSourceError {}
@@ -52,16 +55,11 @@ pub struct PostgresSource {
 
 impl PostgresSource {
     pub async fn new(
-        host: &str,
-        port: u16,
-        database: &str,
-        username: &str,
-        password: Option<String>,
+        uri: &str,
         slot_name: Option<String>,
         table_names_from: TableNamesFrom,
     ) -> Result<PostgresSource, PostgresSourceError> {
-        let mut replication_client =
-            ReplicationClient::connect_no_tls(host, port, database, username, password).await?;
+        let mut replication_client = ReplicationClient::connect_no_tls(uri).await?;
         replication_client.begin_readonly_transaction().await?;
         if let Some(ref slot_name) = slot_name {
             replication_client.get_or_create_slot(slot_name).await?;
