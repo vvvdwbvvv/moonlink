@@ -14,12 +14,13 @@ use arrow_schema::Schema;
 use delete_vector::BatchDeletionVector;
 pub(crate) use disk_slice::DiskSliceWriter;
 use mem_slice::MemSlice;
-use snapshot::SnapshotTableState;
+pub(crate) use snapshot::SnapshotTableState;
 use std::collections::HashMap;
 use std::mem::take;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use tokio::spawn;
+use tokio::sync::{watch, RwLock};
 use tokio::task::JoinHandle;
 pub(crate) struct TableConfig {
     /// mem slice size
@@ -165,6 +166,9 @@ pub struct MooncakeTable {
 
     // Current snapshot of the table
     snapshot: Arc<RwLock<SnapshotTableState>>,
+
+    table_snapshot_watch_sender: watch::Sender<u64>,
+    table_snapshot_watch_receiver: watch::Receiver<u64>,
     next_snapshot_task: SnapshotTask,
 
     // Stream state per transaction
@@ -185,15 +189,27 @@ impl MooncakeTable {
             path: base_path,
             get_lookup_key,
         });
+        let (table_snapshot_watch_sender, table_snapshot_watch_receiver) = watch::channel(0);
         let table = Self {
             mem_slice: MemSlice::new(metadata.schema.clone(), metadata.config.batch_size),
             metadata: metadata.clone(),
             snapshot: Arc::new(RwLock::new(SnapshotTableState::new(metadata))),
             next_snapshot_task: SnapshotTask::new(),
             transaction_stream_states: HashMap::new(),
+            table_snapshot_watch_sender,
+            table_snapshot_watch_receiver,
         };
 
         table
+    }
+
+    pub(crate) fn get_state_for_reader(
+        &self,
+    ) -> (Arc<RwLock<SnapshotTableState>>, watch::Receiver<u64>) {
+        (
+            self.snapshot.clone(),
+            self.table_snapshot_watch_receiver.clone(),
+        )
     }
 
     pub fn append(&mut self, row: MoonlinkRow) -> Result<()> {
@@ -312,7 +328,7 @@ impl MooncakeTable {
         })
     }
 
-    pub fn flush_transaction_stream(
+    pub(crate) fn flush_transaction_stream(
         &mut self,
         xact_id: u32,
         lsn: u64,
@@ -327,6 +343,8 @@ impl MooncakeTable {
             }
 
             let snapshot_task = &mut self.next_snapshot_task;
+
+            snapshot_task.new_lsn = lsn;
 
             for deletion in snapshot_task.new_deletions.iter_mut() {
                 if deletion.xact_id == Some(xact_id) {
@@ -349,7 +367,7 @@ impl MooncakeTable {
 
     // UNDONE(BATCH_INSERT):
     // flush uncommitted batches from big batch insert
-    pub fn flush(&mut self, lsn: u64) -> JoinHandle<Result<DiskSliceWriter>> {
+    pub(crate) fn flush(&mut self, lsn: u64) -> JoinHandle<Result<DiskSliceWriter>> {
         Self::inner_flush(
             &mut self.mem_slice,
             &mut self.next_snapshot_task,
@@ -358,14 +376,14 @@ impl MooncakeTable {
         )
     }
 
-    pub fn commit_flush(&mut self, disk_slice: DiskSliceWriter) -> Result<()> {
+    pub(crate) fn commit_flush(&mut self, disk_slice: DiskSliceWriter) -> Result<()> {
         self.next_snapshot_task.new_disk_slices.push(disk_slice);
         Ok(())
     }
 
     // Create a snapshot of the last committed version
     //
-    pub fn create_snapshot(&mut self) -> Option<JoinHandle<()>> {
+    pub(crate) fn create_snapshot(&mut self) -> Option<JoinHandle<u64>> {
         if !self.next_snapshot_task.should_create_snapshot() {
             return None;
         }
@@ -376,19 +394,15 @@ impl MooncakeTable {
         )))
     }
 
+    pub(crate) fn notify_snapshot_reader(&self, lsn: u64) {
+        self.table_snapshot_watch_sender.send(lsn).unwrap();
+    }
+
     async fn create_snapshot_async(
         snapshot: Arc<RwLock<SnapshotTableState>>,
         next_snapshot_task: SnapshotTask,
-    ) {
-        snapshot
-            .write()
-            .unwrap()
-            .update_snapshot(next_snapshot_task);
-    }
-
-    pub fn request_read(&self) -> Result<(Vec<PathBuf>, Vec<(usize, usize)>)> {
-        let snapshot = self.snapshot.read().unwrap();
-        snapshot.request_read()
+    ) -> u64 {
+        snapshot.write().await.update_snapshot(next_snapshot_task)
     }
 }
 
@@ -396,4 +410,4 @@ impl MooncakeTable {
 mod tests;
 
 #[cfg(test)]
-mod test_utils;
+pub(crate) mod test_utils;

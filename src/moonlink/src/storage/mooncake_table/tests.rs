@@ -1,8 +1,6 @@
 use super::test_utils::*;
 #[cfg(test)]
 use super::*;
-use std::collections::HashSet;
-
 #[tokio::test]
 async fn test_append_commit_snapshot() -> Result<()> {
     let context = TestContext::new("append_commit");
@@ -10,7 +8,7 @@ async fn test_append_commit_snapshot() -> Result<()> {
     append_rows(&mut table, vec![test_row(1, "A", 20), test_row(2, "B", 21)])?;
     table.commit(1);
     snapshot(&mut table).await;
-    let snapshot = table.snapshot.read().unwrap();
+    let snapshot = table.snapshot.read().await;
     let (paths, _deletions) = snapshot.request_read()?;
     verify_file_contents(&paths[0], &[1, 2], Some(2));
     Ok(())
@@ -22,7 +20,7 @@ async fn test_flush_basic() -> Result<()> {
     let mut table = test_table(&context, "flush_table");
     let rows = vec![test_row(1, "Alice", 30), test_row(2, "Bob", 25)];
     append_commit_flush_snapshot(&mut table, rows, 1).await?;
-    let snapshot = table.snapshot.read().unwrap();
+    let snapshot = table.snapshot.read().await;
     let (paths, _deletions) = snapshot.request_read()?;
     verify_file_contents(&paths[0], &[1, 2], Some(2));
     Ok(())
@@ -47,35 +45,19 @@ async fn test_delete_and_append() -> Result<()> {
     table.commit(3);
     snapshot(&mut table).await;
 
-    let snapshot = table.snapshot.read().unwrap();
-    let (paths, _deletions) = snapshot.request_read()?;
-    // Need to manually handle deletions in the test - simulate what a real reader would do
-    let mut files = paths.clone();
-    files.sort(); // Ensure consistent order
-    let mut actual_ids = HashSet::new();
-
-    // First read all IDs
-    for path in &files {
-        let ids = read_ids_from_parquet(path);
-        actual_ids.extend(ids);
-    }
-
-    // Then remove deleted IDs (ID 2 should be deleted)
-    for path in &files {
-        if files[0] == *path {
-            // This is the first file containing original rows
-            // Remove ID 2 which should be deleted
-            actual_ids.remove(&2);
-            break;
-        }
-    }
-
-    let expected: HashSet<_> = [1, 3, 4].iter().copied().collect();
-    assert_eq!(
-        actual_ids, expected,
-        "File contents after deletions don't match expected IDs"
+    let snapshot = table.snapshot.read().await;
+    let (paths, deletions) = snapshot.request_read()?;
+    verify_files_and_deletions(
+        &paths
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect::<Vec<_>>(),
+        &deletions
+            .iter()
+            .map(|d| (d.0 as u32, d.1 as u32))
+            .collect::<Vec<_>>(),
+        &[1, 3, 4],
     );
-
     Ok(())
 }
 
@@ -92,7 +74,7 @@ async fn test_deletion_before_flush() -> Result<()> {
     table.commit(2);
     snapshot(&mut table).await;
 
-    let snapshot = table.snapshot.read().unwrap();
+    let snapshot = table.snapshot.read().await;
     let (paths, _deletions) = snapshot.request_read()?;
     verify_file_contents(&paths[0], &[1, 3], None);
     Ok(())
@@ -109,14 +91,15 @@ async fn test_deletion_after_flush() -> Result<()> {
     table.commit(2);
     snapshot(&mut table).await;
 
-    let snapshot = table.snapshot.read().unwrap();
-    let (paths, _deletions) = snapshot.request_read()?;
-    // Need to manually handle deletions in the test - simulate what a real reader would do
+    let snapshot = table.snapshot.read().await;
+    let (paths, deletions) = snapshot.request_read()?;
+    assert_eq!(paths.len(), 1);
     let mut ids = read_ids_from_parquet(&paths[0]);
 
-    // Apply deletions - IDs 2 and 4 should be removed
-    ids.remove(&2);
-    ids.remove(&4);
+    for deletion in deletions {
+        ids[deletion.1 as usize] = None;
+    }
+    let ids = ids.into_iter().filter_map(|id| id).collect::<Vec<_>>();
 
     assert!(ids.contains(&1));
     assert!(ids.contains(&3));
