@@ -3,9 +3,7 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 use iceberg::io::FileIO;
-use iceberg::spec::{
-    SnapshotReference, SnapshotRetention, TableMetadata, TableMetadataBuilder, MAIN_BRANCH,
-};
+use iceberg::spec::{TableMetadata, TableMetadataBuilder};
 use iceberg::table::Table;
 use iceberg::Error as IcebergError;
 use iceberg::Result as IcebergResult;
@@ -19,9 +17,8 @@ use iceberg::{
 ///
 /// TODO(hjiang):
 /// 1. Implement property related functionalities.
-/// 2. Implement concurrent accesses features, currently we assume it's only single thread access.
-/// 3. The initial version access everything via filesystem, for performance consideration we should cache metadata in memory.
-/// (not related to functionality) 4. Set snapshot retention policy at metadata.
+/// 2. The initial version access everything via filesystem, for performance consideration we should cache metadata in memory.
+/// (not related to functionality) 3. Set snapshot retention policy at metadata.
 
 /// Iceberg table format from filesystem's perspective:
 /// - data
@@ -61,7 +58,7 @@ impl FileSystemCatalog {
         }
     }
 
-    // Load metadata for the given table.
+    /// Load metadata for the given table.
     async fn load_metadata(
         &self,
         table_ident: &TableIdent,
@@ -498,41 +495,25 @@ impl Catalog for FileSystemCatalog {
 
         // TODO(hjiang): As of now, we only take one AddSnapshot update.
         let updates = commit.take_updates();
-        assert_eq!(
-            updates.len(),
-            1,
-            "Only one update is expected in this implementation"
-        );
-        let mut snapshot_id: Option<i64> = None;
         for update in &updates {
             match update {
                 TableUpdate::AddSnapshot { snapshot } => {
-                    snapshot_id = Some(snapshot.snapshot_id());
                     builder = builder.add_snapshot(snapshot.clone())?;
                 }
+                TableUpdate::SetSnapshotRef {
+                    ref_name,
+                    reference,
+                } => {
+                    builder = builder.set_ref(ref_name, reference.clone())?;
+                }
                 _ => {
-                    unreachable!("Only AddSnapshot updates are expected in this implementation");
+                    unreachable!("Only snapshot updates are expected in this implementation");
                 }
             }
         }
 
-        // After apply all update operations, set current snapshot to the latest one.
-        let metadata = builder
-            .set_ref(
-                MAIN_BRANCH,
-                SnapshotReference {
-                    snapshot_id: snapshot_id.unwrap(),
-                    retention: SnapshotRetention::Branch {
-                        min_snapshots_to_keep: None,
-                        max_snapshot_age_ms: None,
-                        max_ref_age_ms: None,
-                    },
-                },
-            )
-            .unwrap()
-            .build()
-            .unwrap()
-            .metadata;
+        // Construct new metadata with updates.
+        let metadata = builder.build()?.metadata;
 
         // Write metadata file.
         let metadata_directory = format!(
@@ -570,7 +551,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::TempDir;
 
-    use iceberg::spec::{NestedField, PrimitiveType, Schema, Type as IcebergType};
+    use iceberg::spec::{
+        NestedField, PrimitiveType, Schema, SnapshotReference, SnapshotRetention,
+        Type as IcebergType, MAIN_BRANCH,
+    };
     use iceberg::NamespaceIdent;
     use iceberg::Result as IcebergResult;
 
@@ -811,24 +795,37 @@ mod tests {
             .as_millis();
 
         let mut table_updates = vec![];
-        table_updates.append(&mut vec![TableUpdate::AddSnapshot {
-            snapshot: iceberg::spec::Snapshot::builder()
-                .with_snapshot_id(1)
-                .with_sequence_number(1)
-                .with_timestamp_ms(millis as i64)
-                .with_schema_id(0)
-                .with_manifest_list(format!(
-                    "file:///tmp/iceberg-test/{}/{}/snap-8161620281254644995-0-01966b87-6e93-7bc1-9e12-f1980d9737d3.avro",
-                    namespace.to_url_string(),
-                    table_name
-                ))
-                .with_parent_snapshot_id(None)
-                .with_summary(iceberg::spec::Summary {
-                    operation: iceberg::spec::Operation::Append,
-                    additional_properties: HashMap::new(),
-                })
-                .build(),
-        }]);
+        table_updates.append(&mut vec![
+            TableUpdate::AddSnapshot {
+                snapshot: iceberg::spec::Snapshot::builder()
+                    .with_snapshot_id(1)
+                    .with_sequence_number(1)
+                    .with_timestamp_ms(millis as i64)
+                    .with_schema_id(0)
+                    .with_manifest_list(format!(
+                        "file:///tmp/iceberg-test/{}/{}/snap-8161620281254644995-0-01966b87-6e93-7bc1-9e12-f1980d9737d3.avro",
+                        namespace.to_url_string(),
+                        table_name
+                    ))
+                    .with_parent_snapshot_id(None)
+                    .with_summary(iceberg::spec::Summary {
+                        operation: iceberg::spec::Operation::Append,
+                        additional_properties: HashMap::new(),
+                    })
+                    .build(),
+            },
+            TableUpdate::SetSnapshotRef {
+                ref_name: MAIN_BRANCH.to_string(),
+                reference: SnapshotReference {
+                    snapshot_id: 1,
+                    retention: SnapshotRetention::Branch {
+                        min_snapshots_to_keep: None,
+                        max_snapshot_age_ms: None,
+                        max_ref_age_ms: None,
+                    },
+                },
+            }
+        ]);
 
         // TODO(hjiang): This is a hack to create `TableCommit`, because its builder is only exposed to crate instead of public.
         #[repr(C)]

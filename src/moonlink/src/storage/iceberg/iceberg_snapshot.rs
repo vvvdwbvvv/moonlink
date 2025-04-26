@@ -1,3 +1,4 @@
+use super::catalog_utils::create_catalog;
 use crate::storage::mooncake_table::delete_vector::BatchDeletionVector;
 use crate::storage::mooncake_table::Snapshot;
 
@@ -25,17 +26,15 @@ use iceberg::writer::IcebergWriterBuilder;
 use iceberg::NamespaceIdent;
 use iceberg::TableCreation;
 use iceberg::{Catalog, Result as IcebergResult, TableIdent};
-use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::file::properties::WriterProperties;
 
 // UNDONE(Iceberg):
-// 1. Implement filesystem catalog for (1) unit test; (2) local quick experiment for pg_mooncake.
-// 2. Implement deletion file related load and store operations.
-// (unrelated to functionality) 3. Support all data types, other than major primitive types.
-// (unrelated to functionality) 4. Update rest catalog service ip/port, currently it's hard-coded to devcontainer's config, which should be parsed from env variable or config files.
-// (unrelated to functionality) 5. Add timeout to rest catalog access.
-// (unrelated to functionality) 6. Use real namespace and table name, which we should be able to get it from moonlink, it's hard-coded to "default" and "test_table" for now.
+// 1. Implement deletion file related load and store operations.
+// (unrelated to functionality) 2. Support all data types, other than major primitive types.
+// (unrelated to functionality) 3. Update rest catalog service ip/port, currently it's hard-coded to devcontainer's config, which should be parsed from env variable or config files.
+// (unrelated to functionality) 4. Add timeout to rest catalog access.
+// (unrelated to functionality) 5. Use real namespace and table name, which we should be able to get it from moonlink, it's hard-coded to "default" and "test_table" for now.
 
 // Convert arrow schema to icerberg schema.
 fn arrow_to_iceberg_schema(arrow_schema: &ArrowSchema) -> IcebergSchema {
@@ -81,7 +80,7 @@ fn arrow_type_to_iceberg_type(data_type: &ArrowType) -> IcebergType {
 }
 
 // Get or create an iceberg table in the given catalog from the given namespace and table name.
-async fn get_or_create_iceberg_table<C: Catalog>(
+async fn get_or_create_iceberg_table<C: Catalog + ?Sized>(
     catalog: &C,
     namespace: &[&str],
     table_name: &str,
@@ -189,13 +188,9 @@ impl IcebergSnapshot for Snapshot {
         let table_name = self.metadata.name.clone();
         let namespace = vec!["default"];
         let arrow_schema = self.metadata.schema.as_ref();
-        let catalog = RestCatalog::new(
-            RestCatalogConfig::builder()
-                .uri("http://localhost:8181".to_string())
-                .build(),
-        );
+        let catalog = create_catalog(&self.warehouse_uri)?;
         let iceberg_table =
-            get_or_create_iceberg_table(&catalog, &namespace, &table_name, arrow_schema).await?;
+            get_or_create_iceberg_table(&*catalog, &namespace, &table_name, arrow_schema).await?;
 
         let txn = Transaction::new(&iceberg_table);
         let mut action =
@@ -216,7 +211,7 @@ impl IcebergSnapshot for Snapshot {
 
         // Commit write transaction, which internally creates manifest files and manifest list files.
         let txn = action.apply().await?;
-        txn.commit(&catalog).await?;
+        txn.commit(&*catalog).await?;
 
         Ok(())
     }
@@ -225,13 +220,9 @@ impl IcebergSnapshot for Snapshot {
         let namespace = vec!["default"];
         let table_name = self.metadata.name.clone();
         let arrow_schema = self.metadata.schema.as_ref();
-        let catalog = RestCatalog::new(
-            RestCatalogConfig::builder()
-                .uri("http://localhost:8181".to_string())
-                .build(),
-        );
+        let catalog = create_catalog(&self.warehouse_uri)?;
         let iceberg_table =
-            get_or_create_iceberg_table(&catalog, &namespace, &table_name, arrow_schema).await?;
+            get_or_create_iceberg_table(&*catalog, &namespace, &table_name, arrow_schema).await?;
 
         let table_metadata = iceberg_table.metadata();
         let snapshot_meta = table_metadata.current_snapshot().unwrap();
@@ -268,7 +259,10 @@ impl IcebergSnapshot for Snapshot {
 mod tests {
     use super::*;
 
-    use crate::storage::mooncake_table::{Snapshot, TableConfig, TableMetadata};
+    use crate::storage::{
+        iceberg::catalog_utils::create_catalog,
+        mooncake_table::{Snapshot, TableConfig, TableMetadata},
+    };
 
     use std::collections::HashMap;
     use std::fs::File;
@@ -280,7 +274,7 @@ mod tests {
     use iceberg::io::FileRead;
     use parquet::arrow::ArrowWriter;
 
-    async fn delete_all_tables<C: Catalog>(catalog: &C) -> IcebergResult<()> {
+    async fn delete_all_tables<C: Catalog + ?Sized>(catalog: &C) -> IcebergResult<()> {
         let namespaces = catalog.list_namespaces(/*parent=*/ None).await?;
         for namespace in namespaces {
             let tables = catalog.list_tables(&namespace).await?;
@@ -293,7 +287,7 @@ mod tests {
         Ok(())
     }
 
-    async fn delete_all_namespaces<C: Catalog>(catalog: &C) -> IcebergResult<()> {
+    async fn delete_all_namespaces<C: Catalog + ?Sized>(catalog: &C) -> IcebergResult<()> {
         let namespaces = catalog.list_namespaces(/*parent=*/ None).await?;
         for namespace in namespaces {
             catalog.drop_namespace(&namespace).await.ok();
@@ -303,8 +297,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn test_store_and_load_snapshot() -> IcebergResult<()> {
+    async fn test_store_and_load_snapshot_impl(warehouse_uri: &str) -> IcebergResult<()> {
         // Create Arrow schema and record batch.
         let arrow_schema =
             Arc::new(ArrowSchema::new(vec![
@@ -324,14 +317,10 @@ mod tests {
         )?;
 
         // Cleanup namespace and table before testing.
-        let catalog = RestCatalog::new(
-            RestCatalogConfig::builder()
-                .uri("http://localhost:8181".to_string())
-                .build(),
-        );
+        let catalog = create_catalog(warehouse_uri)?;
         // Cleanup states before testing.
-        delete_all_tables(&catalog).await?;
-        delete_all_namespaces(&catalog).await?;
+        delete_all_tables(&*catalog).await?;
+        delete_all_namespaces(&*catalog).await?;
 
         // Write record batch to Parquet file.
         let tmp_dir = tempdir()?;
@@ -354,6 +343,7 @@ mod tests {
         disk_files.insert(parquet_path.clone(), BatchDeletionVector::new(0));
 
         let mut snapshot = Snapshot::new(metadata);
+        snapshot.set_warehouse_info(warehouse_uri.to_string());
         snapshot.disk_files = disk_files;
 
         snapshot._export_to_iceberg().await?;
@@ -367,7 +357,7 @@ mod tests {
         let namespace = vec!["default"];
         let table_name = "test_table";
         let iceberg_table =
-            get_or_create_iceberg_table(&catalog, &namespace, table_name, &arrow_schema).await?;
+            get_or_create_iceberg_table(&*catalog, &namespace, table_name, &arrow_schema).await?;
         let file_io = iceberg_table.file_io();
 
         // Check the loaded data file exists.
@@ -409,6 +399,21 @@ mod tests {
             "Name data should match"
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_store_and_load_snapshot_with_rest_catalog() -> IcebergResult<()> {
+        let warehouse_uri = "http://localhost:8181";
+        test_store_and_load_snapshot_impl(warehouse_uri).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_store_and_load_snapshot_with_filesystem_catalog() -> IcebergResult<()> {
+        let tmp_dir = tempdir()?;
+        let warehouse_path = tmp_dir.path().to_str().unwrap();
+        test_store_and_load_snapshot_impl(warehouse_path).await?;
         Ok(())
     }
 }

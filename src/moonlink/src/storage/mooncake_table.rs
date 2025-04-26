@@ -9,16 +9,18 @@ use super::index::{get_lookup_key, MemIndex, MooncakeIndex};
 use super::storage_utils::{RawDeletionRecord, RecordLocation};
 use crate::error::{Error, Result};
 use crate::row::MoonlinkRow;
+
+use std::collections::HashMap;
+use std::mem::take;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
 use arrow::record_batch::RecordBatch;
 use arrow_schema::Schema;
 use delete_vector::BatchDeletionVector;
 pub(crate) use disk_slice::DiskSliceWriter;
 use mem_slice::MemSlice;
 pub(crate) use snapshot::SnapshotTableState;
-use std::collections::HashMap;
-use std::mem::take;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use tokio::spawn;
 use tokio::sync::{watch, RwLock};
 use tokio::task::JoinHandle;
@@ -67,6 +69,8 @@ pub struct TableMetadata {
 /// A snapshot maps directly to an iceberg snapshot.
 ///
 pub struct Snapshot {
+    /// Warehouse URI for the catalog.
+    pub(crate) warehouse_uri: String,
     /// table metadata
     pub(crate) metadata: Arc<TableMetadata>,
     /// datafile and their deletion vectors
@@ -80,11 +84,19 @@ pub struct Snapshot {
 impl Snapshot {
     pub(crate) fn new(metadata: Arc<TableMetadata>) -> Self {
         Self {
+            // Provide default warehouse location at filesystem.
+            warehouse_uri: "/tmp/moonlink_iceberg_warehouse".to_string(),
             metadata,
             disk_files: HashMap::new(),
             snapshot_version: 0,
             indices: MooncakeIndex::new(),
         }
+    }
+
+    // TODO(hjiang): Currently development between mooncake table and iceberg is independent, this interface is left for unit test purpose.
+    // After end-to-end integration, warehouse information should be passed down from postgres at `Snapshot` initialization.
+    pub fn set_warehouse_info(&mut self, warehouse_uri: String) {
+        self.warehouse_uri = warehouse_uri;
     }
 
     pub fn get_name_for_inmemory_file(&self) -> PathBuf {
