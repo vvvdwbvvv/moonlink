@@ -12,6 +12,7 @@ edition = "2021"
 
 [workspace.dependencies]
 async-trait = "0.1"
+bincode = "2"
 
 tokio-postgres = { git = "ssh://git@github.com/Mooncake-labs/rust-postgres.git"}
 arrow = "54.2.1"

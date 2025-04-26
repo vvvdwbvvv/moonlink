@@ -3,10 +3,14 @@
 // Meant to be sent using either shared memory or network connection.
 //
 
+use super::table_metadata::TableMetadata;
+use bincode::config;
+
+const BINCODE_CONFIG: config::Configuration = config::standard();
+
 #[derive(Debug)]
 pub struct ReadState {
-    pub files: Vec<String>,
-    pub deletions: Vec<(u32, u32)>,
+    pub data: Vec<u8>,
 }
 
 impl Drop for ReadState {
@@ -17,9 +21,11 @@ impl Drop for ReadState {
 
 impl ReadState {
     pub(super) fn new(input: (Vec<String>, Vec<(u32, u32)>)) -> Self {
-        ReadState {
-            files: input.0,
-            deletions: input.1,
-        }
+        let metadata = TableMetadata {
+            data_files: input.0,
+            position_deletes: input.1,
+        };
+        let data = bincode::encode_to_vec(metadata, BINCODE_CONFIG).unwrap(); // TODO
+        Self { data }
     }
 }
