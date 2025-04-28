@@ -1,4 +1,5 @@
 use super::catalog_utils::create_catalog;
+use super::deletion_vector::DeletionVector;
 use crate::storage::mooncake_table::delete_vector::BatchDeletionVector;
 use crate::storage::mooncake_table::Snapshot;
 
@@ -185,6 +186,7 @@ pub trait IcebergSnapshot {
 }
 
 impl IcebergSnapshot for Snapshot {
+    // TODO(hjiang): Extract into multiple functions.
     async fn _export_to_iceberg(&mut self) -> IcebergResult<()> {
         let table_name = self.metadata.name.clone();
         let namespace = vec!["default"];
@@ -200,12 +202,21 @@ impl IcebergSnapshot for Snapshot {
         let mut new_disk_files = HashMap::with_capacity(self.disk_files.len());
         let mut new_data_files = Vec::with_capacity(self.disk_files.len());
         for (file_path, deletion_vector) in self.disk_files.drain() {
+            // Record deleted rows in the deletion vector.
+            let deleted_rows = deletion_vector.collect_deleted_rows();
+            if !deleted_rows.is_empty() {
+                let mut _iceberg_deletion_vector = DeletionVector::new();
+                _iceberg_deletion_vector.mark_rows_deleted(deleted_rows);
+            }
+
+            // Write data files to iceberg table.
             let data_file =
                 write_record_batch_to_iceberg(&iceberg_table.clone(), &file_path).await?;
             let new_path = PathBuf::from(data_file.file_path());
             new_disk_files.insert(new_path, deletion_vector);
             new_data_files.push(data_file);
         }
+
         // TODO(hjiang): Likely we should bookkeep the old files so they could be deleted later.
         self.disk_files = new_disk_files;
         action.add_data_files(new_data_files)?;
