@@ -57,46 +57,45 @@ impl<T: Eq + Hash> MoonlinkBackend<T> {
     pub async fn scan_table(&self, table_id: &T, lsn: Option<u64>) -> Result<Arc<ReadState>> {
         let table_readers = self.table_readers.read().await;
         let reader = table_readers.get(table_id).unwrap();
-        let read_state = reader.try_read(lsn).await.unwrap();
+        let read_state = reader.try_read(lsn).await;
         Ok(read_state)
     }
 }
 
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//     use tokio_postgres::{connect, NoTls};
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_postgres::{connect, NoTls};
+    #[tokio::test]
+    async fn test_moonlink_service() {
+        let uri = "postgresql://postgres:postgres@localhost:5432/postgres";
+        let service = MoonlinkBackend::<&'static str>::new();
+        // connect to postgres and create a table
+        let (client, connection) = connect(uri, NoTls).await.unwrap();
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                eprintln!("connection error: {}", e);
+            }
+        });
 
-//     #[tokio::test]
-//     async fn test_moonlink_service() {
-//         let uri = "postgresql://postgres:postgres@localhost:5432/postgres";
-//         let service = MoonlinkBackend::<&'static str>::new();
-//         // connect to postgres and create a table
-//         let (client, connection) = connect(uri, NoTls).await.unwrap();
-//         tokio::spawn(async move {
-//             if let Err(e) = connection.await {
-//                 eprintln!("connection error: {}", e);
-//             }
-//         });
-
-//         client.simple_query("DROP TABLE IF EXISTS test; CREATE TABLE test (id bigint PRIMARY KEY, name VARCHAR(255));").await.unwrap();
-//         println!("created table");
-//         service
-//             .create_table("test", "public.test", uri)
-//             .await
-//             .unwrap();
-//         client
-//             .simple_query("INSERT INTO test  VALUES (1 ,'foo');")
-//             .await
-//             .unwrap();
-//         client
-//             .simple_query("INSERT INTO test  VALUES (2 ,'bar');")
-//             .await
-//             .unwrap();
-//         // wait 2 second
-//         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-//         let read_state = service.scan_table(&"test", None).await.unwrap();
-//         println!("files: {:?}", read_state.files);
-//         println!("deletions: {:?}", read_state.deletions);
-//     }
-// }
+        client.simple_query("DROP TABLE IF EXISTS test; CREATE TABLE test (id bigint PRIMARY KEY, name VARCHAR(255));").await.unwrap();
+        println!("created table");
+        service
+            .create_table("test", "public.test", uri)
+            .await
+            .unwrap();
+        client
+            .simple_query("INSERT INTO test  VALUES (1 ,'foo');")
+            .await
+            .unwrap();
+        client
+            .simple_query("INSERT INTO test  VALUES (2 ,'bar');")
+            .await
+            .unwrap();
+        let old = service.scan_table(&"test", None).await.unwrap();
+        // wait 2 second
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let new = service.scan_table(&"test", None).await.unwrap();
+        assert_ne!(old.data, new.data);
+    }
+}

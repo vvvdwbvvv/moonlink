@@ -4,3 +4,6 @@ mod table_metadata;
 
 pub use read_state::ReadState;
 pub use read_state_manager::ReadStateManager;
+
+#[cfg(test)]
+pub use read_state::decode_read_state_for_testing;

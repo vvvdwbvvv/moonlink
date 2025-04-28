@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tokio::sync::{watch, RwLock};
 pub struct ReadStateManager {
     last_read_lsn: AtomicU64,
-    last_read_state: RwLock<Option<Arc<ReadState>>>,
+    last_read_state: RwLock<Arc<ReadState>>,
     table_snapshot: Arc<RwLock<SnapshotTableState>>,
     table_snapshot_watch_receiver: watch::Receiver<u64>,
 }
@@ -16,14 +16,14 @@ impl ReadStateManager {
         let (table_snapshot, table_snapshot_watch_receiver) = table.get_state_for_reader();
         ReadStateManager {
             last_read_lsn: AtomicU64::new(0),
-            last_read_state: RwLock::new(None),
+            last_read_state: RwLock::new(Arc::new(ReadState::new((vec![], vec![])))),
             table_snapshot,
             table_snapshot_watch_receiver,
         }
     }
 
     /// Read after a specific lsn
-    pub async fn try_read(&self, lsn: Option<u64>) -> Option<Arc<ReadState>> {
+    pub async fn try_read(&self, lsn: Option<u64>) -> Arc<ReadState> {
         if lsn.is_some() && lsn.unwrap() < self.last_read_lsn.load(Ordering::Relaxed) {
             let last_state = self.last_read_state.read().await;
             return last_state.clone();
@@ -49,7 +49,7 @@ impl ReadStateManager {
                                 .collect(),
                         );
                         self.last_read_lsn.store(table_lsn, Ordering::Release);
-                        *last_state = Some(Arc::new(ReadState::new(formated)));
+                        *last_state = Arc::new(ReadState::new(formated));
                         return last_state.clone();
                     } else {
                         return last_state.clone();

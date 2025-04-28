@@ -29,3 +29,9 @@ impl ReadState {
         Self { data }
     }
 }
+
+#[cfg(test)]
+pub fn decode_read_state_for_testing(read_state: &ReadState) -> (Vec<String>, Vec<(u32, u32)>) {
+    let metadata = TableMetadata::decode(&read_state.data);
+    (metadata.data_files, metadata.position_deletes)
+}
