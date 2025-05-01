@@ -1,8 +1,14 @@
+use super::puffin_writer_proxy::append_puffin_metadata_and_rewrite;
+use crate::storage::iceberg::puffin_writer_proxy::{
+    get_puffin_metadata_and_close, PuffinBlobMetadataProxy,
+};
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 use async_trait::async_trait;
 use iceberg::io::FileIO;
+use iceberg::puffin::PuffinWriter;
 use iceberg::spec::{TableMetadata, TableMetadataBuilder};
 use iceberg::table::Table;
 use iceberg::Error as IcebergError;
@@ -43,6 +49,9 @@ use iceberg::{
 pub struct FileSystemCatalog {
     file_io: FileIO,
     warehouse_location: String,
+    // Used to record puffin blob metadata.
+    // Maps from "puffin filepath" to "puffin blob metadata".
+    puffin_blobs: HashMap<String, Vec<PuffinBlobMetadataProxy>>,
 }
 
 impl FileSystemCatalog {
@@ -55,7 +64,24 @@ impl FileSystemCatalog {
                 .build()
                 .unwrap(),
             warehouse_location,
+            puffin_blobs: HashMap::new(),
         }
+    }
+
+    // Get puffin metadata from the writer, and close it.
+    //
+    // TODO(hjiang): iceberg-rust currently doesn't support puffin write, to workaround and reduce code change,
+    // we record puffin metadata ourselves and rewrite manifest file before transaction commits.
+    pub(crate) async fn record_puffin_metadata_and_close(
+        &mut self,
+        puffin_filepath: String,
+        puffin_writer: PuffinWriter,
+    ) -> IcebergResult<()> {
+        self.puffin_blobs.insert(
+            puffin_filepath,
+            get_puffin_metadata_and_close(puffin_writer).await?,
+        );
+        Ok(())
     }
 
     /// Load metadata for the given table.
@@ -486,6 +512,7 @@ impl Catalog for FileSystemCatalog {
             /*current_file_location=*/ Some(metadata_file_path.clone()),
         );
 
+        // Manifest files and manifest list has persisted into storage, update metadata and persist.
         let updates = commit.take_updates();
         for update in &updates {
             match update {
@@ -518,6 +545,19 @@ impl Catalog for FileSystemCatalog {
         let metadata_json = serde_json::to_string(&metadata)?;
         let output = self.file_io.new_output(&metadata_file_path)?;
         output.write(metadata_json.into()).await?;
+
+        // Manifest files and manifest list has persisted into storage, make modifications based on puffin blobs.
+        //
+        // TODO(hjiang): Add unit test for update and check manifest population.
+        for (puffin_filepath, puffin_blob_metadata) in self.puffin_blobs.iter() {
+            append_puffin_metadata_and_rewrite(
+                &metadata,
+                &self.file_io,
+                puffin_filepath,
+                puffin_blob_metadata.clone(),
+            )
+            .await?;
+        }
 
         // Write version hint file.
         let version_hint_path = format!("{}/version-hint.text", metadata_directory);

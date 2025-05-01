@@ -1,15 +1,24 @@
 use super::catalog_utils::create_catalog;
 use super::deletion_vector::DeletionVector;
+use crate::storage::iceberg::deletion_vector::{
+    DELETION_VECTOR_CADINALITY, DELETION_VECTOR_REFERENCED_DATA_FILE,
+};
+use crate::storage::iceberg::file_catalog::FileSystemCatalog;
+use crate::storage::iceberg::puffin_utils;
+use crate::storage::iceberg::validation::validate_puffin_manifest_entry;
 use crate::storage::mooncake_table::delete_vector::BatchDeletionVector;
 use crate::storage::mooncake_table::Snapshot;
 
 use futures::executor::block_on;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use arrow::datatypes::DataType as ArrowType;
 use arrow_schema::Schema as ArrowSchema;
+use iceberg::puffin::CompressionCodec;
 use iceberg::spec::ManifestContentType;
 use iceberg::spec::{DataFile, DataFileFormat};
 use iceberg::spec::{
@@ -18,17 +27,21 @@ use iceberg::spec::{
 use iceberg::table::Table as IcebergTable;
 use iceberg::transaction::Transaction;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+use iceberg::writer::file_writer::location_generator::LocationGenerator;
 use iceberg::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, DefaultLocationGenerator,
 };
 use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::IcebergWriter;
 use iceberg::writer::IcebergWriterBuilder;
+use iceberg::Error as IcebergError;
 use iceberg::NamespaceIdent;
 use iceberg::TableCreation;
 use iceberg::{Catalog, Result as IcebergResult, TableIdent};
+use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::file::properties::WriterProperties;
+use url::Url;
 use uuid::Uuid;
 
 // UNDONE(Iceberg):
@@ -157,8 +170,9 @@ async fn write_record_batch_to_iceberg(
     }
 
     let data_files = data_file_writer.close().await?;
-    assert!(
-        data_files.len() == 1,
+    assert_eq!(
+        data_files.len(),
+        1,
         "Should only have one parquet file written"
     );
 
@@ -184,14 +198,58 @@ pub trait IcebergSnapshot {
 }
 
 impl IcebergSnapshot for Snapshot {
-    // TODO(hjiang): Extract into multiple functions.
+    // TODO(hjiang):
+    // 1. Extract into multiple functions, for example, data file persistence, deletion vector persistence, iceberg table transaction.
+    // 2. Parallalize IO operations, now they're implemented in sequential style.
+    #[allow(clippy::await_holding_refcell_ref)]
     async fn _export_to_iceberg(&mut self) -> IcebergResult<()> {
+        let url = Url::parse(&self.warehouse_uri)
+            .or_else(|_| Url::from_file_path(self.warehouse_uri.clone()))
+            .map_err(|e| {
+                IcebergError::new(
+                    iceberg::ErrorKind::Unexpected,
+                    format!(
+                        "Invalid warehouse URI {}: {:?}",
+                        self.warehouse_uri.clone(),
+                        e
+                    ),
+                )
+            })?;
+
+        // Create catalog based on warehouse uri.
+        //
+        // TODO(hjiang):
+        // 1. This is a hacky way to check whether catalog is moonlink self-implemented ones, which support deletion vector.
+        // We should revisit to check more rust-idiomatic way.
+        // 2. Implement deletion vector write logic for object storage catalog and integrate here.
+        #[allow(unused_assignments)]
+        let mut opt_catalog: Option<Rc<RefCell<dyn Catalog>>> = None;
+        let mut filesystem_catalog: Option<Rc<RefCell<FileSystemCatalog>>> = None;
+        if url.scheme() == "file" {
+            let absolute_path = url.path();
+            let internal_fs_catalog = Rc::new(RefCell::new(FileSystemCatalog::new(
+                absolute_path.to_string(),
+            )));
+            filesystem_catalog = Some(internal_fs_catalog.clone());
+            let catalog_rc: Rc<RefCell<dyn Catalog>> = internal_fs_catalog.clone();
+            opt_catalog = Some(catalog_rc);
+        } else {
+            // Fallback all other warehouse uri to rest catalog.
+            opt_catalog = Some(Rc::new(RefCell::new(RestCatalog::new(
+                RestCatalogConfig::builder()
+                    .uri(self.warehouse_uri.clone())
+                    .build(),
+            ))));
+        }
+        // `catalog` is guaranteed to be valid.
+        let catalog: Rc<RefCell<dyn Catalog>> = opt_catalog.unwrap();
+
         let table_name = self.metadata.name.clone();
         let namespace = vec!["default"];
         let arrow_schema = self.metadata.schema.as_ref();
-        let catalog = create_catalog(&self.warehouse_uri)?;
         let iceberg_table =
-            get_or_create_iceberg_table(&*catalog, &namespace, &table_name, arrow_schema).await?;
+            get_or_create_iceberg_table(&*catalog.borrow(), &namespace, &table_name, arrow_schema)
+                .await?;
 
         let txn = Transaction::new(&iceberg_table);
         let mut action =
@@ -200,17 +258,51 @@ impl IcebergSnapshot for Snapshot {
         let mut new_disk_files = HashMap::with_capacity(self.disk_files.len());
         let mut new_data_files = Vec::with_capacity(self.disk_files.len());
         for (file_path, deletion_vector) in self.disk_files.drain() {
-            // Record deleted rows in the deletion vector.
-            let deleted_rows = deletion_vector.collect_deleted_rows();
-            if !deleted_rows.is_empty() {
-                let mut _iceberg_deletion_vector = DeletionVector::new();
-                _iceberg_deletion_vector.mark_rows_deleted(deleted_rows);
-            }
-
             // Write data files to iceberg table.
             let data_file =
                 write_record_batch_to_iceberg(&iceberg_table.clone(), &file_path).await?;
             let new_path = PathBuf::from(data_file.file_path());
+
+            // Record deleted rows in the deletion vector.
+            let deleted_rows = deletion_vector.collect_deleted_rows();
+            if !deleted_rows.is_empty() {
+                // TODO(hjiang): Currently one deletion vector is stored in one puffin file, need to revisit later.
+                let deleted_row_count = deleted_rows.len();
+                let mut iceberg_deletion_vector = DeletionVector::new();
+                iceberg_deletion_vector.mark_rows_deleted(deleted_rows);
+                let blob_properties = HashMap::from([
+                    (
+                        DELETION_VECTOR_REFERENCED_DATA_FILE.to_string(),
+                        new_path.to_str().unwrap().to_string(),
+                    ),
+                    (
+                        DELETION_VECTOR_CADINALITY.to_string(),
+                        deleted_row_count.to_string(),
+                    ),
+                ]);
+                let blob = iceberg_deletion_vector.serialize(blob_properties);
+
+                // TODO(hjiang): Current iceberg-rust doesn't support deletion vector officially, so we do our own hack to rewrite manifest file by our own catalog implementation.
+                let location_generator =
+                    DefaultLocationGenerator::new(iceberg_table.metadata().clone())?;
+                let puffin_filepath =
+                    location_generator.generate_location(&format!("{}-puffin.bin", Uuid::new_v4()));
+                let mut puffin_writer = puffin_utils::create_puffin_writer(
+                    iceberg_table.file_io(),
+                    puffin_filepath.clone(),
+                )
+                .await?;
+                // TODO(hjiang): Provide option to enable compression for puffin blob.
+                puffin_writer.add(blob, CompressionCodec::None).await?;
+
+                if let Some(filesystem_catalog_val) = &mut filesystem_catalog {
+                    filesystem_catalog_val
+                        .borrow_mut()
+                        .record_puffin_metadata_and_close(puffin_filepath, puffin_writer)
+                        .await?;
+                }
+            }
+
             new_disk_files.insert(new_path, deletion_vector);
             new_data_files.push(data_file);
         }
@@ -221,7 +313,7 @@ impl IcebergSnapshot for Snapshot {
 
         // Commit write transaction, which internally creates manifest files and manifest list files.
         let txn = action.apply().await?;
-        txn.commit(&*catalog).await?;
+        txn.commit(&*catalog.borrow()).await?;
 
         Ok(())
     }
@@ -241,6 +333,10 @@ impl IcebergSnapshot for Snapshot {
             .load_manifest_list(file_io, table_metadata)
             .await?;
         let mut snapshot = Snapshot::new(self.metadata.clone());
+
+        // Maps from data filepath to batch deletion vector loaded from puffin blob.
+        let mut disk_file_to_deletion_vector: HashMap<PathBuf, BatchDeletionVector> =
+            HashMap::new();
         for manifest_file in manifest_list.entries().iter() {
             // We're only interested in DATA files when recover snapshot status.
             if manifest_file.content != ManifestContentType::Data {
@@ -251,11 +347,32 @@ impl IcebergSnapshot for Snapshot {
             for entry in manifest.entries() {
                 let data_file = entry.data_file();
                 let file_path = PathBuf::from(data_file.file_path().to_string());
-                snapshot
-                    .disk_files
-                    .insert(file_path, BatchDeletionVector::new(/*max_rows=*/ 0));
+
+                // Record batch deletion.
+                if data_file.file_format() == DataFileFormat::Puffin {
+                    validate_puffin_manifest_entry(entry)?;
+                    let deletion_vector =
+                        DeletionVector::load_from_dv_blob(file_io.clone(), data_file).await?;
+                    let batch_deletion_vector = deletion_vector.take_as_batch_delete_vector();
+                    let referenced_path_buf: PathBuf =
+                        data_file.referenced_data_file().unwrap().into();
+                    disk_file_to_deletion_vector.insert(referenced_path_buf, batch_deletion_vector);
+                    continue;
+                }
+
+                // Handle data files.
+                assert_eq!(
+                    data_file.file_format(),
+                    DataFileFormat::Parquet,
+                    "Data file is of file format parquet."
+                );
+                disk_file_to_deletion_vector
+                    .entry(file_path)
+                    .or_insert_with(|| BatchDeletionVector::new(/*max_rows=*/ 0));
             }
         }
+
+        snapshot.disk_files = disk_file_to_deletion_vector;
 
         Ok(snapshot)
     }
@@ -284,6 +401,12 @@ mod tests {
     use iceberg::io::FileRead;
     use parquet::arrow::ArrowWriter;
 
+    fn create_test_batch_deletion_vector() -> BatchDeletionVector {
+        let mut deletion_vector = BatchDeletionVector::new(/*max_rows=*/ 3);
+        deletion_vector.delete_row(2);
+        deletion_vector
+    }
+
     async fn delete_all_tables<C: Catalog + ?Sized>(catalog: &C) -> IcebergResult<()> {
         let namespaces = catalog.list_namespaces(/*parent=*/ None).await?;
         for namespace in namespaces {
@@ -307,7 +430,15 @@ mod tests {
         Ok(())
     }
 
-    async fn test_store_and_load_snapshot_impl(warehouse_uri: &str) -> IcebergResult<()> {
+    /// Test snapshot store and load for different types of catalogs based on the given warehouse.
+    ///
+    /// * `deletion_vector_supported` - whether the given catalog supports deletion vector; if false, skip checking deletion vector load.
+    ///
+    /// TODO(hjiang): This test case only write once, thus one snapshot; should test situations where we write multiple times.
+    async fn test_store_and_load_snapshot_impl(
+        warehouse_uri: &str,
+        deletion_vector_supported: bool,
+    ) -> IcebergResult<()> {
         // Create Arrow schema and record batch.
         let arrow_schema =
             Arc::new(ArrowSchema::new(vec![
@@ -350,7 +481,7 @@ mod tests {
         });
 
         let mut disk_files = HashMap::new();
-        disk_files.insert(parquet_path.clone(), BatchDeletionVector::new(0));
+        disk_files.insert(parquet_path.clone(), create_test_batch_deletion_vector());
 
         let mut snapshot = Snapshot::new(metadata);
         snapshot._set_warehouse_info(warehouse_uri.to_string());
@@ -361,7 +492,8 @@ mod tests {
         assert_eq!(
             loaded_snapshot.disk_files.len(),
             1,
-            "Should have exactly one file."
+            "Should have exactly one file, but disk files have {:?}.",
+            loaded_snapshot.disk_files.keys()
         );
 
         let namespace = vec!["default"];
@@ -371,7 +503,8 @@ mod tests {
         let file_io = iceberg_table.file_io();
 
         // Check the loaded data file exists.
-        let (loaded_path, _) = loaded_snapshot.disk_files.iter().next().unwrap();
+        let (loaded_path, loaded_deletion_vector) =
+            loaded_snapshot.disk_files.iter().next().unwrap();
         assert!(
             file_io.exists(loaded_path.to_str().unwrap()).await?,
             "File should exist"
@@ -397,7 +530,17 @@ mod tests {
             "ID data should match"
         );
 
-        // Verify second column (name)
+        // Check loaded deletion vector.
+        if deletion_vector_supported {
+            let collect_deleted_rows = loaded_deletion_vector.collect_deleted_rows();
+            assert_eq!(
+                collect_deleted_rows,
+                create_test_batch_deletion_vector().collect_deleted_rows(),
+                "Loaded deletion vector is not the same as the one gets stored."
+            );
+        }
+
+        // Verify second column (name).
         let actual_names = batch
             .column(1)
             .as_any()
@@ -415,7 +558,8 @@ mod tests {
     #[tokio::test]
     async fn test_store_and_load_snapshot_with_rest_catalog() -> IcebergResult<()> {
         let warehouse_uri = "http://iceberg:8181";
-        test_store_and_load_snapshot_impl(warehouse_uri).await?;
+        test_store_and_load_snapshot_impl(warehouse_uri, /*deletion_vector_supported=*/ false)
+            .await?;
         Ok(())
     }
 
@@ -423,7 +567,8 @@ mod tests {
     async fn test_store_and_load_snapshot_with_filesystem_catalog() -> IcebergResult<()> {
         let tmp_dir = tempdir()?;
         let warehouse_path = tmp_dir.path().to_str().unwrap();
-        test_store_and_load_snapshot_impl(warehouse_path).await?;
+        test_store_and_load_snapshot_impl(warehouse_path, /*deletion_vector_supported=*/ true)
+            .await?;
         Ok(())
     }
 }
