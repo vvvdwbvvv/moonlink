@@ -362,6 +362,10 @@ mod tests {
     }
     #[test]
     fn test_moonlink_row_equals_parquet_at_offset() {
+        #[cfg(debug_assertions)]
+        let total_rows = 10000;
+        #[cfg(not(debug_assertions))]
+        let total_rows = 1000000;
         let (rows, batch) = generate_data(100);
 
         let dir = tempfile::tempdir().unwrap();
@@ -376,14 +380,16 @@ mod tests {
             .build();
         let mut writer = ArrowWriter::try_new(&file, batch.schema(), Some(props)).unwrap();
         // Write some random rows before and after
-        let num_random_rows = 1000000;
+        let num_random_rows = total_rows / 2;
         let (_, random_batch) = generate_data(num_random_rows);
-        let (_, random_batch2) = generate_data(2000000 - num_random_rows);
+        let (_, random_batch2) = generate_data(total_rows - num_random_rows);
         writer.write(&random_batch).unwrap();
         writer.write(&batch).unwrap();
         writer.write(&random_batch2).unwrap();
         // Write some
         writer.close().unwrap();
+
+        #[cfg(profiling_enabled)]
         let guard = pprof::ProfilerGuard::new(100).unwrap(); // sample at 100 Hz
 
         for (i, row) in rows.iter().enumerate() {
@@ -392,6 +398,7 @@ mod tests {
                 assert!(!row.equals_parquet_at_offset(&file_name, j));
             }
         }
+        #[cfg(profiling_enabled)]
         if let Ok(report) = guard.report().build() {
             let file = std::fs::File::create("flamegraph.svg").unwrap();
             report.flamegraph(file).unwrap();
