@@ -7,7 +7,7 @@ use iceberg::io::FileIO;
 use iceberg::puffin::Blob;
 use iceberg::spec::DataFile;
 use iceberg::{Error as IcebergError, Result as IcebergResult};
-use roaring::RoaringBitmap;
+use roaring::RoaringTreemap;
 
 // Magic bytes for deletion vector for puffin file.
 const DELETION_VECTOR_MAGIC_BYTES: [u8; 4] = [0xD1, 0xD3, 0x39, 0x64];
@@ -16,6 +16,7 @@ const DELETION_VECTOR_MAGIC_BYTES: [u8; 4] = [0xD1, 0xD3, 0x39, 0x64];
 const MIN_SERIALIZED_DELETION_VECTOR_BLOB: usize = 12;
 
 // Deletion vector puffin blob properties which must be contained.
+// Reference: https://iceberg.apache.org/puffin-spec/?h=puffin#deletion-vector-v1-blob-type
 pub(crate) static DELETION_VECTOR_CADINALITY: &str = "cardinality";
 pub(crate) static DELETION_VECTOR_REFERENCED_DATA_FILE: &str = "referenced-data-file";
 
@@ -24,8 +25,8 @@ pub(crate) static DELETION_VECTOR_REFERENCED_DATA_FILE: &str = "referenced-data-
 const HARD_CODE_DELETE_VECTOR_MAX_ROW: usize = 4096;
 
 pub(crate) struct DeletionVector {
-    /// Bitmap representing deleted rows.
-    pub(crate) bitmap: RoaringBitmap,
+    /// Roaring bitmap representing deleted rows.
+    pub(crate) bitmap: RoaringTreemap,
 }
 
 // TODO(hjiang): Ideally moonlink doesn't need to operate on `Blob` directly, iceberg-rust should provide high-level interface to operate on deleted rows, but before it's supported officially, we use this hacky way to construct a `iceberg::puffin::blob::Blob`.
@@ -39,44 +40,26 @@ struct IcebergBlobProxy {
     pub(crate) properties: HashMap<String, String>,
 }
 
-// TODO(hjiang): Current we can only take row index as u32, should implement a u64 version.
 impl DeletionVector {
     /// Creates a new empty deletion vector.
     pub fn new() -> Self {
         Self {
-            bitmap: RoaringBitmap::new(),
+            bitmap: RoaringTreemap::new(),
         }
     }
 
     /// Marks a row as deleted.
-    pub fn mark_rows_deleted(&mut self, rows: Vec<usize>) {
-        let rows_as_u32: Vec<u32> = rows
-            .into_iter()
-            .map(|x| {
-                assert!(
-                    x <= u32::MAX as usize,
-                    "Row index is larger than max value of u32"
-                );
-                x as u32
-            })
-            .collect();
-        self.bitmap.extend(rows_as_u32);
-    }
-
-    /// Serializes the deletion vector into a byte vector.
-    fn serialize_roaring_bitmap(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        self.bitmap.serialize_into(&mut bytes).unwrap();
-        bytes
+    pub fn mark_rows_deleted(&mut self, rows: Vec<u64>) {
+        self.bitmap.extend(rows);
     }
 
     /// Deserializes a byte vector into a DeletionVector.
     fn deserialize_roaring_map(data: &[u8]) -> IcebergResult<Self> {
-        RoaringBitmap::deserialize_from(data)
+        RoaringTreemap::deserialize_from(data)
             .map(|bitmap| Self { bitmap })
             .map_err(|e| {
                 IcebergError::new(
-                    iceberg::ErrorKind::Unexpected,
+                    iceberg::ErrorKind::DataInvalid,
                     format!("Failed to deserialize DeletionVector: {}", e),
                 )
             })
@@ -100,40 +83,65 @@ impl DeletionVector {
     ///
     /// Serialization storage format:
     /// | len for magic and vector | magic | vector | crc32c |
-    /// crc32c field is checksum of the magic bytes and serialized vector as 4 bytes in big-endian.
+    /// - len field records the combined length of the vector and magic bytes stored as 4 bytes in big-endian.
+    /// - vector is the serialized bitmap in u64 format: https://github.com/RoaringBitmap/RoaringFormatSpec?tab=readme-ov-file#extension-for-64-bit-implementations
+    /// - crc32c field is checksum of the magic bytes and serialized vector as 4 bytes in big-endian.
     pub fn serialize(&self, properties: HashMap<String, String>) -> Blob {
         DeletionVector::check_properties(&properties);
 
-        let serialized_bitmap = self.serialize_roaring_bitmap();
-
         // Calculate combined length (magic bytes + bitmap).
-        let combined_length = (DELETION_VECTOR_MAGIC_BYTES.len() + serialized_bitmap.len()) as u32;
+        let serialized_bitmap_size = self.bitmap.serialized_size();
+        let combined_length = (DELETION_VECTOR_MAGIC_BYTES.len() + serialized_bitmap_size) as u32;
 
         // Create a buffer to hold all the data.
-        let mut data = Vec::with_capacity(
-            std::mem::size_of_val(&combined_length) + // length
-            DELETION_VECTOR_MAGIC_BYTES.len() + // magic sequence
-            serialized_bitmap.len() + // serialized roaring bitmap
-            4, // crc
-        );
+        let blob_total_size = std::mem::size_of_val(&combined_length) + // length
+        DELETION_VECTOR_MAGIC_BYTES.len() + // magic sequence
+        serialized_bitmap_size + // serialized roaring bitmap
+        4; // crc
+        let mut data = Vec::with_capacity(blob_total_size);
+
+        // Set blob length and get the mutable pointer to fill in data ourselves.
+        unsafe {
+            data.set_len(blob_total_size);
+        }
+        let ptr: *mut u8 = data.as_mut_ptr();
+        let mut offset = 0;
 
         // Write combined length.
-        data.extend_from_slice(&combined_length.to_be_bytes());
+        let combined_length_bytes = combined_length.to_be_bytes();
+        unsafe {
+            std::ptr::copy_nonoverlapping(combined_length_bytes.as_ptr(), ptr.add(offset), 4);
+        }
+        offset += 4;
 
         // Write magic bytes.
-        data.extend_from_slice(&DELETION_VECTOR_MAGIC_BYTES);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                DELETION_VECTOR_MAGIC_BYTES.as_ptr(),
+                ptr.add(offset),
+                DELETION_VECTOR_MAGIC_BYTES.len(),
+            );
+        }
+        offset += DELETION_VECTOR_MAGIC_BYTES.len();
 
-        // Write serialized bitmap.
-        data.extend_from_slice(&serialized_bitmap);
+        // Serialized and write bitmap, which is the standard roaring on-disk format.
+        // Spec: https://github.com/RoaringBitmap/RoaringFormatSpec
+        let bitmap_slice =
+            unsafe { std::slice::from_raw_parts_mut(ptr.add(offset), serialized_bitmap_size) };
+        let mut bitmap_writer = std::io::Cursor::new(bitmap_slice);
+        self.bitmap.serialize_into(&mut bitmap_writer).unwrap();
+        offset += serialized_bitmap_size;
 
         // Calculate CRC (magic bytes + serialized bitmap).
         let mut hasher = crc32fast::Hasher::new();
-        hasher.update(&DELETION_VECTOR_MAGIC_BYTES);
-        hasher.update(&serialized_bitmap);
+        hasher.update(&data[4..offset]);
         let crc = hasher.finalize();
 
         // Write CRC.
-        data.extend_from_slice(&crc.to_be_bytes());
+        let crc_bytes = crc.to_be_bytes();
+        unsafe {
+            std::ptr::copy_nonoverlapping(crc_bytes.as_ptr(), ptr.add(offset), crc_bytes.len());
+        }
 
         let blob_proxy = IcebergBlobProxy {
             r#type: "deletion-vector-v1".to_string(),
@@ -257,14 +265,14 @@ mod tests {
     #[test]
     fn test_mark_and_serialize_deserialize_deletion_vector() {
         let mut dv = DeletionVector::new();
-        let deleted_rows = vec![1, 3, 5, 7, 1000];
+        let deleted_rows: Vec<u64> = vec![1, 3, 5, 7, 1000];
         dv.mark_rows_deleted(deleted_rows.clone());
         let blob = dv.serialize(create_test_blob_properties(
             /*deleted_rows=*/ deleted_rows.len(),
         ));
         let deserialized_dv = DeletionVector::deserialize(blob).unwrap();
         for row in deleted_rows {
-            assert!(deserialized_dv.bitmap.contains(row as u32));
+            assert!(deserialized_dv.bitmap.contains(row));
         }
         assert_eq!(dv.bitmap.len(), deserialized_dv.bitmap.len());
     }
