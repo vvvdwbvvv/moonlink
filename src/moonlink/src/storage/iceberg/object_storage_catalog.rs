@@ -322,7 +322,7 @@ impl Catalog for S3Catalog {
         &self,
         _parent: Option<&NamespaceIdent>,
     ) -> IcebergResult<Vec<NamespaceIdent>> {
-        todo!()
+        todo!("Not used for now, likely need for recovery, will implement later.")
     }
 
     /// Create a new namespace inside the catalog, return error if namespace already exists, or any parent namespace doesn't exist.
@@ -654,7 +654,7 @@ mod tests {
     async fn create_s3_catalog() -> S3Catalog {
         let (bucket_name, warehouse_uri) =
             crate::storage::iceberg::test_utils::get_test_minio_bucket_and_warehouse();
-        test_utils::test_utils::create_test_s3_bucket(bucket_name.clone())
+        test_utils::object_store_test_utils::create_test_s3_bucket(bucket_name.clone())
             .await
             .unwrap();
         test_utils::create_minio_s3_catalog(&bucket_name, &warehouse_uri)
