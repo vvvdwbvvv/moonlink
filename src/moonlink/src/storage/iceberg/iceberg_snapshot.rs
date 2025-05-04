@@ -80,7 +80,6 @@ async fn get_or_create_iceberg_table<C: Catalog + ?Sized>(
                 .schema(iceberg_schema)
                 .properties(HashMap::new())
                 .build();
-
             let table = catalog
                 .create_table(&table_ident.namespace, tbl_creation)
                 .await?;
@@ -134,6 +133,19 @@ async fn write_record_batch_to_iceberg(
     Ok(data_files[0].clone())
 }
 
+// TODO(hjiang): A few data file properties need to respect and consider.
+// Reference:
+// - https://iceberg.apache.org/docs/latest/configuration/#table-properties
+// - https://iceberg.apache.org/docs/latest/configuration/#table-behavior-properties
+//
+// - write.parquet.row-group-size-bytes
+// - write.parquet.page-size-bytes
+// - write.parquet.page-row-limit
+// - write.parquet.dict-size-bytes
+// - write.parquet.compression-codec
+// - write.parquet.compression-level
+// - write.parquet.bloom-filter-max-bytes
+// - write.metadata.compression-codec
 pub trait IcebergSnapshot {
     // Write the current version to iceberg
     async fn _export_to_iceberg(&mut self) -> IcebergResult<()>;
@@ -252,7 +264,12 @@ impl IcebergSnapshot for Snapshot {
                         deleted_row_count.to_string(),
                     ),
                 ]);
-                let blob = iceberg_deletion_vector.serialize(blob_properties);
+                let table_metadata = iceberg_table.metadata();
+                let blob = iceberg_deletion_vector.serialize(
+                    table_metadata.current_snapshot_id().unwrap_or(-1),
+                    table_metadata.next_sequence_number(),
+                    blob_properties,
+                );
 
                 // TODO(hjiang): Current iceberg-rust doesn't support deletion vector officially, so we do our own hack to rewrite manifest file by our own catalog implementation.
                 let location_generator =
@@ -327,7 +344,21 @@ impl IcebergSnapshot for Snapshot {
             }
 
             let manifest = manifest_file.load_manifest(file_io).await?;
+
+            // All files (i.e. data files, deletion vector, manifest files) under the same snapshot are assigned with the same sequence number.
+            // Reference: https://iceberg.apache.org/spec/?h=content#sequence-numbers
+            let snapshot_seq_no = manifest.entries().first().unwrap().sequence_number();
+
             for entry in manifest.entries() {
+                // Sanity check all manifest entries are of the sequence number.
+                let cur_entry_seq_no = entry.sequence_number();
+                if snapshot_seq_no != cur_entry_seq_no {
+                    return Err(IcebergError::new(
+                        iceberg::ErrorKind::DataInvalid,
+                        format!("When reading from iceberg table, snapshot sequence id inconsistency found {:?} vs {:?}", snapshot_seq_no, cur_entry_seq_no),
+                    ));
+                }
+
                 let data_file = entry.data_file();
                 let file_path = PathBuf::from(data_file.file_path().to_string());
 
@@ -462,7 +493,7 @@ mod tests {
             loaded_snapshot.disk_files.keys()
         );
 
-        let namespace = vec!["default_namespace"];
+        let namespace = vec!["default"];
         let table_name = "test_table";
         let iceberg_table = get_or_create_iceberg_table(
             &*catalog,
