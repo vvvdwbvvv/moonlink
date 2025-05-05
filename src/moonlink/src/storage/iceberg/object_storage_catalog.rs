@@ -468,6 +468,18 @@ impl Catalog for S3Catalog {
         &self,
         namespace_ident: &NamespaceIdent,
     ) -> IcebergResult<Vec<TableIdent>> {
+        // Check if the given namespace exists.
+        let exists = self.namespace_exists(namespace_ident).await?;
+        if !exists {
+            return Err(IcebergError::new(
+                iceberg::ErrorKind::NamespaceNotFound,
+                format!(
+                    "Namespace {:?} doesn't exist when list tables within.",
+                    namespace_ident
+                ),
+            ));
+        }
+
         let parent_directory = namespace_ident.to_url_string();
         let subdirectories = self
             .list_direct_subdirectories(&parent_directory)
@@ -764,7 +776,7 @@ mod tests {
     #[tokio::test]
     async fn test_s3_catalog_namespace_operations() -> IcebergResult<()> {
         let catalog = create_s3_catalog().await;
-        let namespace = NamespaceIdent::from_vec(vec!["default".to_string(), "ns".to_string()])?;
+        let namespace = NamespaceIdent::from_strs(vec!["default", "ns"])?;
 
         // Ensure namespace does not exist.
         let exists = catalog.namespace_exists(&namespace).await?;
@@ -773,7 +785,7 @@ mod tests {
         // Create parent namespace.
         catalog
             .create_namespace(
-                &NamespaceIdent::from_vec(vec!["default".to_string()]).unwrap(),
+                &NamespaceIdent::from_strs(vec!["default"]).unwrap(),
                 /*properties=*/ HashMap::new(),
             )
             .await?;
@@ -803,7 +815,7 @@ mod tests {
         let catalog = create_s3_catalog().await;
 
         // Define namespace and table.
-        let namespace = NamespaceIdent::from_vec(vec!["default".to_string()])?;
+        let namespace = NamespaceIdent::from_strs(vec!["default"])?;
         let table_name = "test_table".to_string();
         let table_ident = TableIdent::new(namespace.clone(), table_name.clone());
 
@@ -849,6 +861,40 @@ mod tests {
     #[tokio::test]
     async fn test_list_operation() -> IcebergResult<()> {
         let catalog = create_s3_catalog().await;
+
+        // List namespaces with non-existent parent namespace.
+        let res = catalog
+            .list_namespaces(Some(
+                &NamespaceIdent::from_strs(["non-existent-ns"]).unwrap(),
+            ))
+            .await;
+        assert!(
+            res.is_err(),
+            "List namespace under a non-existent namespace should fail"
+        );
+        let err = res.err().unwrap();
+        assert_eq!(
+            err.kind(),
+            iceberg::ErrorKind::NamespaceNotFound,
+            "List namespace under a non-existent namespace gets error {:?}",
+            err
+        );
+
+        // List tables with non-existent parent namespace.
+        let res = catalog
+            .list_tables(&NamespaceIdent::from_strs(["non-existent-ns"]).unwrap())
+            .await;
+        assert!(
+            res.is_err(),
+            "List tables under a non-existent namespace should fail"
+        );
+        let err = res.err().unwrap();
+        assert_eq!(
+            err.kind(),
+            iceberg::ErrorKind::NamespaceNotFound,
+            "List namespace under a non-existent namespace gets error {:?}",
+            err
+        );
 
         // Create default namespace.
         let default_namespace = NamespaceIdent::from_strs(["default"])?;
