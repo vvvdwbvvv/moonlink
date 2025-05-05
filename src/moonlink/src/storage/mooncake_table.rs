@@ -412,3 +412,6 @@ mod tests;
 
 #[cfg(test)]
 pub(crate) mod test_utils;
+
+#[cfg(test)]
+mod benchmark;

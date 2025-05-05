@@ -28,7 +28,7 @@ pub(crate) struct DiskSliceWriter {
     // a mapping of old record locations to new record locations
     // this is used to remap deletions on the disk slice
     batch_id_to_idx: HashMap<u64, usize>,
-    row_offset_mapping: HashMap<(usize, usize), (usize, usize)>,
+    row_offset_mapping: Vec<Vec<Option<(usize, usize)>>>,
 
     new_index: Option<FileIndex>,
 
@@ -56,7 +56,7 @@ impl DiskSliceWriter {
             files: vec![],
             batch_id_to_idx: HashMap::new(),
             writer_lsn,
-            row_offset_mapping: HashMap::new(),
+            row_offset_mapping: vec![],
             old_index,
             new_index: None,
         }
@@ -64,11 +64,21 @@ impl DiskSliceWriter {
 
     pub(super) fn write(&mut self) -> Result<()> {
         let mut filtered_batches = Vec::new();
-        for (id, entry) in self.batches.iter().enumerate() {
+        let mut id = 0;
+        for entry in self.batches.iter() {
             let filtered_batch = entry.batch.get_filtered_batch()?;
             if let Some(batch) = filtered_batch {
-                filtered_batches.push((id, batch, entry.batch.deletions.collect_active_rows()));
+                let total_rows = entry.batch.data.as_ref().unwrap().num_rows();
+                filtered_batches.push((
+                    id,
+                    batch,
+                    entry.batch.deletions.collect_active_rows(total_rows),
+                ));
+                let mut mapping = Vec::with_capacity(total_rows);
+                mapping.resize(total_rows, None);
+                self.row_offset_mapping.push(mapping);
                 self.batch_id_to_idx.insert(entry.id, id);
+                id += 1;
             }
         }
         self.write_batch_to_parquet(&filtered_batches)?;
@@ -114,8 +124,7 @@ impl DiskSliceWriter {
                 out_row_idx = 0;
             }
             for row_idx in row_indices {
-                self.row_offset_mapping
-                    .insert((*batch_id, *row_idx), (out_file_idx, out_row_idx));
+                self.row_offset_mapping[*batch_id][*row_idx] = Some((out_file_idx, out_row_idx));
                 out_row_idx += 1;
             }
             // Write the batch
@@ -145,7 +154,7 @@ impl DiskSliceWriter {
                     panic!("Invalid record location");
                 };
                 let old_location = (*self.batch_id_to_idx.get(batch_id).unwrap(), *row_idx);
-                let new_location = self.row_offset_mapping.get(&old_location);
+                let new_location = self.row_offset_mapping[old_location.0][old_location.1];
                 new_location.map(|new_location| (*key, new_location.0, new_location.1))
             })
             .collect::<Vec<_>>();
@@ -170,8 +179,8 @@ impl DiskSliceWriter {
             let batch_was_flushed = self.batch_id_to_idx.contains_key(batch_id);
             if batch_was_flushed {
                 let old_location = (*self.batch_id_to_idx.get(batch_id).unwrap(), *row_idx);
-                // Guard the case where the record was deleted before making it to disk
-                if let Some(new_location) = self.row_offset_mapping.get(&old_location) {
+                let new_location = self.row_offset_mapping[old_location.0][old_location.1];
+                if let Some(new_location) = new_location {
                     deletion.pos = RecordLocation::DiskFile(
                         FileId(Arc::new(self.files[new_location.0].0.clone())),
                         new_location.1,
