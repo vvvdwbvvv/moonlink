@@ -139,7 +139,6 @@ impl TableHandler {
                 _ = periodic_snapshot_interval.tick() => {
                     // Only create a periodic snapshot if there isn't already one in progress
                     if snapshot_handle.is_none() {
-                        println!("Creating periodic snapshot");
                         snapshot_handle = table.create_snapshot();
                     }
                 }
