@@ -10,7 +10,7 @@ edition = "2021"
 async-trait = "0.1"
 bincode = "2"
 
-tokio-postgres = { git = "ssh://git@github.com/Mooncake-labs/rust-postgres.git" }
+tokio-postgres.git = "https://github.com/Mooncake-labs/rust-postgres.git"
 arrow = "54.2"
 thiserror = "2.0"
 parquet = "54.2"
@@ -19,7 +19,7 @@ futures = "0.3"
 multimap = "0.10"
 chrono = "=0.4.39"
 num-traits = "0.2"
-postgres-replication = { git = "ssh://git@github.com/Mooncake-labs/rust-postgres.git" }
+postgres-replication.git = "https://github.com/Mooncake-labs/rust-postgres.git"
 tokio = { version = "1.38", default-features = false, features = [
   "rt-multi-thread",
   "macros",
