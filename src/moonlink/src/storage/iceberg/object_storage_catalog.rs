@@ -8,13 +8,6 @@ use futures::StreamExt;
 use std::collections::HashMap;
 /// This module contains the object storage catalog implementation, currently only S3 is supported.
 ///
-/// TODO(hjiang):
-/// 1. Implement property related functionalities.
-/// 2. (low priority) Implement `list_namespace` function, for now it's not required in snapshot <-> iceberg interaction.
-/// 3. (low priority) Implement `rename_table` function, for now it's not required in snapshot <-> iceberg interaction.
-/// 4. The initial version access everything via network IO, for performance consideration we should cache metadata in memory.
-/// 5. (not related to functionality) Set snapshot retention policy at metadata.
-///
 /// Iceberg table format from object storage's perspective:
 /// - namespace_indicator.txt
 ///   - An empty file, indicates it's a valid namespace
@@ -52,6 +45,7 @@ use iceberg::{
 use opendal::layers::RetryLayer;
 use opendal::services::S3;
 use opendal::Operator;
+use tokio::sync::OnceCell;
 
 // Object storage usually doesn't have "folder" concept, when creating a new namespace, we create an indicator file under certain folder.
 static NAMESPACE_INDICATOR_OBJECT_NAME: &str = "indicator.text";
@@ -61,6 +55,12 @@ static MIN_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(5
 static MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(3);
 static RETRY_DELAY_FACTOR: f32 = 1.5;
 static MAX_RETRY_COUNT: usize = 5;
+
+#[derive(Debug)]
+struct ObjectStorageOperator {
+    /// opendal operator.
+    op: Operator,
+}
 
 #[derive(Debug)]
 pub struct S3CatalogConfig {
@@ -95,11 +95,13 @@ impl S3CatalogConfig {
 
 #[derive(Debug)]
 pub struct S3Catalog {
+    config: S3CatalogConfig,
     file_io: FileIO,
-    op: Operator,
+    /// Operator to manager all IO operations.
+    operator: OnceCell<ObjectStorageOperator>,
     warehouse_location: String,
     bucket: String,
-    // Used to record puffin blob metadata.
+    /// Used to record puffin blob metadata in one transaction, and cleaned up after transaction commits.
     // Maps from "puffin filepath" to "puffin blob metadata".
     puffin_blobs: HashMap<String, Vec<PuffinBlobMetadataProxy>>,
 }
@@ -117,24 +119,8 @@ impl S3Catalog {
         let secret_access_key = config.secret_access_key.clone();
         let warehouse_location = config.warehouse_location.clone();
 
-        let builder = S3::default()
-            .bucket(&config.bucket)
-            .region(&config.region)
-            .endpoint(&config.endpoint)
-            .access_key_id(&config.access_key_id)
-            .secret_access_key(&config.secret_access_key);
-        let retry_layer = RetryLayer::new()
-            .with_max_times(MAX_RETRY_COUNT)
-            .with_jitter()
-            .with_factor(RETRY_DELAY_FACTOR)
-            .with_min_delay(MIN_RETRY_DELAY)
-            .with_max_delay(MAX_RETRY_DELAY);
-        let op = Operator::new(builder)
-            .expect("failed to create operator")
-            .layer(retry_layer)
-            .finish();
-
         Self {
+            config,
             file_io: FileIOBuilder::new("s3")
                 .with_prop(iceberg::io::S3_REGION, region)
                 .with_prop(iceberg::io::S3_ENDPOINT, endpoint)
@@ -142,11 +128,36 @@ impl S3Catalog {
                 .with_prop(iceberg::io::S3_SECRET_ACCESS_KEY, secret_access_key)
                 .build()
                 .unwrap(),
-            op,
+            operator: OnceCell::new(),
             warehouse_location,
             bucket,
             puffin_blobs: HashMap::new(),
         }
+    }
+
+    /// Get IO operator from the catalog.
+    async fn get_operator(&self) -> IcebergResult<&ObjectStorageOperator> {
+        self.operator
+            .get_or_try_init(|| async {
+                let builder = S3::default()
+                    .bucket(&self.config.bucket)
+                    .region(&self.config.region)
+                    .endpoint(&self.config.endpoint)
+                    .access_key_id(&self.config.access_key_id)
+                    .secret_access_key(&self.config.secret_access_key);
+                let retry_layer = RetryLayer::new()
+                    .with_max_times(MAX_RETRY_COUNT)
+                    .with_jitter()
+                    .with_factor(RETRY_DELAY_FACTOR)
+                    .with_min_delay(MIN_RETRY_DELAY)
+                    .with_max_delay(MAX_RETRY_DELAY);
+                let op = Operator::new(builder)
+                    .expect("failed to create operator")
+                    .layer(retry_layer)
+                    .finish();
+                Ok(ObjectStorageOperator { op })
+            })
+            .await
     }
 
     /// Get object name of the indicator object for the given namespace.
@@ -160,7 +171,7 @@ impl S3Catalog {
     }
 
     async fn object_exists(&self, object: &str) -> Result<bool, Box<dyn Error>> {
-        match self.op.stat(object).await {
+        match self.get_operator().await?.op.stat(object).await {
             Ok(_) => Ok(true),
             Err(e) if e.kind() == opendal::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(e.into()),
@@ -174,7 +185,13 @@ impl S3Catalog {
     ) -> Result<Vec<String>, Box<dyn Error>> {
         let prefix = format!("{}/", folder);
         let mut objects = Vec::new();
-        let mut lister = self.op.lister_with(&prefix).recursive(true).await?;
+        let mut lister = self
+            .get_operator()
+            .await?
+            .op
+            .lister_with(&prefix)
+            .recursive(true)
+            .await?;
         while let Some(entry) = lister.next().await {
             let entry = entry?;
             let path = entry.path();
@@ -192,7 +209,7 @@ impl S3Catalog {
     ) -> Result<Vec<String>, Box<dyn Error>> {
         let prefix = format!("{}/", folder);
         let mut dirs = Vec::new();
-        let lister = self.op.list(&prefix).await?;
+        let lister = self.get_operator().await?.op.list(&prefix).await?;
 
         let entries = lister;
         for cur_entry in entries.iter() {
@@ -216,7 +233,7 @@ impl S3Catalog {
     /// Read the whole content for the given object.
     /// Notice, it's not suitable to read large files; as of now it's made for metadata files.
     async fn read_object(&self, object: &str) -> Result<String, Box<dyn Error>> {
-        let content = self.op.read(object).await?;
+        let content = self.get_operator().await?.op.read(object).await?;
         Ok(String::from_utf8(content.to_vec())?)
     }
 
@@ -227,12 +244,17 @@ impl S3Catalog {
         content: &str,
     ) -> Result<(), Box<dyn Error>> {
         let data = content.as_bytes().to_vec();
-        self.op.write(object_filepath, data).await.map_err(|e| {
-            IcebergError::new(
-                iceberg::ErrorKind::Unexpected,
-                format!("Failed to write content: {}", e),
-            )
-        })?;
+        self.get_operator()
+            .await?
+            .op
+            .write(object_filepath, data)
+            .await
+            .map_err(|e| {
+                IcebergError::new(
+                    iceberg::ErrorKind::Unexpected,
+                    format!("Failed to write content: {}", e),
+                )
+            })?;
         Ok(())
     }
 
@@ -243,8 +265,11 @@ impl S3Catalog {
         objects_to_delete: Vec<String>,
     ) -> Result<(), Box<dyn Error>> {
         let futures = objects_to_delete.into_iter().map(|object| {
-            let op = self.op.clone();
-            async move { op.delete(&object).await }
+            async move {
+                // TODO(hjiang): Better error handling.
+                let op = self.get_operator().await.unwrap().op.clone();
+                op.delete(&object).await
+            }
         });
 
         let results = join_all(futures).await;
@@ -269,6 +294,11 @@ impl S3Catalog {
             get_puffin_metadata_and_close(puffin_writer).await?,
         );
         Ok(())
+    }
+
+    /// After transaction commits, puffin metadata should be cleared for next puffin write.
+    pub(crate) fn clear_puffin_metadata(&mut self) {
+        self.puffin_blobs.clear();
     }
 
     /// Load metadata and its location foe the given table.
@@ -438,6 +468,8 @@ impl Catalog for S3Catalog {
     /// Check if namespace exists in catalog.
     async fn namespace_exists(&self, namespace_ident: &NamespaceIdent) -> IcebergResult<bool> {
         match self
+            .get_operator()
+            .await?
             .op
             .stat(&S3Catalog::get_namespace_indicator_name(namespace_ident))
             .await
@@ -451,12 +483,17 @@ impl Catalog for S3Catalog {
     async fn drop_namespace(&self, namespace_ident: &NamespaceIdent) -> IcebergResult<()> {
         let key = S3Catalog::get_namespace_indicator_name(namespace_ident);
 
-        self.op.delete(&key).await.map_err(|e| {
-            IcebergError::new(
-                iceberg::ErrorKind::Unexpected,
-                format!("Failed to drop namespace: {}", e),
-            )
-        })?;
+        self.get_operator()
+            .await?
+            .op
+            .delete(&key)
+            .await
+            .map_err(|e| {
+                IcebergError::new(
+                    iceberg::ErrorKind::Unexpected,
+                    format!("Failed to drop namespace: {}", e),
+                )
+            })?;
 
         Ok(())
     }
@@ -989,7 +1026,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_table() -> IcebergResult<()> {
-        let catalog = create_s3_catalog().await;
+        let mut catalog = create_s3_catalog().await;
         create_test_table(&catalog).await?;
 
         let namespace = NamespaceIdent::from_strs(["default"])?;
@@ -1052,6 +1089,8 @@ mod tests {
 
         // Check table metadata.
         let table = catalog.update_table(table_commit).await?;
+        catalog.clear_puffin_metadata();
+
         let table_metadata = table.metadata();
         assert_eq!(
             **table_metadata.current_schema(),

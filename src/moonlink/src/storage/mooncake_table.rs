@@ -25,6 +25,8 @@ pub(crate) use snapshot::SnapshotTableState;
 use tokio::spawn;
 use tokio::sync::{watch, RwLock};
 use tokio::task::JoinHandle;
+
+#[derive(Debug)]
 pub(crate) struct TableConfig {
     /// mem slice size
     ///
@@ -51,6 +53,7 @@ impl TableConfig {
     }
 }
 
+#[derive(Debug)]
 pub struct TableMetadata {
     /// table name
     pub(crate) name: String,
@@ -117,11 +120,14 @@ pub struct SnapshotTask {
     ///
     new_disk_slices: Vec<DiskSliceWriter>,
     new_deletions: Vec<RawDeletionRecord>,
+    /// Pair of <batch id, record batch>.
     new_record_batches: Vec<(u64, Arc<RecordBatch>)>,
     new_rows: Option<SharedRowBufferSnapshot>,
     new_mem_indices: Vec<Arc<MemIndex>>,
+    /// Assigned (non-zero) after a commit event.
     new_lsn: u64,
     new_commit_point: Option<RecordLocation>,
+    /// Maps from xact_id to its LSN.
     flushed_xacts: HashMap<u32, u64>,
     aborted_xacts: Vec<u32>,
 }
@@ -177,14 +183,16 @@ pub struct MooncakeTable {
     ///
     mem_slice: MemSlice,
 
-    // Current snapshot of the table
+    /// Current snapshot of the table
     snapshot: Arc<RwLock<SnapshotTableState>>,
 
     table_snapshot_watch_sender: watch::Sender<u64>,
     table_snapshot_watch_receiver: watch::Receiver<u64>,
+
+    /// Records all the write operations since last snapshot.
     next_snapshot_task: SnapshotTask,
 
-    // Stream state per transaction
+    /// Stream state per transaction, keyed by xact-id.
     transaction_stream_states: HashMap<u32, TransactionStreamState>,
 }
 
@@ -324,7 +332,8 @@ impl MooncakeTable {
         self.transaction_stream_states.remove(&xact_id);
     }
 
-    async fn inner_flush(
+    /// Flush the given MemSlice and in-memory record batches into data files.
+    async fn inner_flush_data_files(
         mem_slice: &mut MemSlice,
         snapshot_task: &mut SnapshotTask,
         metadata: &Arc<TableMetadata>,
@@ -375,7 +384,7 @@ impl MooncakeTable {
             snapshot_task.flushed_xacts.insert(xact_id, lsn);
 
             let disk_slice =
-                Self::inner_flush(mem_slice, snapshot_task, &self.metadata, lsn).await?;
+                Self::inner_flush_data_files(mem_slice, snapshot_task, &self.metadata, lsn).await?;
             self.next_snapshot_task.new_disk_slices.push(disk_slice);
             Ok(())
         } else {
@@ -386,8 +395,8 @@ impl MooncakeTable {
     // UNDONE(BATCH_INSERT):
     // flush uncommitted batches from big batch insert
     pub async fn flush(&mut self, lsn: u64) -> Result<()> {
-        // Call inner_flush directly and await
-        let disk_slice = Self::inner_flush(
+        // Flush data files into iceberb table.
+        let disk_slice = Self::inner_flush_data_files(
             &mut self.mem_slice,
             &mut self.next_snapshot_task,
             &self.metadata,
@@ -398,7 +407,7 @@ impl MooncakeTable {
         Ok(())
     }
 
-    // Create a snapshot of the last committed version
+    // Create a snapshot of the last committed version, return current snapshot's version.
     //
     pub(crate) fn create_snapshot(&mut self) -> Option<JoinHandle<u64>> {
         if !self.next_snapshot_task.should_create_snapshot() {
