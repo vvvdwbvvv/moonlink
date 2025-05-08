@@ -49,6 +49,7 @@ impl TestEnvironment {
             1,
             path,
             Identity::Keys(vec![0]),
+            /*iceberg_table_config=*/ None,
         );
 
         let (replication_tx, replication_rx) = watch::channel(0u64);
