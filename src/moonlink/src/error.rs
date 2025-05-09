@@ -24,6 +24,9 @@ pub enum Error {
         #[source]
         source: watch::error::RecvError,
     },
+
+    #[error("Tokio join error: {0}. This typically occurs when a spawned task fails to complete successfully. Check the task's execution or panic status for more details.")]
+    TokioJoinError(String),
 }
 
 pub type Result<T> = result::Result<T, Error>;
