@@ -5,17 +5,19 @@ use crate::storage::iceberg::s3_test_utils;
 
 use futures::TryStreamExt;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use url::Url;
 use uuid::Uuid;
 
 use arrow_schema::Schema as ArrowSchema;
 use iceberg::arrow as IcebergArrow;
-use iceberg::spec::{DataFile, DataFileFormat};
+use iceberg::io::FileIOBuilder;
+use iceberg::spec::DataFile;
+use iceberg::spec::{DataContentType, DataFileFormat, ManifestEntry};
 use iceberg::table::Table as IcebergTable;
 use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{
-    DefaultFileNameGenerator, DefaultLocationGenerator,
+    DefaultFileNameGenerator, DefaultLocationGenerator, LocationGenerator,
 };
 use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::IcebergWriter;
@@ -26,6 +28,48 @@ use iceberg::{
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use parquet::file::properties::WriterProperties;
 use tokio::fs::File;
+
+/// Return whether the given manifest entry represents data files.
+pub fn is_data_file_entry(entry: &ManifestEntry) -> bool {
+    let f = entry.data_file();
+    let is_data_file =
+        f.content_type() == DataContentType::Data && f.file_format() == DataFileFormat::Parquet;
+    if !is_data_file {
+        return false;
+    }
+    assert!(f.referenced_data_file().is_none());
+    assert!(f.content_offset().is_none());
+    assert!(f.content_size_in_bytes().is_none());
+    true
+}
+
+/// Return whether the given manifest entry represents deletion vector.
+pub fn is_deletion_vector_entry(entry: &ManifestEntry) -> bool {
+    let f = entry.data_file();
+    let is_deletion_vector = f.content_type() == DataContentType::PositionDeletes;
+    if !is_deletion_vector {
+        return false;
+    }
+    assert_eq!(f.file_format(), DataFileFormat::Puffin);
+    assert!(f.referenced_data_file().is_some());
+    assert!(f.content_offset().is_some());
+    assert!(f.content_size_in_bytes().is_some());
+    true
+}
+
+/// Return whether the given manifest entry represents file index.
+pub fn is_file_index(entry: &ManifestEntry) -> bool {
+    let f = entry.data_file();
+    let is_file_index =
+        f.content_type() == DataContentType::Data && f.file_format() == DataFileFormat::Puffin;
+    if !is_file_index {
+        return false;
+    }
+    assert!(f.referenced_data_file().is_none());
+    assert!(f.content_offset().is_none());
+    assert!(f.content_size_in_bytes().is_none());
+    true
+}
 
 /// Create a catelog based on the provided type.
 ///
@@ -147,8 +191,6 @@ pub(crate) async fn write_record_batch_to_iceberg(
         /*location_generator=*/ location_generator,
         /*file_name_generator=*/ file_name_generator,
     );
-
-    // TOOD(hjiang): Add support for partition values.
     let data_file_writer_builder = DataFileWriterBuilder::new(
         parquet_writer_builder,
         /*partition_value=*/ None,
@@ -172,4 +214,51 @@ pub(crate) async fn write_record_batch_to_iceberg(
     );
 
     Ok(data_files[0].clone())
+}
+
+/// Get URL scheme for the given path.
+fn get_url_scheme(url: &str) -> String {
+    let url = Url::parse(url)
+        .or_else(|_| Url::from_file_path(url))
+        .unwrap_or_else(|_| panic!("Cannot get URL scheme from {:?}", url));
+    url.scheme().to_string()
+}
+
+/// Copy the given local index file to iceberg table, and return filepath within iceberg table.
+pub(crate) async fn upload_index_file(
+    table: &IcebergTable,
+    local_index_filepath: &str,
+) -> IcebergResult<String> {
+    let filename = Path::new(local_index_filepath)
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let location_generator = DefaultLocationGenerator::new(table.metadata().clone()).unwrap();
+    let remote_filepath = location_generator.generate_location(&filename);
+    let src = FileIOBuilder::new_fs_io()
+        .build()?
+        .new_input(local_index_filepath)?;
+    let dst = FileIOBuilder::new(get_url_scheme(&remote_filepath))
+        .build()?
+        .new_output(remote_filepath.clone())?;
+
+    // TODO(hjiang): Switch to parallel chunk-based reading.
+    let bytes = src.read().await?;
+    dst.write(bytes).await?;
+
+    Ok(remote_filepath)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_get_url_scheme() {
+        assert_eq!(get_url_scheme("/tmp/iceberg_table"), "file");
+        assert_eq!(get_url_scheme("file:///tmp/iceberg_table"), "file");
+        assert_eq!(get_url_scheme("s3://bucket/iceberg_table"), "s3");
+    }
 }

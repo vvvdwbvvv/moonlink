@@ -1,3 +1,4 @@
+pub mod file_index_id;
 pub mod hash_index;
 pub mod persisted_bucket_hash_map;
 
@@ -14,8 +15,8 @@ pub trait Index<'a>: Send + Sync {
 }
 
 pub struct MooncakeIndex {
-    in_memory_index: HashSet<IndexPtr>,
-    file_indices: Vec<FileIndex>,
+    pub(crate) in_memory_index: HashSet<IndexPtr>,
+    pub(crate) file_indices: Vec<FileIndex>,
 }
 /// Type for primary keys
 pub type PrimaryKey = u64;
@@ -27,7 +28,7 @@ pub type FileIndex = GlobalIndex; // key -> (file, row_offset)
 
 // Wrapper that uses Arc pointer identity
 #[derive(Clone)]
-struct IndexPtr(Arc<MemIndex>);
+pub(crate) struct IndexPtr(Arc<MemIndex>);
 
 impl PartialEq for IndexPtr {
     fn eq(&self, other: &Self) -> bool {

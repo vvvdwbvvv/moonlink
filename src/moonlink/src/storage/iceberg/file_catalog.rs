@@ -1,5 +1,5 @@
 use super::puffin_writer_proxy::append_puffin_metadata_and_rewrite;
-use crate::storage::iceberg::moonlink_catalog::DeletionVectorWrite;
+use crate::storage::iceberg::moonlink_catalog::PuffinWrite;
 use crate::storage::iceberg::puffin_writer_proxy::{
     get_puffin_metadata_and_close, PuffinBlobMetadataProxy,
 };
@@ -136,7 +136,7 @@ impl FileCatalog {
     }
 
     /// Get IO operator from the catalog.
-    async fn get_operator(&self) -> IcebergResult<&Operator> {
+    pub(crate) async fn get_operator(&self) -> IcebergResult<&Operator> {
         let retry_layer = RetryLayer::new()
             .with_max_times(MAX_RETRY_COUNT)
             .with_jitter()
@@ -350,16 +350,14 @@ impl FileCatalog {
 }
 
 #[async_trait]
-impl DeletionVectorWrite for FileCatalog {
+impl PuffinWrite for FileCatalog {
     async fn record_puffin_metadata_and_close(
         &mut self,
         puffin_filepath: String,
         puffin_writer: PuffinWriter,
     ) -> IcebergResult<()> {
-        self.puffin_blobs.insert(
-            puffin_filepath,
-            get_puffin_metadata_and_close(puffin_writer).await?,
-        );
+        let puffin_metadata = get_puffin_metadata_and_close(puffin_writer).await?;
+        self.puffin_blobs.insert(puffin_filepath, puffin_metadata);
         Ok(())
     }
 

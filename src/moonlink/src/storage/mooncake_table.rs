@@ -6,7 +6,7 @@ mod shared_array;
 mod snapshot;
 
 use super::iceberg::iceberg_table_manager::IcebergTableManagerConfig;
-use super::index::{MemIndex, MooncakeIndex};
+use super::index::{FileIndex, MemIndex, MooncakeIndex};
 use super::storage_utils::{RawDeletionRecord, RecordLocation};
 use crate::error::{Error, Result};
 use crate::row::{Identity, MoonlinkRow};
@@ -77,11 +77,12 @@ pub struct Snapshot {
     /// table metadata
     pub(crate) metadata: Arc<TableMetadata>,
     /// datafile and their deletion vectors
+    /// TODO(hjiang): Use `String` as key.
     pub(crate) disk_files: HashMap<PathBuf, BatchDeletionVector>,
     /// Current snapshot version
-    snapshot_version: u64,
+    pub(crate) snapshot_version: u64,
     /// indices
-    indices: MooncakeIndex,
+    pub(crate) indices: MooncakeIndex,
 }
 
 impl Snapshot {
@@ -92,6 +93,11 @@ impl Snapshot {
             snapshot_version: 0,
             indices: MooncakeIndex::new(),
         }
+    }
+
+    /// Get file indices for the current snapshot.
+    pub(crate) fn get_file_indices(&self) -> &[FileIndex] {
+        self.indices.file_indices.as_slice()
     }
 
     pub fn get_name_for_inmemory_file(&self) -> PathBuf {

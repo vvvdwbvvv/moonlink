@@ -14,8 +14,11 @@ use parquet::arrow::ArrowWriter;
 use std::collections::BTreeMap;
 use std::mem::take;
 use std::sync::Arc;
+
 pub(crate) struct SnapshotTableState {
     /// Current snapshot
+    ///
+    /// TODO(hjiang): Current snapshot should be loaded from iceberg table manager.
     current_snapshot: Snapshot,
 
     /// In memory RecordBatches, maps from batch to in-memory batch.
@@ -92,7 +95,10 @@ impl SnapshotTableState {
             self.iceberg_table_manager
                 .as_mut()
                 .unwrap()
-                .sync_snapshot(self.current_snapshot.disk_files.clone())
+                .sync_snapshot(
+                    self.current_snapshot.disk_files.clone(),
+                    self.current_snapshot.get_file_indices(),
+                )
                 .await
                 .unwrap();
         }

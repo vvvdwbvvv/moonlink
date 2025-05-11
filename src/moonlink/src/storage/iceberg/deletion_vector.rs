@@ -1,3 +1,4 @@
+use crate::storage::iceberg::blob_proxy::IcebergBlobProxy;
 use crate::storage::iceberg::puffin_utils;
 use crate::storage::mooncake_table::delete_vector::BatchDeletionVector;
 
@@ -16,7 +17,7 @@ const DELETION_VECTOR_MAGIC_BYTES: [u8; 4] = [0xD1, 0xD3, 0x39, 0x64];
 const MIN_SERIALIZED_DELETION_VECTOR_BLOB: usize = 12;
 
 // Blob type for deletion vector.
-const DELETION_VECTOR_BLOB_TYPE: &str = "deletion-vector-v1";
+pub(crate) const DELETION_VECTOR_BLOB_TYPE: &str = "deletion-vector-v1";
 
 // Deletion vector puffin blob properties which must be contained.
 pub(crate) const DELETION_VECTOR_CADINALITY: &str = "cardinality";
@@ -29,17 +30,6 @@ const HARD_CODE_DELETE_VECTOR_MAX_ROW: usize = 4096;
 pub(crate) struct DeletionVector {
     /// Roaring bitmap representing deleted rows.
     pub(crate) bitmap: RoaringTreemap,
-}
-
-// TODO(hjiang): Ideally moonlink doesn't need to operate on `Blob` directly, iceberg-rust should provide high-level interface to operate on deleted rows, but before it's supported officially, we use this hacky way to construct a `iceberg::puffin::blob::Blob`.
-#[allow(dead_code)]
-struct IcebergBlobProxy {
-    pub(crate) r#type: String,
-    pub(crate) fields: Vec<i32>,
-    pub(crate) snapshot_id: i64,
-    pub(crate) sequence_number: i64,
-    pub(crate) data: Vec<u8>,
-    pub(crate) properties: HashMap<String, String>,
 }
 
 impl DeletionVector {
