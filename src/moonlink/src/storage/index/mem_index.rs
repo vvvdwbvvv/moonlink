@@ -117,6 +117,14 @@ impl MemIndex {
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        match self {
+            MemIndex::SinglePrimitive(map) => map.is_empty(),
+            MemIndex::Key(map) => map.is_empty(),
+            MemIndex::FullRow(map) => map.is_empty(),
+        }
+    }
+
     pub fn remap_into_vec(
         &self,
         batch_id_to_idx: &std::collections::HashMap<u64, usize>,

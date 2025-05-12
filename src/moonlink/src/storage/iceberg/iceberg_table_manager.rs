@@ -516,7 +516,7 @@ impl IcebergOperation for IcebergTableManager {
 mod tests {
     use super::*;
 
-    use crate::row::Identity as RowIdentity;
+    use crate::row::IdentityProp as RowIdentity;
     use crate::row::MoonlinkRow;
     use crate::row::{IdentityProp, RowValue};
     use crate::storage::iceberg::iceberg_table_manager::IcebergTableManager;

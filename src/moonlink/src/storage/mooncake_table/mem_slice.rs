@@ -40,10 +40,7 @@ impl MemSlice {
 
     /// Return whether slice is empty.
     pub fn is_empty(&self) -> bool {
-        let column_store_is_empty = self.column_store.get_num_rows() == 0;
-        let mem_index_is_empty = self.mem_index.is_empty();
-        assert_eq!(column_store_is_empty, mem_index_is_empty);
-        column_store_is_empty
+        self.column_store.get_num_rows() == 0
     }
 
     /// Delete the given record from mem slice, and return its location if exists.
