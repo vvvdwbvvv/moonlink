@@ -161,16 +161,8 @@ impl DiskSliceWriter {
         }
         let list = self
             .old_index
-            .iter()
-            .filter_map(|(key, value)| {
-                let RecordLocation::MemoryBatch(batch_id, row_idx) = value else {
-                    panic!("Invalid record location");
-                };
-                let old_location = (*self.batch_id_to_idx.get(batch_id).unwrap(), *row_idx);
-                let new_location = self.row_offset_mapping[old_location.0][old_location.1];
-                new_location.map(|new_location| (*key, new_location.0, new_location.1))
-            })
-            .collect::<Vec<_>>();
+            .remap_into_vec(&self.batch_id_to_idx, &self.row_offset_mapping);
+
         let mut index_builder = GlobalIndexBuilder::new();
         index_builder.set_files(
             self.files
@@ -207,7 +199,7 @@ impl DiskSliceWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::row::{Identity, MoonlinkRow, RowValue};
+    use crate::row::{IdentityProp, MoonlinkRow, RowValue};
     use crate::storage::mooncake_table::mem_slice::MemSlice;
     use crate::storage::storage_utils::RawDeletionRecord;
     use arrow::datatypes::{DataType, Field};
@@ -237,8 +229,9 @@ mod tests {
         // Create a schema for testing
         let schema = get_test_schema();
 
+        let identity = IdentityProp::SinglePrimitiveKey(0);
         // Create a MemSlice with test data
-        let mut mem_slice = MemSlice::new(schema.clone(), 100);
+        let mut mem_slice = MemSlice::new(schema.clone(), 100, identity);
 
         // Add some test rows
         let row1 = MoonlinkRow::new(vec![
@@ -250,12 +243,9 @@ mod tests {
             RowValue::ByteArray("Bob".as_bytes().to_vec()),
         ]);
 
-        mem_slice.append(1, row1)?;
-        mem_slice.append(2, row2)?;
-        let (_new_batch, entries, _index) = mem_slice.drain().unwrap();
-        let mut old_index = MemIndex::new();
-        old_index.insert(1, RecordLocation::MemoryBatch(0, 0));
-        old_index.insert(2, RecordLocation::MemoryBatch(0, 1));
+        mem_slice.append(1, row1, None)?;
+        mem_slice.append(2, row2, None)?;
+        let (_new_batch, entries, old_index) = mem_slice.drain().unwrap();
 
         let mut disk_slice = DiskSliceWriter::new(
             schema.clone(),
@@ -302,8 +292,10 @@ mod tests {
         // Create a schema for testing
         let schema = get_test_schema();
 
+        let identity = IdentityProp::SinglePrimitiveKey(0);
+
         // Create a MemSlice with test data - more rows this time
-        let mut mem_slice = MemSlice::new(schema.clone(), 3);
+        let mut mem_slice = MemSlice::new(schema.clone(), 3, identity);
 
         // Add several test rows
         let rows = [
@@ -335,7 +327,7 @@ mod tests {
                 RowValue::Int32(v) => v as u64,
                 _ => panic!("Expected i32"),
             };
-            mem_slice.append(key, row)?;
+            mem_slice.append(key, row, None)?;
         }
 
         // Delete a couple of rows to test that only active rows are mapped
@@ -346,7 +338,7 @@ mod tests {
                 pos: Some((0, 1)),
                 lsn: 1,
             },
-            &Identity::SinglePrimitiveKey(0),
+            &IdentityProp::SinglePrimitiveKey(0),
         ); // Delete Bob (ID 2)
         mem_slice.delete(
             &RawDeletionRecord {
@@ -355,7 +347,7 @@ mod tests {
                 pos: Some((0, 3)),
                 lsn: 1,
             },
-            &Identity::SinglePrimitiveKey(0),
+            &IdentityProp::SinglePrimitiveKey(0),
         ); // Delete David (ID 4)
 
         let (_new_batch, entries, index) = mem_slice.drain().unwrap();
