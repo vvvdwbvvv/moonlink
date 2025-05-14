@@ -19,7 +19,7 @@ pub fn postgres_primitive_to_arrow_type(typ: &Type, name: &str, nullable: bool) 
         Type::INT8 => (DataType::Int64, None),
         Type::FLOAT4 => (DataType::Float32, None),
         Type::FLOAT8 => (DataType::Float64, None),
-        Type::NUMERIC => (DataType::Decimal128(38, 0), None),
+        Type::NUMERIC => (DataType::Decimal128(38, 10), None),
         Type::VARCHAR | Type::TEXT | Type::BPCHAR | Type::CHAR | Type::NAME => {
             (DataType::Utf8, None)
         }

@@ -236,44 +236,46 @@ impl ColumnArrayBuilder {
     }
     /// Finish building and return the array
     pub(crate) fn finish(&mut self, logical_type: &DataType) -> ArrayRef {
-        let (array, offset_builder): (ArrayRef, Option<Vec<i32>>) = match self {
+        let (array, offset_builder): (ArrayRef, &mut Option<Vec<i32>>) = match self {
             ColumnArrayBuilder::Boolean(builder, offset_builder) => {
-                (Arc::new(builder.finish()), take(offset_builder))
+                (Arc::new(builder.finish()), offset_builder)
             }
             ColumnArrayBuilder::Int32(builder, offset_builder) => {
-                (Arc::new(builder.finish()), take(offset_builder))
+                (Arc::new(builder.finish()), offset_builder)
             }
             ColumnArrayBuilder::Int64(builder, offset_builder) => {
-                (Arc::new(builder.finish()), take(offset_builder))
+                (Arc::new(builder.finish()), offset_builder)
             }
             ColumnArrayBuilder::Float32(builder, offset_builder) => {
-                (Arc::new(builder.finish()), take(offset_builder))
+                (Arc::new(builder.finish()), offset_builder)
             }
             ColumnArrayBuilder::Float64(builder, offset_builder) => {
-                (Arc::new(builder.finish()), take(offset_builder))
+                (Arc::new(builder.finish()), offset_builder)
             }
             ColumnArrayBuilder::Decimal128(builder, offset_builder) => {
-                (Arc::new(builder.finish()), take(offset_builder))
+                (Arc::new(builder.finish()), offset_builder)
             }
             ColumnArrayBuilder::Utf8(builder, offset_builder) => {
-                (Arc::new(builder.finish()), take(offset_builder))
+                (Arc::new(builder.finish()), offset_builder)
             }
             ColumnArrayBuilder::FixedSizeBinary(builder, offset_builder) => {
-                (Arc::new(builder.finish()), take(offset_builder))
+                (Arc::new(builder.finish()), offset_builder)
             }
             ColumnArrayBuilder::Binary(builder, offset_builder) => {
-                (Arc::new(builder.finish()), take(offset_builder))
+                (Arc::new(builder.finish()), offset_builder)
             }
         };
-        if let Some(mut offset_builder) = offset_builder {
-            offset_builder.push(array.len() as i32);
+        if let Some(vec) = offset_builder.as_mut() {
+            let mut taken_vec = take(vec);
+            taken_vec.push(array.len() as i32);
+
             let inner_field = match logical_type {
                 DataType::List(inner) => inner,
                 _ => panic!("List expected from well-typed input"),
             };
             let list_array = ListArray::new(
                 inner_field.clone(),
-                OffsetBuffer::new(offset_builder.into()),
+                OffsetBuffer::new(taken_vec.into()),
                 array,
                 None,
             );
