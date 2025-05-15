@@ -32,6 +32,9 @@ use uuid::Uuid;
 #[cfg(test)]
 use mockall::*;
 
+/// Key for iceberg table property, to record flush lsn.
+const MOONCAKE_TABLE_FLUSH_LSN: &str = "mooncake-table-flush-lsn";
+
 #[derive(Clone, Debug, TypedBuilder)]
 pub struct IcebergTableConfig {
     /// Table warehouse location.
@@ -62,7 +65,7 @@ pub(crate) trait IcebergOperation {
     /// Provide delta change interface, so snapshot doesn't need to store everything.
     async fn sync_snapshot(
         &mut self,
-        lsn: u64,
+        flush_lsn: u64,
         disk_files: Vec<PathBuf>,
         desired_deletion_vector: HashMap<PathBuf, BatchDeletionVector>,
         file_indices: &[MooncakeFileIndex],
@@ -245,6 +248,7 @@ impl IcebergTableManager {
     fn transform_to_mooncake_snapshot(
         &self,
         persisted_file_indices: Vec<MooncakeFileIndex>,
+        flush_lsn: Option<u64>,
     ) -> MooncakeSnapshot {
         let mut mooncake_snapshot = MooncakeSnapshot::new(self.mooncake_table_metadata.clone());
 
@@ -271,6 +275,9 @@ impl IcebergTableManager {
             in_memory_index: HashSet::new(),
             file_indices: persisted_file_indices,
         };
+
+        // Fill in flush LSN.
+        mooncake_snapshot.data_file_flush_lsn = flush_lsn;
 
         mooncake_snapshot
     }
@@ -441,7 +448,7 @@ impl IcebergOperation for IcebergTableManager {
     /// TODO(hjiang): Persist LSN into iceberg table as well.
     async fn sync_snapshot(
         &mut self,
-        _lsn: u64,
+        flush_lsn: u64,
         new_disk_files: Vec<PathBuf>,
         desired_deletion_vector: HashMap<PathBuf, BatchDeletionVector>,
         file_indices: &[MooncakeFileIndex],
@@ -467,6 +474,13 @@ impl IcebergOperation for IcebergTableManager {
             txn = action.apply().await?;
         }
 
+        // Persist flush lsn at table property, it's just a workaround.
+        // The ideal solution is to store at snapshot summary additional properties.
+        // Issue: https://github.com/apache/iceberg-rust/issues/1329
+        let mut prop = HashMap::new();
+        prop.insert(MOONCAKE_TABLE_FLUSH_LSN.to_string(), flush_lsn.to_string());
+        txn = txn.set_properties(prop)?;
+
         self.iceberg_table = Some(txn.commit(&*self.catalog).await?);
         self.catalog.clear_puffin_metadata();
 
@@ -478,6 +492,10 @@ impl IcebergOperation for IcebergTableManager {
 
         self.get_or_create_table().await?;
         let table_metadata = self.iceberg_table.as_ref().unwrap().metadata();
+        let mut flush_lsn: Option<u64> = None;
+        if let Some(lsn) = table_metadata.properties().get(MOONCAKE_TABLE_FLUSH_LSN) {
+            flush_lsn = Some(lsn.parse().unwrap());
+        }
 
         // There's nothing stored in iceberg table (aka, first time initialization).
         if table_metadata.current_snapshot().is_none() {
@@ -520,7 +538,7 @@ impl IcebergOperation for IcebergTableManager {
             }
         }
 
-        let mooncake_snapshot = self.transform_to_mooncake_snapshot(loaded_file_indices);
+        let mooncake_snapshot = self.transform_to_mooncake_snapshot(loaded_file_indices, flush_lsn);
         Ok(mooncake_snapshot)
     }
 }
@@ -709,7 +727,7 @@ mod tests {
 
         iceberg_table_manager
             .sync_snapshot(
-                /*lsn=*/ 0,
+                /*flush_lsn=*/ 0,
                 /*new_disk_files=*/ vec![parquet_path.clone()],
                 /*committed_deletion_log=*/
                 test_committed_deletion_log_1(parquet_path.clone()),
@@ -725,7 +743,7 @@ mod tests {
             .await?;
         iceberg_table_manager
             .sync_snapshot(
-                /*lsn=*/ 1,
+                /*flush_lsn=*/ 1,
                 /*new_disk_files=*/ vec![parquet_path.clone()],
                 /*committed_deletion_log=*/
                 test_committed_deletion_log_2(parquet_path.clone()),
@@ -826,7 +844,7 @@ mod tests {
             IcebergTableManager::new(mooncake_table_metadata.clone(), config.clone());
         iceberg_table_manager
             .sync_snapshot(
-                /*lsn=*/ 0,
+                /*flush_lsn=*/ 0,
                 /*disk_files=*/ vec![],
                 /*desired_deletion_vector=*/ HashMap::new(),
                 /*file_indices=*/ vec![].as_slice(),
@@ -840,6 +858,7 @@ mod tests {
         assert!(snapshot.disk_files.is_empty());
         assert!(snapshot.indices.in_memory_index.is_empty());
         assert!(snapshot.indices.file_indices.is_empty());
+        assert!(snapshot.data_file_flush_lsn.is_none());
         Ok(())
     }
 
@@ -855,6 +874,9 @@ mod tests {
             table_name: "test_table".to_string(),
         };
         let schema = create_test_arrow_schema();
+        // Create iceberg snapshot whenever `create_snapshot` is called.
+        let mut mooncake_table_config = MooncakeTableConfig::new();
+        mooncake_table_config.iceberg_snapshot_new_data_file_count = 0;
         let mut table = MooncakeTable::new(
             schema.as_ref().clone(),
             "test_table".to_string(),
@@ -862,6 +884,7 @@ mod tests {
             path,
             IdentityProp::Keys(vec![0]),
             iceberg_table_config.clone(),
+            mooncake_table_config,
         )
         .await;
 
@@ -913,14 +936,14 @@ mod tests {
             )
         })?;
         // First deletion of row2, which happens in MemSlice.
-        table.delete(row1.clone(), /*lsn=*/ 100);
-        table.flush(/*lsn=*/ 200).await.map_err(|e| {
+        table.delete(row1.clone(), /*flush_lsn=*/ 100);
+        table.flush(/*flush_lsn=*/ 200).await.map_err(|e| {
             IcebergError::new(
                 iceberg::ErrorKind::Unexpected,
                 format!("Failed to flush records to mooncake table because {:?}", e),
             )
         })?;
-        table.commit(/*lsn=*/ 200);
+        table.commit(/*flush_lsn=*/ 200);
         table.create_snapshot().unwrap().await.map_err(|e| {
             IcebergError::new(
                 iceberg::ErrorKind::Unexpected,
@@ -946,6 +969,7 @@ mod tests {
             "Snapshot data files and file indices are {:?}",
             get_file_indices_filepath_and_data_filepaths(&snapshot.indices)
         );
+        assert_eq!(snapshot.data_file_flush_lsn.unwrap(), 200);
 
         // Check the loaded data file is of the expected format and content.
         let file_io = iceberg_table_manager
@@ -980,8 +1004,8 @@ mod tests {
         // --------------------------------------
         // Operation series 2: no more additional rows appended, only to delete the first row in the table.
         // Expects to see a new deletion vector, because its corresponding data file has been persisted.
-        table.delete(row2.clone(), /*lsn=*/ 300);
-        table.flush(/*lsn=*/ 300).await.map_err(|e| {
+        table.delete(row2.clone(), /*flush_lsn=*/ 300);
+        table.flush(/*flush_lsn=*/ 300).await.map_err(|e| {
             IcebergError::new(
                 iceberg::ErrorKind::Unexpected,
                 format!(
@@ -990,7 +1014,7 @@ mod tests {
                 ),
             )
         })?;
-        table.commit(/*lsn=*/ 300);
+        table.commit(/*flush_lsn=*/ 300);
         table.create_snapshot().unwrap().await.map_err(|e| {
             IcebergError::new(
                 iceberg::ErrorKind::Unexpected,
@@ -1016,6 +1040,7 @@ mod tests {
             "Snapshot data files and file indices are {:?}",
             get_file_indices_filepath_and_data_filepaths(&snapshot.indices)
         );
+        assert_eq!(snapshot.data_file_flush_lsn.unwrap(), 300);
 
         // Check the loaded data file is of the expected format and content.
         let file_io = iceberg_table_manager
@@ -1042,14 +1067,14 @@ mod tests {
         // --------------------------------------
         // Operation series 3: no more additional rows appended, only to delete the last row in the table.
         // Expects to see the existing deletion vector updated, because its corresponding data file has been persisted.
-        table.delete(row3.clone(), /*lsn=*/ 400);
-        table.flush(/*lsn=*/ 400).await.map_err(|e| {
+        table.delete(row3.clone(), /*flush_lsn=*/ 400);
+        table.flush(/*flush_lsn=*/ 400).await.map_err(|e| {
             IcebergError::new(
                 iceberg::ErrorKind::Unexpected,
                 format!("Failed to flush records to mooncake table because {:?}", e),
             )
         })?;
-        table.commit(/*lsn=*/ 400);
+        table.commit(/*flush_lsn=*/ 400);
         table.create_snapshot().unwrap().await.map_err(|e| {
             IcebergError::new(
                 iceberg::ErrorKind::Unexpected,
@@ -1075,6 +1100,7 @@ mod tests {
             "Snapshot data files and file indices are {:?}",
             get_file_indices_filepath_and_data_filepaths(&snapshot.indices)
         );
+        assert_eq!(snapshot.data_file_flush_lsn.unwrap(), 400);
 
         // Check the loaded data file is of the expected format and content.
         let file_io = iceberg_table_manager
@@ -1120,13 +1146,13 @@ mod tests {
                 ),
             )
         })?;
-        table.flush(/*lsn=*/ 500).await.map_err(|e| {
+        table.flush(/*flush_lsn=*/ 500).await.map_err(|e| {
             IcebergError::new(
                 iceberg::ErrorKind::Unexpected,
                 format!("Failed to flush records to mooncake table because {:?}", e),
             )
         })?;
-        table.commit(/*lsn=*/ 500);
+        table.commit(/*flush_lsn=*/ 500);
         table.create_snapshot().unwrap().await.map_err(|e| {
             IcebergError::new(
                 iceberg::ErrorKind::Unexpected,
@@ -1152,6 +1178,7 @@ mod tests {
             "Snapshot data files and file indices are {:?}",
             get_file_indices_filepath_and_data_filepaths(&snapshot.indices)
         );
+        assert_eq!(snapshot.data_file_flush_lsn.unwrap(), 500);
 
         // The old data file and deletion vector is unchanged.
         let old_data_entry = iceberg_table_manager
