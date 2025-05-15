@@ -45,11 +45,14 @@ impl TableConfig {
     #[cfg(not(debug_assertions))]
     const DEFAULT_BATCH_SIZE: usize = 2048;
 
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             mem_slice_size: Self::DEFAULT_MEM_SLICE_SIZE,
             batch_size: Self::DEFAULT_BATCH_SIZE,
         }
+    }
+    pub(crate) fn batch_size(&self) -> usize {
+        self.batch_size
     }
 }
 
@@ -78,8 +81,18 @@ pub struct Snapshot {
     /// datafile and their deletion vectors
     /// TODO(hjiang): Use `String` as key.
     pub(crate) disk_files: HashMap<PathBuf, BatchDeletionVector>,
-    /// Current snapshot version
+    /// Current snapshot version, which is the mooncake table commit point.
     pub(crate) snapshot_version: u64,
+    /// LSN which last data file flush operation happens.
+    ///
+    /// There're two important time points: commit and flush.
+    /// - Data files are persisted at flush point, which could span across multiple commit points;
+    /// - Batch deletion vector, which is the value for `Snapshot::disk_files` updates at commit points.
+    ///   So likely they are not consistent from LSN's perspective.
+    ///
+    /// At iceberg snapshot creation, we should only dump consistent data files and deletion logs.
+    /// Data file flush LSN is recorded here, to get correponding deletion logs from "committed deletion logs".
+    pub(crate) data_file_flush_lsn: Option<u64>,
     /// indices
     pub(crate) indices: MooncakeIndex,
 }
@@ -90,6 +103,7 @@ impl Snapshot {
             metadata,
             disk_files: HashMap::new(),
             snapshot_version: 0,
+            data_file_flush_lsn: None,
             indices: MooncakeIndex::new(),
         }
     }
@@ -140,6 +154,21 @@ impl SnapshotTask {
 
     pub fn should_create_snapshot(&self) -> bool {
         self.new_lsn > 0 || !self.new_disk_slices.is_empty() || self.new_deletions.len() > 1000
+    }
+
+    /// Get newly created data files.
+    pub(crate) fn get_new_data_files(&self) -> Vec<PathBuf> {
+        let mut new_files = vec![];
+        for cur_disk_slice in self.new_disk_slices.iter() {
+            new_files.extend(
+                cur_disk_slice
+                    .output_files()
+                    .iter()
+                    .map(|(p, _)| p.clone())
+                    .collect::<Vec<_>>(),
+            );
+        }
+        new_files
     }
 }
 
@@ -358,7 +387,7 @@ impl MooncakeTable {
         mem_slice: &mut MemSlice,
         snapshot_task: &mut SnapshotTask,
         metadata: &Arc<TableMetadata>,
-        lsn: Option<u64>,
+        lsn: u64,
     ) -> Result<DiskSliceWriter> {
         // Finalize the current batch (if needed)
         let (new_batch, batches, index) = mem_slice.drain().unwrap();
@@ -378,7 +407,7 @@ impl MooncakeTable {
                 metadata_clone.schema.clone(),
                 path_clone,
                 batches,
-                lsn,
+                Some(lsn),
                 index,
             );
             block_on(disk_slice.write())?;
@@ -465,6 +494,9 @@ impl MooncakeTable {
     // UNDONE(BATCH_INSERT):
     // flush uncommitted batches from big batch insert
     pub async fn flush(&mut self, lsn: u64) -> Result<()> {
+        // Marks a checkpoint for iceberg snapshot creation.
+        self.snapshot.write().await.update_flush_lsn(lsn);
+
         if self.mem_slice.is_empty() {
             return Ok(());
         }
@@ -474,10 +506,11 @@ impl MooncakeTable {
             &mut self.mem_slice,
             &mut self.next_snapshot_task,
             &self.metadata,
-            Some(lsn),
+            lsn,
         )
         .await?;
         self.next_snapshot_task.new_disk_slices.push(disk_slice);
+
         Ok(())
     }
 

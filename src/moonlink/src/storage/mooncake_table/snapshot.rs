@@ -11,8 +11,9 @@ use crate::storage::mooncake_table::MoonlinkRow;
 use crate::storage::storage_utils::RawDeletionRecord;
 use crate::storage::storage_utils::{ProcessedDeletionRecord, RecordLocation};
 use parquet::arrow::ArrowWriter;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::mem::take;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 pub(crate) struct SnapshotTableState {
@@ -76,7 +77,44 @@ impl SnapshotTableState {
         }
     }
 
+    /// Update data file flush LSN.
+    pub(crate) fn update_flush_lsn(&mut self, lsn: u64) {
+        self.current_snapshot.data_file_flush_lsn = Some(lsn)
+    }
+
+    /// Aggregate committed deletion logs to flush point.
+    fn aggregate_ondisk_committed_deletion_logs(&self) -> HashMap<PathBuf, BatchDeletionVector> {
+        let mut aggregated_deletion_logs = std::collections::HashMap::new();
+        if self.current_snapshot.data_file_flush_lsn.is_none() {
+            return aggregated_deletion_logs;
+        }
+
+        let flush_point_lsn = self.current_snapshot.data_file_flush_lsn.unwrap();
+        for cur_deletion_log in self.committed_deletion_log.iter() {
+            assert!(
+                cur_deletion_log.lsn <= self.current_snapshot.snapshot_version,
+                "Committed deletion log {:?} is later than current snapshot LSN {}",
+                cur_deletion_log,
+                self.current_snapshot.snapshot_version
+            );
+            if cur_deletion_log.lsn > flush_point_lsn {
+                continue;
+            }
+            if let RecordLocation::DiskFile(file_id, row_idx) = &cur_deletion_log.pos {
+                let filepath = (*file_id.0).clone();
+                let deletion_vector = aggregated_deletion_logs
+                    .entry(filepath)
+                    .or_insert_with(|| BatchDeletionVector::new(1000));
+                assert!(deletion_vector.delete_row(*row_idx));
+            }
+        }
+        aggregated_deletion_logs
+    }
+
     pub(super) async fn update_snapshot(&mut self, mut task: SnapshotTask) -> u64 {
+        // To reduce iceberg write frequency, only create new iceberg snapshot when there're new data files.
+        let new_data_files = task.get_new_data_files();
+
         self.merge_mem_indices(&mut task);
         self.finalize_batches(&mut task);
         self.integrate_disk_slices(&mut task);
@@ -91,11 +129,20 @@ impl SnapshotTableState {
             self.last_commit = cp;
         }
 
-        // Sync the latest change to iceberg.
+        // Sync the latest change to iceberg, only triggered when there're new data files generated.
+        // TODO(hjiang): Should also trigger when there're large number of new deletions.
         // TODO(hjiang): Error handling for snapshot sync-up.
+        // TODO(hjiang): Need to prune committed deletion logs, will finish in the next PR.
+        //
+        // TODO(hjiang): Add unit test where there're no new disk files.
+        // To reduce iceberg persistence overhead, we only snapshot persisted data files, instead of all committed records.
+        // To achieve consistency between data files and deletion vectors, we only consider those with persisted data files.
+        let aggregated_committed_deletion_logs = self.aggregate_ondisk_committed_deletion_logs();
         self.iceberg_table_manager
             .sync_snapshot(
-                self.current_snapshot.disk_files.clone(),
+                /*lsn=*/ self.current_snapshot.snapshot_version,
+                new_data_files,
+                aggregated_committed_deletion_logs,
                 self.current_snapshot.get_file_indices(),
             )
             .await
@@ -276,7 +323,6 @@ impl SnapshotTableState {
             RecordLocation::MemoryBatch(batch_id, row_id) => {
                 if self.batches.contains_key(batch_id) {
                     // Possible we deleted an in memory row that was flushed
-
                     let res = self
                         .batches
                         .get_mut(batch_id)
@@ -312,7 +358,7 @@ impl SnapshotTableState {
             let deletion = entry.take().unwrap();
 
             if deletion.lsn <= task.new_lsn {
-                Self::commit_deletion(self, deletion);
+                self.commit_deletion(deletion);
             } else {
                 still_uncommitted.push(Some(deletion));
             }
