@@ -54,6 +54,11 @@ pub(crate) trait IcebergOperation {
     /// Write a new snapshot to iceberg table.
     /// It could be called for multiple times to write and commit multiple snapshots.
     ///
+    /// - Apart from data files, it also supports deletion vector (which is introduced in v3) and self-defined hash index,
+    ///   both of which are stored in puffin files.
+    /// - For deletion vectors, we store one blob in one puffin file.
+    /// - For hash index, we store one mooncake file index in one puffin file.
+    ///
     /// # Arguments
     ///
     /// * disk_files: new data files to be managed by iceberg
@@ -296,37 +301,28 @@ impl IcebergTableManager {
             return Ok(());
         }
 
-        if !deleted_rows.is_empty() {
-            // TODO(hjiang): Currently one deletion vector is stored in one puffin file, need to revisit later.
-            let deleted_row_count = deleted_rows.len();
-            let mut iceberg_deletion_vector = DeletionVector::new();
-            iceberg_deletion_vector.mark_rows_deleted(deleted_rows);
-            let blob_properties = HashMap::from([
-                (DELETION_VECTOR_REFERENCED_DATA_FILE.to_string(), data_file),
-                (
-                    DELETION_VECTOR_CADINALITY.to_string(),
-                    deleted_row_count.to_string(),
-                ),
-            ]);
-            let table_metadata = self.iceberg_table.as_ref().unwrap().metadata();
-            // TODO(hjiang): Fix sequence number and snapshot id, which should be -1.
-            let blob = iceberg_deletion_vector.serialize(
-                table_metadata.current_snapshot_id().unwrap_or(-1),
-                table_metadata.next_sequence_number(),
-                blob_properties,
-            );
-            let puffin_filepath = self.get_unique_deletion_vector_filepath();
-            let mut puffin_writer = puffin_utils::create_puffin_writer(
-                self.iceberg_table.as_ref().unwrap().file_io(),
-                puffin_filepath.clone(),
-            )
-            .await?;
-            puffin_writer.add(blob, CompressionCodec::None).await?;
+        let deleted_row_count = deleted_rows.len();
+        let mut iceberg_deletion_vector = DeletionVector::new();
+        iceberg_deletion_vector.mark_rows_deleted(deleted_rows);
+        let blob_properties = HashMap::from([
+            (DELETION_VECTOR_REFERENCED_DATA_FILE.to_string(), data_file),
+            (
+                DELETION_VECTOR_CADINALITY.to_string(),
+                deleted_row_count.to_string(),
+            ),
+        ]);
+        let blob = iceberg_deletion_vector.serialize(blob_properties);
+        let puffin_filepath = self.get_unique_deletion_vector_filepath();
+        let mut puffin_writer = puffin_utils::create_puffin_writer(
+            self.iceberg_table.as_ref().unwrap().file_io(),
+            puffin_filepath.clone(),
+        )
+        .await?;
+        puffin_writer.add(blob, CompressionCodec::None).await?;
 
-            self.catalog
-                .record_puffin_metadata_and_close(puffin_filepath, puffin_writer)
-                .await?;
-        }
+        self.catalog
+            .record_puffin_metadata_and_close(puffin_filepath, puffin_writer)
+            .await?;
 
         Ok(())
     }
