@@ -62,10 +62,11 @@ async fn test_delete_and_append(#[case] identity: IdentityProp) -> Result<()> {
     let snapshot = table.snapshot.read().await;
     let ReadOutput {
         file_paths,
-        deletions,
+        position_deletes,
+        deletion_vectors,
         ..
     } = snapshot.request_read()?;
-    verify_files_and_deletions(&file_paths, deletions.as_slice(), &[1, 3, 4]);
+    verify_files_and_deletions(&file_paths, position_deletes, deletion_vectors, &[1, 3, 4]);
     Ok(())
 }
 
@@ -104,13 +105,13 @@ async fn test_deletion_after_flush(#[case] identity: IdentityProp) -> Result<()>
     let snapshot = table.snapshot.read().await;
     let ReadOutput {
         file_paths,
-        deletions,
+        position_deletes,
         ..
     } = snapshot.request_read()?;
     assert_eq!(file_paths.len(), 1);
     let mut ids = read_ids_from_parquet(&file_paths[0]);
 
-    for deletion in deletions {
+    for deletion in position_deletes {
         ids[deletion.1 as usize] = None;
     }
     let ids = ids.into_iter().flatten().collect::<Vec<_>>();
@@ -184,10 +185,16 @@ async fn test_full_row_with_duplication_and_identical() -> Result<()> {
         let table_snapshot = table.snapshot.read().await;
         let ReadOutput {
             file_paths,
-            deletions,
+            position_deletes,
+            deletion_vectors,
             ..
         } = table_snapshot.request_read()?;
-        verify_files_and_deletions(&file_paths, &deletions, &[1, 2, 2, 3, 3]);
+        verify_files_and_deletions(
+            &file_paths,
+            position_deletes,
+            deletion_vectors,
+            &[1, 2, 2, 3, 3],
+        );
     }
 
     // Flush the table
@@ -204,10 +211,16 @@ async fn test_full_row_with_duplication_and_identical() -> Result<()> {
         let table_snapshot = table.snapshot.read().await;
         let ReadOutput {
             file_paths,
-            deletions,
+            position_deletes,
+            deletion_vectors,
             ..
         } = table_snapshot.request_read()?;
-        verify_files_and_deletions(&file_paths, deletions.as_slice(), &[1, 2, 3, 3]);
+        verify_files_and_deletions(
+            &file_paths,
+            position_deletes,
+            deletion_vectors,
+            &[1, 2, 3, 3],
+        );
     }
 
     // Delete one duplicate after flush (row5)
@@ -219,10 +232,11 @@ async fn test_full_row_with_duplication_and_identical() -> Result<()> {
         let table_snapshot = table.snapshot.read().await;
         let ReadOutput {
             file_paths,
-            deletions,
+            position_deletes,
+            deletion_vectors,
             ..
         } = table_snapshot.request_read()?;
-        verify_files_and_deletions(&file_paths, deletions.as_slice(), &[1, 2, 3]);
+        verify_files_and_deletions(&file_paths, position_deletes, deletion_vectors, &[1, 2, 3]);
     }
 
     Ok(())

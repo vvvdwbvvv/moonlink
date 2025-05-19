@@ -448,7 +448,7 @@ async fn mooncake_table_snapshot_persist_impl(warehouse_uri: String) -> IcebergR
         expected_arrow_batch, loaded_arrow_batch
     );
 
-    let deleted_rows = deletion_vector.collect_deleted_rows();
+    let deleted_rows = deletion_vector.batch_deletion_vector.collect_deleted_rows();
     assert!(
         deleted_rows.is_empty(),
         "There should be no deletion vector in iceberg table."
@@ -509,7 +509,7 @@ async fn mooncake_table_snapshot_persist_impl(warehouse_uri: String) -> IcebergR
         expected_arrow_batch, loaded_arrow_batch
     );
 
-    let deleted_rows = deletion_vector.collect_deleted_rows();
+    let deleted_rows = deletion_vector.batch_deletion_vector.collect_deleted_rows();
     let expected_deleted_rows = vec![0_u64];
     assert_eq!(
         deleted_rows, expected_deleted_rows,
@@ -569,7 +569,7 @@ async fn mooncake_table_snapshot_persist_impl(warehouse_uri: String) -> IcebergR
         expected_arrow_batch, loaded_arrow_batch
     );
 
-    let deleted_rows = deletion_vector.collect_deleted_rows();
+    let deleted_rows = deletion_vector.batch_deletion_vector.collect_deleted_rows();
     let expected_deleted_rows = vec![0_u64, 1_u64];
     assert_eq!(
         deleted_rows, expected_deleted_rows,
@@ -668,7 +668,7 @@ async fn mooncake_table_snapshot_persist_impl(warehouse_uri: String) -> IcebergR
         expected_arrow_batch, loaded_arrow_batch
     );
 
-    let deleted_rows = deletion_vector.collect_deleted_rows();
+    let deleted_rows = deletion_vector.batch_deletion_vector.collect_deleted_rows();
     assert!(
         deleted_rows.is_empty(),
         "The new appended data file should have no deletion vector aside, but actually it contains deletion vector {:?}",
@@ -814,11 +814,17 @@ async fn check_prev_data_files(
     assert_eq!(loaded_arrow_batch, expected_arrow_batch);
 
     // In the test suite, we only delete the second prepared row.
-    assert!(!deletion_vector.is_deleted(/*row_idx=*/ 0));
+    assert!(!deletion_vector
+        .batch_deletion_vector
+        .is_deleted(/*row_idx=*/ 0));
     if deleted {
-        assert!(deletion_vector.is_deleted(/*row_idx=*/ 1));
+        assert!(deletion_vector
+            .batch_deletion_vector
+            .is_deleted(/*row_idx=*/ 1));
     } else {
-        assert!(!deletion_vector.is_deleted(/*row_idx=*/ 1));
+        assert!(!deletion_vector
+            .batch_deletion_vector
+            .is_deleted(/*row_idx=*/ 1));
     }
 }
 
@@ -854,11 +860,17 @@ async fn check_new_data_files(
     assert_eq!(loaded_arrow_batch, expected_arrow_batch);
 
     // In the test suite, we only delete the second prepared row.
-    assert!(!deletion_vector.is_deleted(/*row_idx=*/ 0));
+    assert!(!deletion_vector
+        .batch_deletion_vector
+        .is_deleted(/*row_idx=*/ 0));
     if deleted {
-        assert!(deletion_vector.is_deleted(/*row_idx=*/ 1));
+        assert!(deletion_vector
+            .batch_deletion_vector
+            .is_deleted(/*row_idx=*/ 1));
     } else {
-        assert!(!deletion_vector.is_deleted(/*row_idx=*/ 1));
+        assert!(!deletion_vector
+            .batch_deletion_vector
+            .is_deleted(/*row_idx=*/ 1));
     }
 }
 
@@ -886,7 +898,7 @@ async fn check_prev_and_new_data_files(
             .await
             .unwrap();
         loaded_record_batches.push(cur_arrow_batch);
-        batch_deletion_vectors.push(cur_deletion_vector);
+        batch_deletion_vectors.push(&cur_deletion_vector.batch_deletion_vector);
     }
     // In the test suite, the first record has two rows, and the second record has one row.
     if loaded_record_batches[0].num_rows() == 1 {
