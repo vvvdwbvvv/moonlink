@@ -3,7 +3,10 @@ mod index;
 pub(crate) mod mooncake_table;
 mod storage_utils;
 
-pub use iceberg::iceberg_table_manager::{IcebergTableConfig, IcebergTableManager};
+pub use iceberg::iceberg_snapshot_state_manager::IcebergSnapshotStateManager;
+pub use iceberg::iceberg_table_manager::{
+    IcebergOperation, IcebergTableConfig, IcebergTableManager,
+};
 pub use mooncake_table::{MooncakeTable, TableConfig};
 pub(crate) use mooncake_table::{PuffinDeletionBlobAtRead, SnapshotTableState};
 
