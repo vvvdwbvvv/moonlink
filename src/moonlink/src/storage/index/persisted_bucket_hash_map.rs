@@ -81,12 +81,12 @@ impl IndexBlock {
         }
     }
 
-    fn iter<'a>(
+    async fn _create_iterator<'a>(
         &'a self,
         metadata: &'a GlobalIndex,
         file_id_remap: &'a Vec<u32>,
     ) -> IndexBlockIterator<'a> {
-        IndexBlockIterator::new(self, metadata, file_id_remap)
+        IndexBlockIterator::new(self, metadata, file_id_remap).await
     }
 
     #[inline]
@@ -169,8 +169,11 @@ impl GlobalIndex {
         vec![]
     }
 
-    pub fn _iter<'a>(&'a self, file_id_remap: &'a Vec<u32>) -> GlobalIndexIterator<'a> {
-        GlobalIndexIterator::_new(self, file_id_remap)
+    pub async fn _create_iterator<'a>(
+        &'a self,
+        file_id_remap: &'a Vec<u32>,
+    ) -> GlobalIndexIterator<'a> {
+        GlobalIndexIterator::_new(self, file_id_remap).await
     }
 }
 
@@ -302,6 +305,32 @@ impl GlobalIndexBuilder {
         self
     }
 
+    // Util function to build global index.
+    fn create_global_index(&mut self) -> (u32, GlobalIndex) {
+        let num_rows = self.num_rows;
+        let bucket_bits = 32 - num_rows.leading_zeros();
+        let num_buckets = (num_rows / 4 + 2).next_power_of_two();
+        let upper_bits = num_buckets.trailing_zeros();
+        let lower_bits = 64 - upper_bits;
+        let seg_id_bits = 32 - (self.files.len() as u32).trailing_zeros();
+        let global_index = GlobalIndex {
+            global_index_id: get_next_file_index_id(),
+            files: std::mem::take(&mut self.files),
+            num_rows,
+            hash_bits: HASH_BITS,
+            hash_upper_bits: upper_bits,
+            hash_lower_bits: lower_bits,
+            seg_id_bits,
+            row_id_bits: 32,
+            bucket_bits,
+            index_blocks: vec![],
+        };
+        (num_buckets, global_index)
+    }
+
+    // ================================
+    // Build from flush
+    // ================================
     pub async fn build_from_flush(mut self, mut entries: Vec<(u64, usize, usize)>) -> GlobalIndex {
         self.num_rows = entries.len() as u32;
         for entry in &mut entries {
@@ -311,6 +340,24 @@ impl GlobalIndexBuilder {
         self.build(entries.into_iter()).await
     }
 
+    async fn build(mut self, iter: impl Iterator<Item = (u64, usize, usize)>) -> GlobalIndex {
+        let (num_buckets, mut global_index) = self.create_global_index();
+        let mut index_blocks = Vec::new();
+        let mut index_block_builder =
+            IndexBlockBuilder::new(0, num_buckets + 1, self.directory.clone());
+        for entry in iter {
+            index_block_builder
+                .write_entry(entry.0, entry.1, entry.2, &global_index)
+                .await;
+        }
+        index_blocks.push(index_block_builder.build(&global_index).await);
+        global_index.index_blocks = index_blocks;
+        global_index
+    }
+
+    // ================================
+    // Build from merge
+    // ================================
     pub async fn _build_from_merge(mut self, indices: Vec<GlobalIndex>) -> GlobalIndex {
         self.num_rows = indices.iter().map(|index| index.num_rows).sum();
         self.files = indices
@@ -327,38 +374,23 @@ impl GlobalIndexBuilder {
             }
             file_id_remaps.push(file_id_remap);
         }
-        let iters = indices
-            .iter()
-            .enumerate()
-            .map(|(i, index)| index._iter(&file_id_remaps[i]))
-            .collect::<Vec<_>>();
-        let merge_iter = GlobalIndexMergingIterator::_new(iters);
-        self.build(merge_iter).await
+        let mut iters = Vec::with_capacity(indices.len());
+        for (idx, index) in indices.iter().enumerate() {
+            iters.push(index._create_iterator(&file_id_remaps[idx]).await);
+        }
+        let merge_iter = GlobalIndexMergingIterator::_new(iters).await;
+        self._build_from_merging_iterator(merge_iter).await
     }
 
-    async fn build(self, iter: impl Iterator<Item = (u64, usize, usize)>) -> GlobalIndex {
-        let num_rows = self.num_rows;
-        let bucket_bits = 32 - num_rows.leading_zeros();
-        let num_buckets = (num_rows / 4 + 2).next_power_of_two();
-        let upper_bits = num_buckets.trailing_zeros();
-        let lower_bits = 64 - upper_bits;
-        let seg_id_bits = 32 - (self.files.len() as u32).trailing_zeros();
-        let mut global_index = GlobalIndex {
-            global_index_id: get_next_file_index_id(),
-            files: self.files,
-            num_rows,
-            hash_bits: HASH_BITS,
-            hash_upper_bits: upper_bits,
-            hash_lower_bits: lower_bits,
-            seg_id_bits,
-            row_id_bits: 32,
-            bucket_bits,
-            index_blocks: vec![],
-        };
+    async fn _build_from_merging_iterator(
+        mut self,
+        mut iter: GlobalIndexMergingIterator<'_>,
+    ) -> GlobalIndex {
+        let (num_buckets, mut global_index) = self.create_global_index();
         let mut index_blocks = Vec::new();
         let mut index_block_builder =
             IndexBlockBuilder::new(0, num_buckets + 1, self.directory.clone());
-        for entry in iter {
+        while let Some(entry) = iter._next().await {
             index_block_builder
                 .write_entry(entry.0, entry.1, entry.2, &global_index)
                 .await;
@@ -385,7 +417,7 @@ struct IndexBlockIterator<'a> {
 }
 
 impl<'a> IndexBlockIterator<'a> {
-    fn new(
+    async fn new(
         collection: &'a IndexBlock,
         metadata: &'a GlobalIndex,
         file_id_remap: &'a Vec<u32>,
@@ -395,10 +427,18 @@ impl<'a> IndexBlockIterator<'a> {
             AsyncBigEndian,
         );
         let entry_reader = bucket_reader.clone();
-        block_on(bucket_reader.seek_bits(SeekFrom::Start(collection.bucket_start_offset))).unwrap();
-        let _ = block_on(bucket_reader.read::<u32>(metadata.bucket_bits)).unwrap();
-        let current_bucket_entry_end =
-            block_on(bucket_reader.read::<u32>(metadata.bucket_bits)).unwrap();
+        bucket_reader
+            .seek_bits(SeekFrom::Start(collection.bucket_start_offset))
+            .await
+            .unwrap();
+        let _ = bucket_reader
+            .read::<u32>(metadata.bucket_bits)
+            .await
+            .unwrap();
+        let current_bucket_entry_end = bucket_reader
+            .read::<u32>(metadata.bucket_bits)
+            .await
+            .unwrap();
         Self {
             collection,
             metadata,
@@ -411,12 +451,8 @@ impl<'a> IndexBlockIterator<'a> {
             file_id_remap,
         }
     }
-}
 
-impl Iterator for IndexBlockIterator<'_> {
-    type Item = (u64, usize, usize);
-
-    fn next(&mut self) -> Option<Self::Item> {
+    async fn next(&mut self) -> Option<(u64, usize, usize)> {
         loop {
             if self.current_bucket == self.collection.bucket_end_idx - 1 {
                 return None;
@@ -426,14 +462,17 @@ impl Iterator for IndexBlockIterator<'_> {
                 if self.current_bucket == self.collection.bucket_end_idx - 1 {
                     return None;
                 }
-                self.current_bucket_entry_end =
-                    block_on(self.bucket_reader.read::<u32>(self.metadata.bucket_bits)).unwrap();
+                self.current_bucket_entry_end = self
+                    .bucket_reader
+                    .read::<u32>(self.metadata.bucket_bits)
+                    .await
+                    .unwrap();
                 self.current_upper_hash += 1 << self.metadata.hash_lower_bits;
             }
-            let (lower_hash, seg_idx, row_idx) = block_on(
-                self.collection
-                    .read_entry(&mut self.entry_reader, self.metadata),
-            );
+            let (lower_hash, seg_idx, row_idx) = self
+                .collection
+                .read_entry(&mut self.entry_reader, self.metadata)
+                .await;
             self.current_entry += 1;
             if *self.file_id_remap.get(seg_idx).unwrap() != INVALID_FILE_ID {
                 return Some((lower_hash + self.current_upper_hash, seg_idx, row_idx));
@@ -450,11 +489,15 @@ pub struct GlobalIndexIterator<'a> {
 }
 
 impl<'a> GlobalIndexIterator<'a> {
-    pub fn _new(index: &'a GlobalIndex, file_id_remap: &'a Vec<u32>) -> Self {
+    pub async fn _new(index: &'a GlobalIndex, file_id_remap: &'a Vec<u32>) -> Self {
         let mut block_iter = None;
         let block_idx = 0;
         if !index.index_blocks.is_empty() {
-            block_iter = Some(index.index_blocks[0].iter(index, file_id_remap));
+            block_iter = Some(
+                index.index_blocks[0]
+                    ._create_iterator(index, file_id_remap)
+                    .await,
+            );
         }
         Self {
             index,
@@ -463,15 +506,11 @@ impl<'a> GlobalIndexIterator<'a> {
             file_id_remap,
         }
     }
-}
 
-impl Iterator for GlobalIndexIterator<'_> {
-    type Item = (u64, usize, usize);
-
-    fn next(&mut self) -> Option<Self::Item> {
+    pub async fn next(&mut self) -> Option<(u64, usize, usize)> {
         loop {
             if let Some(ref mut iter) = self.block_iter {
-                if let Some(item) = iter.next() {
+                if let Some(item) = iter.next().await {
                     return Some(item);
                 }
             }
@@ -479,16 +518,21 @@ impl Iterator for GlobalIndexIterator<'_> {
             if self.block_idx >= self.index.index_blocks.len() {
                 return None;
             }
-            self.block_iter =
-                Some(self.index.index_blocks[self.block_idx].iter(self.index, self.file_id_remap));
+            self.block_iter = Some(
+                self.index.index_blocks[self.block_idx]
+                    ._create_iterator(self.index, self.file_id_remap)
+                    .await,
+            );
         }
     }
 }
 
+#[allow(dead_code)]
 pub struct GlobalIndexMergingIterator<'a> {
     heap: BinaryHeap<HeapItem<'a>>,
 }
 
+#[allow(dead_code)]
 struct HeapItem<'a> {
     value: (u64, usize, usize),
     iter: GlobalIndexIterator<'a>,
@@ -514,24 +558,20 @@ impl Ord for HeapItem<'_> {
 }
 
 impl<'a> GlobalIndexMergingIterator<'a> {
-    pub fn _new(iterators: Vec<GlobalIndexIterator<'a>>) -> Self {
+    pub async fn _new(iterators: Vec<GlobalIndexIterator<'a>>) -> Self {
         let mut heap = BinaryHeap::new();
         for mut it in iterators {
-            if let Some(value) = it.next() {
+            if let Some(value) = it.next().await {
                 heap.push(HeapItem { value, iter: it });
             }
         }
         Self { heap }
     }
-}
 
-impl Iterator for GlobalIndexMergingIterator<'_> {
-    type Item = (u64, usize, usize);
-
-    fn next(&mut self) -> Option<Self::Item> {
+    pub async fn _next(&mut self) -> Option<(u64, usize, usize)> {
         if let Some(mut heap_item) = self.heap.pop() {
             let result = heap_item.value;
-            if let Some(next_value) = heap_item.iter.next() {
+            if let Some(next_value) = heap_item.iter.next().await {
                 self.heap.push(HeapItem {
                     value: next_value,
                     iter: heap_item.iter,
@@ -628,7 +668,8 @@ mod tests {
         let mut hash_entry_num = 0;
         let file_id_remap = vec![0; index.files.len()];
         for block in index.index_blocks.iter() {
-            for (hash, seg_idx, row_idx) in block.iter(&index, &file_id_remap) {
+            let mut index_block_iter = block._create_iterator(&index, &file_id_remap).await;
+            while let Some((hash, seg_idx, row_idx)) = index_block_iter.next().await {
                 println!("{} {} {}", hash, seg_idx, row_idx);
                 hash_entry_num += 1;
             }
