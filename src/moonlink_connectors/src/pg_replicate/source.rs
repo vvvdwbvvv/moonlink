@@ -5,7 +5,6 @@ use std::{
     time::{Duration, SystemTime, SystemTimeError, UNIX_EPOCH},
 };
 
-use async_trait::async_trait;
 use futures::{ready, Stream};
 use pin_project_lite::pin_project;
 use postgres_replication::LogicalReplicationStream;
@@ -21,8 +20,6 @@ use crate::pg_replicate::{
     },
     table::{ColumnSchema, TableId, TableName, TableSchema},
 };
-
-use super::{Source, SourceError};
 
 pub enum TableNamesFrom {
     Vec(Vec<TableName>),
@@ -42,9 +39,10 @@ pub enum PostgresSourceError {
 
     #[error("tokio postgres error: {0}")]
     TokioPostgres(#[from] tokio_postgres::Error),
-}
 
-impl SourceError for PostgresSourceError {}
+    #[error("cdc stream error: {0}")]
+    CdcStream(#[from] CdcStreamError),
+}
 
 pub struct PostgresSource {
     replication_client: ReplicationClient,
@@ -106,21 +104,16 @@ impl PostgresSource {
             }
         })
     }
-}
 
-#[async_trait]
-impl Source for PostgresSource {
-    type Error = PostgresSourceError;
-
-    fn get_table_schemas(&self) -> &HashMap<TableId, TableSchema> {
+    pub fn get_table_schemas(&self) -> &HashMap<TableId, TableSchema> {
         &self.table_schemas
     }
 
-    async fn get_table_copy_stream(
+    pub async fn get_table_copy_stream(
         &self,
         table_name: &TableName,
         column_schemas: &[ColumnSchema],
-    ) -> Result<TableCopyStream, Self::Error> {
+    ) -> Result<TableCopyStream, PostgresSourceError> {
         info!("starting table copy stream for table {table_name}");
 
         let stream = self
@@ -135,7 +128,7 @@ impl Source for PostgresSource {
         })
     }
 
-    async fn commit_transaction(&mut self) -> Result<(), Self::Error> {
+    pub async fn commit_transaction(&mut self) -> Result<(), PostgresSourceError> {
         self.replication_client
             .commit_txn()
             .await
@@ -143,7 +136,7 @@ impl Source for PostgresSource {
         Ok(())
     }
 
-    async fn get_cdc_stream(&self, start_lsn: PgLsn) -> Result<CdcStream, Self::Error> {
+    pub async fn get_cdc_stream(&self, start_lsn: PgLsn) -> Result<CdcStream, PostgresSourceError> {
         info!("starting cdc stream at lsn {start_lsn}");
         let publication = self
             .publication()

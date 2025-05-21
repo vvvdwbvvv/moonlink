@@ -2,5 +2,6 @@
 
 pub mod clients;
 pub mod conversions;
-pub mod pipeline;
+pub mod replication_state;
+pub mod source;
 pub mod table;
