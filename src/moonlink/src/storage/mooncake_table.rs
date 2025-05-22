@@ -4,14 +4,18 @@ mod disk_slice;
 mod mem_slice;
 mod shared_array;
 mod snapshot;
+mod table_snapshot;
 
-use super::iceberg::iceberg_table_manager::IcebergTableConfig;
 use super::iceberg::puffin_utils::PuffinBlobRef;
-use super::index::{FileIndex, MemIndex, MooncakeIndex};
+use super::index::{MemIndex, MooncakeIndex};
 use super::storage_utils::{RawDeletionRecord, RecordLocation};
 use crate::error::{Error, Result};
 use crate::row::{IdentityProp, MoonlinkRow};
+use crate::storage::iceberg::iceberg_table_manager::{
+    IcebergOperation, IcebergTableConfig, IcebergTableManager,
+};
 use crate::storage::mooncake_table::shared_array::SharedRowBufferSnapshot;
+pub(crate) use crate::storage::mooncake_table::table_snapshot::IcebergSnapshotPayload;
 use futures::executor::block_on;
 use std::collections::HashMap;
 use std::mem::take;
@@ -154,11 +158,6 @@ impl Snapshot {
         }
     }
 
-    /// Get file indices for the current snapshot.
-    pub(crate) fn get_file_indices(&self) -> &[FileIndex] {
-        self.indices.file_indices.as_slice()
-    }
-
     pub fn get_name_for_inmemory_file(&self) -> PathBuf {
         Path::join(
             &self.metadata.path,
@@ -172,6 +171,8 @@ impl Snapshot {
 
 #[derive(Default)]
 pub struct SnapshotTask {
+    /// ---- States not recorded by mooncake snapshot ----
+    ///
     /// Mooncake table config.
     mooncake_table_config: TableConfig,
     /// Current task
@@ -187,6 +188,14 @@ pub struct SnapshotTask {
     /// Assigned at a flush operation.
     new_flush_lsn: Option<u64>,
     new_commit_point: Option<RecordLocation>,
+
+    /// ---- States have been recorded by mooncake snapshot, and persisted into iceberg table ----
+    /// These persisted items will be reflected to mooncake snapshot in the next invocation of periodic mooncake snapshot operation.
+    ///
+    /// Flush LSN for iceberg snapshot.
+    iceberg_flush_lsn: Option<u64>,
+    /// Puffin blobs which have been persisted into iceberg snapshot.
+    iceberg_persisted_puffin_blob: HashMap<PathBuf, PuffinBlobRef>,
 }
 
 impl SnapshotTask {
@@ -201,6 +210,8 @@ impl SnapshotTask {
             new_commit_lsn: 0,
             new_flush_lsn: None,
             new_commit_point: None,
+            iceberg_flush_lsn: None,
+            iceberg_persisted_puffin_blob: HashMap::new(),
         }
     }
 
@@ -271,6 +282,11 @@ pub struct MooncakeTable {
 
     /// Stream state per transaction, keyed by xact-id.
     transaction_stream_states: HashMap<u32, TransactionStreamState>,
+
+    /// Iceberg table manager, used to sync snapshot to the corresponding iceberg table.
+    ///
+    /// TODO(hjiang): Figure out a way to store dynamic trait for mock-based unit test.
+    iceberg_table_manager: IcebergTableManager,
 }
 
 impl MooncakeTable {
@@ -295,6 +311,8 @@ impl MooncakeTable {
             identity,
         });
         let (table_snapshot_watch_sender, table_snapshot_watch_receiver) = watch::channel(0);
+        let mut iceberg_table_manager =
+            IcebergTableManager::new(metadata.clone(), iceberg_table_config);
         Self {
             mem_slice: MemSlice::new(
                 metadata.schema.clone(),
@@ -303,12 +321,13 @@ impl MooncakeTable {
             ),
             metadata: metadata.clone(),
             snapshot: Arc::new(RwLock::new(
-                SnapshotTableState::new(metadata, iceberg_table_config).await,
+                SnapshotTableState::new(metadata, &mut iceberg_table_manager).await,
             )),
             next_snapshot_task: SnapshotTask::new(table_config),
             transaction_stream_states: HashMap::new(),
             table_snapshot_watch_sender,
             table_snapshot_watch_receiver,
+            iceberg_table_manager,
         }
     }
 
@@ -573,9 +592,9 @@ impl MooncakeTable {
         Ok(())
     }
 
-    // Create a snapshot of the last committed version, return current snapshot's version.
+    // Create a snapshot of the last committed version, return current snapshot's version and payload to perform iceberg snapshot.
     //
-    pub fn create_snapshot(&mut self) -> Option<JoinHandle<u64>> {
+    pub fn create_snapshot(&mut self) -> Option<JoinHandle<(u64, Option<IcebergSnapshotPayload>)>> {
         if !self.next_snapshot_task.should_create_snapshot() {
             return None;
         }
@@ -591,15 +610,63 @@ impl MooncakeTable {
         self.table_snapshot_watch_sender.send(lsn).unwrap();
     }
 
+    // TODO(hjiang): Better error handling at TableHandler eventloop.
+    pub(crate) async fn persist_iceberg_snapshot(
+        &mut self,
+        snapshot_payload: IcebergSnapshotPayload,
+    ) {
+        let flush_lsn = snapshot_payload.flush_lsn;
+        let puffin_blob_ref = self
+            .iceberg_table_manager
+            .sync_snapshot(snapshot_payload)
+            .await
+            .unwrap();
+
+        assert!(self.next_snapshot_task.iceberg_flush_lsn.is_none());
+        self.next_snapshot_task.iceberg_flush_lsn = Some(flush_lsn);
+
+        assert!(self
+            .next_snapshot_task
+            .iceberg_persisted_puffin_blob
+            .is_empty());
+        self.next_snapshot_task.iceberg_persisted_puffin_blob = puffin_blob_ref;
+    }
+
     async fn create_snapshot_async(
         snapshot: Arc<RwLock<SnapshotTableState>>,
         next_snapshot_task: SnapshotTask,
-    ) -> u64 {
+    ) -> (u64, Option<IcebergSnapshotPayload>) {
         snapshot
             .write()
             .await
             .update_snapshot(next_snapshot_task)
             .await
+    }
+
+    // ================================
+    // Test util functions
+    // ================================
+    //
+    // Test util function, which updates mooncake table snapshot and create iceberg snapshot in a serial fashion.
+    #[cfg(test)]
+    pub(crate) async fn create_mooncake_and_iceberg_snapshot_for_test(&mut self) {
+        if let Some(join_handle) = self.create_snapshot() {
+            // Wait for the snapshot async task to complete.
+            match join_handle.await {
+                Ok((lsn, payload)) => {
+                    // Notify readers that the mooncake snapshot has been created.
+                    self.notify_snapshot_reader(lsn);
+
+                    // Create iceberg snapshot if possible
+                    if let Some(payload) = payload {
+                        self.persist_iceberg_snapshot(payload).await;
+                    }
+                }
+                Err(e) => {
+                    panic!("failed to join snapshot handle: {:?}", e);
+                }
+            }
+        }
     }
 }
 

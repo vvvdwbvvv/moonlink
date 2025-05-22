@@ -10,6 +10,7 @@ use crate::storage::iceberg::utils;
 use crate::storage::iceberg::validation as IcebergValidation;
 use crate::storage::index::{FileIndex as MooncakeFileIndex, MooncakeIndex};
 use crate::storage::mooncake_table::delete_vector::BatchDeletionVector;
+use crate::storage::mooncake_table::IcebergSnapshotPayload;
 use crate::storage::mooncake_table::{
     DiskFileDeletionVector, Snapshot as MooncakeSnapshot, TableMetadata as MooncakeTableMetadata,
 };
@@ -72,13 +73,12 @@ pub trait IcebergOperation {
     ///
     /// TODO(hjiang): We're storing the iceberg table status in two places, one for iceberg table manager, another at snapshot.
     /// Provide delta change interface, so snapshot doesn't need to store everything.
+    ///
+    /// TODO(hjiang): It's ok to take only new moooncake file index, instead of all file indices.
     #[allow(async_fn_in_trait)]
     async fn sync_snapshot(
         &mut self,
-        flush_lsn: u64,
-        disk_files: Vec<PathBuf>,
-        new_deletion_vector: HashMap<PathBuf, BatchDeletionVector>,
-        file_indices: &[MooncakeFileIndex],
+        snapshot_payload: IcebergSnapshotPayload,
     ) -> IcebergResult<HashMap<PathBuf, PuffinBlobRef>>;
 
     /// Load latest snapshot from iceberg table. Used for recovery and initialization.
@@ -469,22 +469,24 @@ impl IcebergTableManager {
 impl IcebergOperation for IcebergTableManager {
     async fn sync_snapshot(
         &mut self,
-        flush_lsn: u64,
-        new_disk_files: Vec<PathBuf>,
-        new_deletion_vector: HashMap<PathBuf, BatchDeletionVector>,
-        file_indices: &[MooncakeFileIndex],
+        mut snapshot_payload: IcebergSnapshotPayload,
     ) -> IcebergResult<HashMap<PathBuf, PuffinBlobRef>> {
         // Initialize iceberg table on access.
         self.initialize_iceberg_table().await?;
 
         // Persist data files.
-        let new_iceberg_data_files = self.sync_data_files(new_disk_files).await?;
+        let new_iceberg_data_files = self
+            .sync_data_files(std::mem::take(&mut snapshot_payload.data_files))
+            .await?;
 
         // Persist committed deletion logs.
-        let deletion_puffin_blobs = self.sync_deletion_vector(new_deletion_vector).await?;
+        let deletion_puffin_blobs = self
+            .sync_deletion_vector(std::mem::take(&mut snapshot_payload.new_deletion_vector))
+            .await?;
 
         // Persist file index changes.
-        self.sync_file_indices(file_indices).await?;
+        self.sync_file_indices(&snapshot_payload.file_indices)
+            .await?;
 
         // Only start append action when there're new data files.
         let mut txn = Transaction::new(self.iceberg_table.as_ref().unwrap());
@@ -499,7 +501,10 @@ impl IcebergOperation for IcebergTableManager {
         // The ideal solution is to store at snapshot summary additional properties.
         // Issue: https://github.com/apache/iceberg-rust/issues/1329
         let mut prop = HashMap::new();
-        prop.insert(MOONCAKE_TABLE_FLUSH_LSN.to_string(), flush_lsn.to_string());
+        prop.insert(
+            MOONCAKE_TABLE_FLUSH_LSN.to_string(),
+            snapshot_payload.flush_lsn.to_string(),
+        );
         txn = txn.set_properties(prop)?;
 
         self.iceberg_table = Some(txn.commit(&*self.catalog).await?);

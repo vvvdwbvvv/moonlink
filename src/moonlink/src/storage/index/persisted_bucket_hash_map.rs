@@ -21,7 +21,7 @@ use tokio_bitstream_io::{
 const HASH_BITS: u32 = 64;
 const _MAX_BLOCK_SIZE: u32 = 2 * 1024 * 1024 * 1024; // 2GB
 const _TARGET_NUM_FILES_PER_INDEX: u32 = 4000;
-const INVALID_FILE_ID: u32 = 0xFFFFFFFF;
+const _INVALID_FILE_ID: u32 = 0xFFFFFFFF;
 
 fn splitmix64(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9E3779B97F4A7C15);
@@ -39,6 +39,7 @@ fn splitmix64(mut x: u64) -> u64 {
 ///
 /// Values
 /// [lower_bit_hash, seg_idx, row_idx]
+#[derive(Clone)]
 pub struct GlobalIndex {
     /// A unique id to identify each global index.
     pub(crate) global_index_id: u32,
@@ -55,12 +56,13 @@ pub struct GlobalIndex {
     pub(crate) index_blocks: Vec<IndexBlock>,
 }
 
+#[derive(Clone)]
 pub(crate) struct IndexBlock {
     pub(crate) bucket_start_idx: u32,
     pub(crate) bucket_end_idx: u32,
     pub(crate) bucket_start_offset: u64,
     pub(crate) file_path: String,
-    data: Option<Mmap>,
+    data: Arc<Option<Mmap>>,
 }
 
 impl IndexBlock {
@@ -77,7 +79,7 @@ impl IndexBlock {
             bucket_end_idx,
             bucket_start_offset,
             file_path,
-            data: Some(data),
+            data: Arc::new(Some(data)),
         }
     }
 
@@ -86,7 +88,7 @@ impl IndexBlock {
         metadata: &'a GlobalIndex,
         file_id_remap: &'a Vec<u32>,
     ) -> IndexBlockIterator<'a> {
-        IndexBlockIterator::new(self, metadata, file_id_remap).await
+        IndexBlockIterator::_new(self, metadata, file_id_remap).await
     }
 
     #[inline]
@@ -126,7 +128,7 @@ impl IndexBlock {
         metadata: &GlobalIndex,
     ) -> Vec<RecordLocation> {
         assert!(bucket_idx >= self.bucket_start_idx && bucket_idx < self.bucket_end_idx);
-        let cursor = Cursor::new(self.data.as_ref().unwrap().as_ref());
+        let cursor = Cursor::new(self.data.as_ref().as_ref().unwrap().as_ref());
         let mut reader = AsyncBitReader::endian(cursor, AsyncBigEndian);
         let mut entry_reader = reader.clone();
         let (entry_start, entry_end) = self.read_bucket(bucket_idx, &mut reader, metadata).await;
@@ -367,7 +369,7 @@ impl GlobalIndexBuilder {
         let mut file_id_remaps = vec![];
         let mut file_id_after_remap = 0;
         for index in &indices {
-            let mut file_id_remap = vec![INVALID_FILE_ID; index.files.len()];
+            let mut file_id_remap = vec![_INVALID_FILE_ID; index.files.len()];
             for (_, item) in file_id_remap.iter_mut().enumerate().take(index.files.len()) {
                 *item = file_id_after_remap;
                 file_id_after_remap += 1;
@@ -404,6 +406,7 @@ impl GlobalIndexBuilder {
 // ================================
 // Iterators for merging indices
 // ================================
+#[allow(dead_code)]
 struct IndexBlockIterator<'a> {
     collection: &'a IndexBlock,
     metadata: &'a GlobalIndex,
@@ -417,13 +420,13 @@ struct IndexBlockIterator<'a> {
 }
 
 impl<'a> IndexBlockIterator<'a> {
-    async fn new(
+    async fn _new(
         collection: &'a IndexBlock,
         metadata: &'a GlobalIndex,
         file_id_remap: &'a Vec<u32>,
     ) -> Self {
         let mut bucket_reader = AsyncBitReader::endian(
-            Cursor::new(collection.data.as_ref().unwrap().as_ref()),
+            Cursor::new(collection.data.as_ref().as_ref().unwrap().as_ref()),
             AsyncBigEndian,
         );
         let entry_reader = bucket_reader.clone();
@@ -452,7 +455,7 @@ impl<'a> IndexBlockIterator<'a> {
         }
     }
 
-    async fn next(&mut self) -> Option<(u64, usize, usize)> {
+    async fn _next(&mut self) -> Option<(u64, usize, usize)> {
         loop {
             if self.current_bucket == self.collection.bucket_end_idx - 1 {
                 return None;
@@ -474,13 +477,14 @@ impl<'a> IndexBlockIterator<'a> {
                 .read_entry(&mut self.entry_reader, self.metadata)
                 .await;
             self.current_entry += 1;
-            if *self.file_id_remap.get(seg_idx).unwrap() != INVALID_FILE_ID {
+            if *self.file_id_remap.get(seg_idx).unwrap() != _INVALID_FILE_ID {
                 return Some((lower_hash + self.current_upper_hash, seg_idx, row_idx));
             }
         }
     }
 }
 
+#[allow(dead_code)]
 pub struct GlobalIndexIterator<'a> {
     index: &'a GlobalIndex,
     block_idx: usize,
@@ -507,10 +511,10 @@ impl<'a> GlobalIndexIterator<'a> {
         }
     }
 
-    pub async fn next(&mut self) -> Option<(u64, usize, usize)> {
+    pub async fn _next(&mut self) -> Option<(u64, usize, usize)> {
         loop {
             if let Some(ref mut iter) = self.block_iter {
-                if let Some(item) = iter.next().await {
+                if let Some(item) = iter._next().await {
                     return Some(item);
                 }
             }
@@ -561,7 +565,7 @@ impl<'a> GlobalIndexMergingIterator<'a> {
     pub async fn _new(iterators: Vec<GlobalIndexIterator<'a>>) -> Self {
         let mut heap = BinaryHeap::new();
         for mut it in iterators {
-            if let Some(value) = it.next().await {
+            if let Some(value) = it._next().await {
                 heap.push(HeapItem { value, iter: it });
             }
         }
@@ -571,7 +575,7 @@ impl<'a> GlobalIndexMergingIterator<'a> {
     pub async fn _next(&mut self) -> Option<(u64, usize, usize)> {
         if let Some(mut heap_item) = self.heap.pop() {
             let result = heap_item.value;
-            if let Some(next_value) = heap_item.iter.next().await {
+            if let Some(next_value) = heap_item.iter._next().await {
                 self.heap.push(HeapItem {
                     value: next_value,
                     iter: heap_item.iter,
@@ -594,7 +598,7 @@ impl IndexBlock {
             "\nIndexBlock {{ \n   bucket_start_idx: {}, \n   bucket_end_idx: {},",
             self.bucket_start_idx, self.bucket_end_idx
         )?;
-        let cursor = Cursor::new(self.data.as_ref().unwrap().as_ref());
+        let cursor = Cursor::new(self.data.as_ref().as_ref().unwrap().as_ref());
         let mut reader = AsyncBitReader::endian(cursor, AsyncBigEndian);
         write!(f, "\n   Buckets: ")?;
         let mut num = 0;
@@ -669,7 +673,7 @@ mod tests {
         let file_id_remap = vec![0; index.files.len()];
         for block in index.index_blocks.iter() {
             let mut index_block_iter = block._create_iterator(&index, &file_id_remap).await;
-            while let Some((hash, seg_idx, row_idx)) = index_block_iter.next().await {
+            while let Some((hash, seg_idx, row_idx)) = index_block_iter._next().await {
                 println!("{} {} {}", hash, seg_idx, row_idx);
                 hash_entry_num += 1;
             }

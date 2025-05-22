@@ -1,10 +1,12 @@
 use super::data_batches::{create_batch_from_rows, InMemoryBatch};
 use super::delete_vector::BatchDeletionVector;
-use super::{DiskFileDeletionVector, Snapshot, SnapshotTask, TableConfig, TableMetadata};
-use crate::error::Result;
-use crate::storage::iceberg::iceberg_table_manager::{
-    IcebergOperation, IcebergTableConfig, IcebergTableManager,
+use super::{
+    DiskFileDeletionVector, IcebergSnapshotPayload, Snapshot, SnapshotTask, TableConfig,
+    TableMetadata,
 };
+use crate::error::Result;
+use crate::storage::iceberg::iceberg_table_manager::{IcebergOperation, IcebergTableManager};
+use crate::storage::iceberg::puffin_utils::PuffinBlobRef;
 use crate::storage::index::Index;
 use crate::storage::mooncake_table::shared_array::SharedRowBufferSnapshot;
 use crate::storage::mooncake_table::MoonlinkRow;
@@ -42,11 +44,6 @@ pub(crate) struct SnapshotTableState {
 
     /// Last commit point
     last_commit: RecordLocation,
-
-    /// Iceberg table manager, used to sync snapshot to the corresponding iceberg table.
-    ///
-    /// TODO(hjiang): Figure out a way to store dynamic trait for mock-based unit test.
-    iceberg_table_manager: IcebergTableManager,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -74,13 +71,11 @@ pub struct ReadOutput {
 impl SnapshotTableState {
     pub(super) async fn new(
         metadata: Arc<TableMetadata>,
-        iceberg_table_config: IcebergTableConfig,
+        iceberg_table_manager: &mut IcebergTableManager,
     ) -> Self {
         let mut batches = BTreeMap::new();
         batches.insert(0, InMemoryBatch::new(metadata.config.batch_size));
 
-        let mut iceberg_table_manager =
-            IcebergTableManager::new(metadata.clone(), iceberg_table_config);
         let snapshot = iceberg_table_manager
             .load_snapshot_from_table()
             .await
@@ -94,23 +89,49 @@ impl SnapshotTableState {
             last_commit: RecordLocation::MemoryBatch(0, 0),
             committed_deletion_log: Vec::new(),
             uncommitted_deletion_log: Vec::new(),
-            iceberg_table_manager,
         }
     }
 
-    /// Prune and aggregate committed deletion logs to flush point.
-    fn prune_and_aggregate_ondisk_committed_deletion_logs(
-        &mut self,
+    /// Aggregate committed deletion logs, which could be persisted into iceberg snapshot.
+    /// Return a mapping from local data filepath to its batch deletion vector.
+    fn aggregate_committed_deletion_logs(
+        &self,
+        flush_lsn: u64,
     ) -> HashMap<PathBuf, BatchDeletionVector> {
-        let mut aggregated_deletion_logs = std::collections::HashMap::new();
-        if self.current_snapshot.data_file_flush_lsn.is_none() {
-            return aggregated_deletion_logs;
+        let mut aggregated_deletion_logs = HashMap::new();
+        for cur_deletion_log in self.committed_deletion_log.iter() {
+            assert!(
+                cur_deletion_log.lsn <= self.current_snapshot.snapshot_version,
+                "Committed deletion log {:?} is later than current snapshot LSN {}",
+                cur_deletion_log,
+                self.current_snapshot.snapshot_version
+            );
+            if cur_deletion_log.lsn > flush_lsn {
+                continue;
+            }
+            if let RecordLocation::DiskFile(file_id, row_idx) = &cur_deletion_log.pos {
+                let filepath = (*file_id.0).clone();
+                let deletion_vector =
+                    aggregated_deletion_logs.entry(filepath).or_insert_with(|| {
+                        BatchDeletionVector::new(self.mooncake_table_config.batch_size())
+                    });
+                assert!(deletion_vector.delete_row(*row_idx));
+            }
+        }
+        aggregated_deletion_logs
+    }
+
+    /// Prune committed deletion logs for the given persisted records.
+    fn prune_committed_deletion_logs(&mut self, task: &SnapshotTask) {
+        // No iceberg snapshot persisted between two mooncake snapshot.
+        if task.iceberg_flush_lsn.is_none() {
+            return;
         }
 
-        // Include two types of committed logs: (1) in-memory committed deletion logs; (2) commit point after flush LSN.
+        // Keep two types of committed logs: (1) in-memory committed deletion logs; (2) commit point after flush LSN.
+        // All on-disk committed deletion logs, which are <= iceberg snapshot flush LSN could be pruned.
         let mut new_committed_deletion_log = vec![];
-
-        let flush_point_lsn = self.current_snapshot.data_file_flush_lsn.unwrap();
+        let flush_point_lsn = task.iceberg_flush_lsn.unwrap();
         // TODO(hjiang): deletion record is not cheap to copy, we should be able to consume the ownership for `committed_deletion_log`.
         for cur_deletion_log in self.committed_deletion_log.iter() {
             assert!(
@@ -123,24 +144,41 @@ impl SnapshotTableState {
                 new_committed_deletion_log.push(cur_deletion_log.clone());
                 continue;
             }
-            if let RecordLocation::DiskFile(file_id, row_idx) = &cur_deletion_log.pos {
-                let filepath = (*file_id.0).clone();
-                let deletion_vector =
-                    aggregated_deletion_logs.entry(filepath).or_insert_with(|| {
-                        BatchDeletionVector::new(self.mooncake_table_config.batch_size())
-                    });
-                assert!(deletion_vector.delete_row(*row_idx));
-            } else {
+            if let RecordLocation::MemoryBatch(_, _) = &cur_deletion_log.pos {
                 new_committed_deletion_log.push(cur_deletion_log.clone());
             }
         }
 
         self.committed_deletion_log = new_committed_deletion_log;
-
-        aggregated_deletion_logs
     }
 
-    pub(super) async fn update_snapshot(&mut self, mut task: SnapshotTask) -> u64 {
+    /// Update current mooncake snapshot with persisted deletion vector.
+    fn update_current_snapshot_with_iceberg_snapshot(
+        &mut self,
+        puffin_blob_ref: HashMap<PathBuf, PuffinBlobRef>,
+    ) {
+        for (local_disk_file, puffin_blob_ref) in puffin_blob_ref.into_iter() {
+            let entry = self
+                .current_snapshot
+                .disk_files
+                .get_mut(&local_disk_file)
+                .unwrap();
+            entry.puffin_deletion_blob = Some(puffin_blob_ref);
+        }
+    }
+
+    pub(super) async fn update_snapshot(
+        &mut self,
+        mut task: SnapshotTask,
+    ) -> (u64, Option<IcebergSnapshotPayload>) {
+        // Reflect iceberg snapshot to mooncake snapshot.
+        self.prune_committed_deletion_logs(&task);
+        self.update_current_snapshot_with_iceberg_snapshot(std::mem::take(
+            &mut task.iceberg_persisted_puffin_blob,
+        ));
+
+        // Sync buffer snapshot states into current mooncake snapshot.
+        //
         // To reduce iceberg write frequency, only create new iceberg snapshot when there're new data files.
         let new_data_files = task.get_new_data_files();
 
@@ -162,13 +200,10 @@ impl SnapshotTableState {
         }
 
         // Till this point, committed changes have been reflected to current snapshot; sync the latest change to iceberg.
-        // Sync the latest change to iceberg, only triggered when there're new data files generated.
         // To reduce iceberg persistence overhead, we only snapshot when (1) there're persisted data files, or (2) accumulated unflushed deletion vector exceeds threshold.
-        // To achieve consistency between data files and deletion vectors, we only consider those with persisted data files.
         //
         // TODO(hjiang): Error handling for snapshot sync-up.
-        //
-        // TODO(hjiang): Add unit test where there're no new disk files.
+        let mut iceberg_snapshot_payload: Option<IcebergSnapshotPayload> = None;
         let flush_by_data_files = new_data_files.len()
             >= self
                 .mooncake_table_config
@@ -182,30 +217,20 @@ impl SnapshotTableState {
         {
             let flush_lsn = self.current_snapshot.data_file_flush_lsn.unwrap();
             let aggregated_committed_deletion_logs =
-                self.prune_and_aggregate_ondisk_committed_deletion_logs();
-            let puffin_blob_ref = self
-                .iceberg_table_manager
-                .sync_snapshot(
-                    flush_lsn,
-                    new_data_files,
-                    aggregated_committed_deletion_logs,
-                    self.current_snapshot.get_file_indices(),
-                )
-                .await
-                .unwrap();
+                self.aggregate_committed_deletion_logs(flush_lsn);
 
-            // Update current snapshot reference.
-            for (local_disk_file, puffin_blob_ref) in puffin_blob_ref.into_iter() {
-                let entry = self
-                    .current_snapshot
-                    .disk_files
-                    .get_mut(&local_disk_file)
-                    .unwrap();
-                entry.puffin_deletion_blob = Some(puffin_blob_ref);
-            }
+            iceberg_snapshot_payload = Some(IcebergSnapshotPayload {
+                flush_lsn,
+                data_files: new_data_files,
+                new_deletion_vector: aggregated_committed_deletion_logs,
+                file_indices: self.current_snapshot.indices.file_indices.clone(),
+            });
         }
 
-        self.current_snapshot.snapshot_version
+        (
+            self.current_snapshot.snapshot_version,
+            iceberg_snapshot_payload,
+        )
     }
 
     fn merge_mem_indices(&mut self, task: &mut SnapshotTask) {
