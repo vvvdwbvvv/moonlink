@@ -1,6 +1,10 @@
+use arrow_array::{Int32Array, RecordBatch, StringArray};
+
 use super::test_utils::*;
 use crate::storage::mooncake_table::TableConfig as MooncakeTableConfig;
 use crate::storage::IcebergOperation;
+
+use std::sync::Arc;
 
 #[tokio::test]
 async fn test_table_handler() {
@@ -381,23 +385,35 @@ async fn test_streaming_transaction_periodic_flush_then_abort() {
 
 #[tokio::test]
 async fn test_iceberg_snapshot_creation() {
+    // Set mooncake and iceberg flush and snapshot threshold to huge value, to verify force flush and force snapshot works as expected.
     let mooncake_table_config = MooncakeTableConfig {
         batch_size: MooncakeTableConfig::DEFAULT_BATCH_SIZE,
-        // Flush to local filesystem as long as there's new data.
-        mem_slice_size: 1,
-        // Create mooncake table snapshot as long as there's new deletion records.
-        snapshot_deletion_record_count: 1,
-        // Create iceberg snapshot as long as there's new data file persisted.
-        iceberg_snapshot_new_data_file_count: 1,
-        // Create iceberg snapshot as long as there's new committed deletion logs.
-        iceberg_snapshot_new_committed_deletion_log: 1,
+        mem_slice_size: 1000,
+        snapshot_deletion_record_count: 1000,
+        iceberg_snapshot_new_data_file_count: 1000,
+        iceberg_snapshot_new_committed_deletion_log: 1000,
     };
     let mut env = TestEnvironment::new(mooncake_table_config.clone()).await;
 
-    // ---- Attempt to create snapshot before any rows appended ----
-    // Snapshot creation function shouldn't get blocked.
-    env.initiate_snapshot().await;
-    env.sync_snapshot_completion().await;
+    // Arrow batches used in test.
+    let arrow_batch_1 = RecordBatch::try_new(
+        Arc::new(default_schema()),
+        vec![
+            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(StringArray::from(vec!["John".to_string()])),
+            Arc::new(Int32Array::from(vec![30])),
+        ],
+    )
+    .unwrap();
+    let arrow_batch_2 = RecordBatch::try_new(
+        Arc::new(default_schema()),
+        vec![
+            Arc::new(Int32Array::from(vec![2])),
+            Arc::new(StringArray::from(vec!["Bob".to_string()])),
+            Arc::new(Int32Array::from(vec![20])),
+        ],
+    )
+    .unwrap();
 
     // ---- Create snapshot after new records appended ----
     // Append a new row to the mooncake table.
@@ -407,11 +423,11 @@ async fn test_iceberg_snapshot_creation() {
     .await;
     env.commit(/*lsn=*/ 1).await;
 
-    // Attempt an iceberg snapshot.
-    env.initiate_snapshot().await;
+    // Attempt an iceberg snapshot, with requested LSN already committed.
+    env.initiate_snapshot(/*lsn=*/ 1).await;
     env.sync_snapshot_completion().await;
 
-    // Load from iceberg table manager to make sure data file exists.
+    // Load from iceberg table manager to check snapshot status.
     let mut iceberg_table_manager = env.create_iceberg_table_manager(mooncake_table_config.clone());
     let snapshot = iceberg_table_manager
         .load_snapshot_from_table()
@@ -419,10 +435,130 @@ async fn test_iceberg_snapshot_creation() {
         .unwrap();
     assert_eq!(snapshot.disk_files.len(), 1);
     let (cur_data_file, cur_deletion_vector) = snapshot.disk_files.into_iter().next().unwrap();
-    assert!(tokio::fs::metadata(cur_data_file.file_path()).await.is_ok());
+    // Check data file.
+    let actual_arrow_batch = load_arrow_batch(cur_data_file.file_path()).await;
+    let expected_arrow_batch = arrow_batch_1.clone();
+    assert_eq!(actual_arrow_batch, expected_arrow_batch);
+    // Check deletion vector.
     assert!(cur_deletion_vector
         .batch_deletion_vector
         .collect_deleted_rows()
         .is_empty());
+    check_deletion_vector_consistency(&cur_deletion_vector).await;
     assert!(cur_deletion_vector.puffin_deletion_blob.is_none());
+    let old_data_file = cur_data_file;
+
+    // ---- Create snapshot after new records appended and old records deleted ----
+    //
+    // Attempt an iceberg snapshot, which is a future flush LSN, and contains both new records and deletion records.
+    env.initiate_snapshot(/*lsn=*/ 5).await;
+    env.append_row(
+        /*id=*/ 2, /*name=*/ "Bob", /*age=*/ 20, /*xact_id=*/ None,
+    )
+    .await;
+    env.commit(/*lsn=*/ 3).await;
+    env.delete_row(
+        /*id=*/ 1, /*name=*/ "John", /*age=*/ 30, /*lsn=*/ 4,
+        /*xact_id=*/ None,
+    )
+    .await;
+    env.commit(/*lsn=*/ 5).await;
+
+    // Block wait until iceberg snapshot created.
+    env.sync_snapshot_completion().await;
+
+    // Load from iceberg table manager to check snapshot status.
+    let mut iceberg_table_manager = env.create_iceberg_table_manager(mooncake_table_config.clone());
+    let snapshot = iceberg_table_manager
+        .load_snapshot_from_table()
+        .await
+        .unwrap();
+    assert_eq!(snapshot.disk_files.len(), 2);
+    for (cur_data_file, cur_deletion_vector) in snapshot.disk_files.into_iter() {
+        // Check the first data file.
+        if cur_data_file.file_path() == old_data_file.file_path() {
+            let actual_arrow_batch = load_arrow_batch(cur_data_file.file_path()).await;
+            let expected_arrow_batch = arrow_batch_1.clone();
+            assert_eq!(actual_arrow_batch, expected_arrow_batch);
+            // Check the first deletion vector.
+            assert_eq!(
+                cur_deletion_vector
+                    .batch_deletion_vector
+                    .collect_deleted_rows(),
+                vec![0]
+            );
+            check_deletion_vector_consistency(&cur_deletion_vector).await;
+            continue;
+        }
+
+        // Check the second data file.
+        let actual_arrow_batch = load_arrow_batch(cur_data_file.file_path()).await;
+        let expected_arrow_batch = arrow_batch_2.clone();
+        assert_eq!(actual_arrow_batch, expected_arrow_batch);
+        // Check the second deletion vector.
+        let deleted_rows = cur_deletion_vector
+            .batch_deletion_vector
+            .collect_deleted_rows();
+        assert!(
+            deleted_rows.is_empty(),
+            "Deletion vector for the second data file is {:?}",
+            deleted_rows
+        );
+        check_deletion_vector_consistency(&cur_deletion_vector).await;
+    }
+
+    // ---- Create snapshot only with old records deleted ----
+    env.initiate_snapshot(/*lsn=*/ 7).await;
+    env.delete_row(
+        /*id=*/ 2, /*name=*/ "Bob", /*age=*/ 20, /*lsn=*/ 6,
+        /*xact_id=*/ None,
+    )
+    .await;
+    env.commit(/*lsn=*/ 7).await;
+
+    // Block wait until iceberg snapshot created.
+    env.sync_snapshot_completion().await;
+
+    // Load from iceberg table manager to check snapshot status.
+    let mut iceberg_table_manager = env.create_iceberg_table_manager(mooncake_table_config.clone());
+    let snapshot = iceberg_table_manager
+        .load_snapshot_from_table()
+        .await
+        .unwrap();
+    assert_eq!(snapshot.disk_files.len(), 2);
+    for (cur_data_file, cur_deletion_vector) in snapshot.disk_files.into_iter() {
+        // Check the first data file.
+        if cur_data_file.file_path() == old_data_file.file_path() {
+            let actual_arrow_batch = load_arrow_batch(cur_data_file.file_path()).await;
+            let expected_arrow_batch = arrow_batch_1.clone();
+            assert_eq!(actual_arrow_batch, expected_arrow_batch);
+            // Check the first deletion vector.
+            assert_eq!(
+                cur_deletion_vector
+                    .batch_deletion_vector
+                    .collect_deleted_rows(),
+                vec![0]
+            );
+            check_deletion_vector_consistency(&cur_deletion_vector).await;
+            continue;
+        }
+
+        // Check the second data file.
+        let actual_arrow_batch = load_arrow_batch(cur_data_file.file_path()).await;
+        let expected_arrow_batch = arrow_batch_2.clone();
+        assert_eq!(actual_arrow_batch, expected_arrow_batch);
+        // Check the second deletion vector.
+        // Check the first deletion vector.
+        assert_eq!(
+            cur_deletion_vector
+                .batch_deletion_vector
+                .collect_deleted_rows(),
+            vec![0]
+        );
+        check_deletion_vector_consistency(&cur_deletion_vector).await;
+    }
+
+    // Requested LSN is no later than current iceberg snapshot LSN.
+    env.initiate_snapshot(/*lsn=*/ 1).await;
+    env.sync_snapshot_completion().await;
 }
