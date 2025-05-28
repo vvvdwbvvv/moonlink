@@ -323,9 +323,41 @@ async fn test_sync_snapshots() -> IcebergResult<()> {
         table_name: "test_table".to_string(),
         drop_table_if_exists: false,
     };
-    let mut iceberg_table_manager = IcebergTableManager::new(mooncake_table_metadata, config);
+    let mut iceberg_table_manager = IcebergTableManager::new(mooncake_table_metadata, config)?;
     test_store_and_load_snapshot_impl(&mut iceberg_table_manager).await?;
     Ok(())
+}
+
+/// Test iceberg table manager drop table.
+#[tokio::test]
+async fn test_drop_table() {
+    let tmp_dir = tempdir().unwrap();
+    let mooncake_table_metadata =
+        create_test_table_metadata(tmp_dir.path().to_str().unwrap().to_string());
+    let config = IcebergTableConfig {
+        warehouse_uri: tmp_dir.path().to_str().unwrap().to_string(),
+        namespace: vec!["namespace".to_string()],
+        table_name: "test_table".to_string(),
+        drop_table_if_exists: false,
+    };
+    let mut iceberg_table_manager =
+        IcebergTableManager::new(mooncake_table_metadata.clone(), config.clone()).unwrap();
+    iceberg_table_manager
+        .initialize_iceberg_table()
+        .await
+        .unwrap();
+
+    // Perform whitebox testing, which assume the table directory `<warehouse>/<namespace>/<table>` on local filesystem , to check whether table are correctly created or dropped.
+    let mut table_directory = PathBuf::from(tmp_dir.path());
+    table_directory.push(config.namespace.first().unwrap());
+    table_directory.push(config.table_name);
+    let directory_exists = tokio::fs::try_exists(&table_directory).await.unwrap();
+    assert!(directory_exists);
+
+    // Drop table and check directory existence.
+    iceberg_table_manager.drop_table().await.unwrap();
+    let directory_exists = tokio::fs::try_exists(&table_directory).await.unwrap();
+    assert!(!directory_exists);
 }
 
 /// Testing scenario: attempt an iceberg snapshot when no data file, deletion vector or index files generated.
@@ -341,7 +373,7 @@ async fn test_empty_content_snapshot_creation() -> IcebergResult<()> {
         drop_table_if_exists: false,
     };
     let mut iceberg_table_manager =
-        IcebergTableManager::new(mooncake_table_metadata.clone(), config.clone());
+        IcebergTableManager::new(mooncake_table_metadata.clone(), config.clone())?;
     let iceberg_snapshot_payload = IcebergSnapshotPayload {
         flush_lsn: 0,
         data_files: vec![],
@@ -354,7 +386,7 @@ async fn test_empty_content_snapshot_creation() -> IcebergResult<()> {
 
     // Recover from iceberg snapshot, and check mooncake table snapshot version.
     let mut iceberg_table_manager =
-        IcebergTableManager::new(mooncake_table_metadata.clone(), config.clone());
+        IcebergTableManager::new(mooncake_table_metadata.clone(), config.clone())?;
     let snapshot = iceberg_table_manager.load_snapshot_from_table().await?;
     assert!(snapshot.disk_files.is_empty());
     assert!(snapshot.indices.in_memory_index.is_empty());
@@ -711,7 +743,7 @@ async fn mooncake_table_snapshot_persist_impl(warehouse_uri: String) -> IcebergR
     let mut iceberg_table_manager = IcebergTableManager::new(
         mooncake_table_metadata.clone(),
         iceberg_table_config.clone(),
-    );
+    )?;
     let snapshot = iceberg_table_manager.load_snapshot_from_table().await?;
     assert_eq!(
         snapshot.disk_files.len(),
@@ -782,7 +814,7 @@ async fn mooncake_table_snapshot_persist_impl(warehouse_uri: String) -> IcebergR
     let mut iceberg_table_manager = IcebergTableManager::new(
         mooncake_table_metadata.clone(),
         iceberg_table_config.clone(),
-    );
+    )?;
     let snapshot = iceberg_table_manager.load_snapshot_from_table().await?;
     assert_eq!(
         snapshot.disk_files.len(),
@@ -844,7 +876,7 @@ async fn mooncake_table_snapshot_persist_impl(warehouse_uri: String) -> IcebergR
     let mut iceberg_table_manager = IcebergTableManager::new(
         mooncake_table_metadata.clone(),
         iceberg_table_config.clone(),
-    );
+    )?;
     let snapshot = iceberg_table_manager.load_snapshot_from_table().await?;
     assert_eq!(
         snapshot.disk_files.len(),
@@ -923,7 +955,7 @@ async fn mooncake_table_snapshot_persist_impl(warehouse_uri: String) -> IcebergR
     let mut iceberg_table_manager = IcebergTableManager::new(
         mooncake_table_metadata.clone(),
         iceberg_table_config.clone(),
-    );
+    )?;
     let mut snapshot = iceberg_table_manager.load_snapshot_from_table().await?;
     assert_eq!(
         snapshot.disk_files.len(),
@@ -1049,7 +1081,7 @@ async fn test_drop_table_at_creation() -> IcebergResult<()> {
     let mut iceberg_table_manager = IcebergTableManager::new(
         mooncake_table_metadata.clone(),
         iceberg_table_config.clone(),
-    );
+    )?;
     let snapshot = iceberg_table_manager.load_snapshot_from_table().await?;
     assert!(snapshot.disk_files.is_empty());
     assert!(snapshot.indices.file_indices.is_empty());
@@ -1118,7 +1150,8 @@ async fn create_table_and_iceberg_manager(
     let iceberg_table_manager = IcebergTableManager::new(
         mooncake_table_metadata.clone(),
         iceberg_table_config.clone(),
-    );
+    )
+    .unwrap();
 
     (table, iceberg_table_manager)
 }

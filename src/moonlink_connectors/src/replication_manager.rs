@@ -1,7 +1,7 @@
 use crate::pg_replicate::table::TableId;
 use crate::Result;
 use crate::{PostgresSourceError, ReplicationConnection};
-use moonlink::{IcebergSnapshotStateManager, ReadStateManager};
+use moonlink::{IcebergTableEventManager, ReadStateManager};
 use std::collections::HashMap;
 use std::hash::Hash;
 
@@ -12,8 +12,10 @@ use std::hash::Hash;
 /// replication. A new replication will automatically be started when a
 /// table is added for a URI that is not currently being replicated.
 pub struct ReplicationManager<T: Eq + Hash> {
+    /// Maps from uri to replication connection.
     connections: HashMap<String, ReplicationConnection>,
     table_base_path: String,
+    /// Maps from table id (string format) to (uri, table id).
     table_info: HashMap<T, (String, TableId)>,
 }
 
@@ -67,10 +69,7 @@ impl<T: Eq + Hash> ReplicationManager<T> {
         connection.get_table_reader(*table_id)
     }
 
-    pub fn get_iceberg_snapshot_manager(
-        &mut self,
-        table_id: &T,
-    ) -> &mut IcebergSnapshotStateManager {
+    pub fn get_iceberg_snapshot_manager(&mut self, table_id: &T) -> &mut IcebergTableEventManager {
         let (uri, table_id) = self.table_info.get(table_id).expect("table not found");
         let connection = self.connections.get_mut(uri).expect("connection not found");
         connection.get_iceberg_snapshot_manager(*table_id)
