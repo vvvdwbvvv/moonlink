@@ -1,8 +1,15 @@
 use arrow_array::{Int32Array, RecordBatch, StringArray};
+use iceberg::{Error as IcebergError, ErrorKind};
+use tempfile::tempdir;
 
 use super::test_utils::*;
 use crate::storage::mooncake_table::TableConfig as MooncakeTableConfig;
+use crate::storage::mooncake_table::TableMetadata as MooncakeTableMetadata;
+use crate::storage::MockTableManager;
+use crate::storage::MooncakeTable;
 use crate::storage::TableManager;
+use crate::MooncakeSnapshot;
+use crate::TableConfig;
 
 use std::sync::Arc;
 
@@ -387,7 +394,7 @@ async fn test_streaming_transaction_periodic_flush_then_abort() {
 #[tokio::test]
 async fn test_iceberg_drop_table() {
     let mut env = TestEnvironment::new(MooncakeTableConfig::default()).await;
-    env.drop_iceberg_table().await
+    env.drop_iceberg_table().await.unwrap()
 }
 
 #[tokio::test]
@@ -432,7 +439,7 @@ async fn test_iceberg_snapshot_creation() {
 
     // Attempt an iceberg snapshot, with requested LSN already committed.
     env.initiate_snapshot(/*lsn=*/ 1).await;
-    env.sync_snapshot_completion().await;
+    env.sync_snapshot_completion().await.unwrap();
 
     // Load from iceberg table manager to check snapshot status.
     let mut iceberg_table_manager = env.create_iceberg_table_manager(mooncake_table_config.clone());
@@ -472,7 +479,7 @@ async fn test_iceberg_snapshot_creation() {
     env.commit(/*lsn=*/ 5).await;
 
     // Block wait until iceberg snapshot created.
-    env.sync_snapshot_completion().await;
+    env.sync_snapshot_completion().await.unwrap();
 
     // Load from iceberg table manager to check snapshot status.
     let mut iceberg_table_manager = env.create_iceberg_table_manager(mooncake_table_config.clone());
@@ -524,7 +531,7 @@ async fn test_iceberg_snapshot_creation() {
     env.commit(/*lsn=*/ 7).await;
 
     // Block wait until iceberg snapshot created.
-    env.sync_snapshot_completion().await;
+    env.sync_snapshot_completion().await.unwrap();
 
     // Load from iceberg table manager to check snapshot status.
     let mut iceberg_table_manager = env.create_iceberg_table_manager(mooncake_table_config.clone());
@@ -567,5 +574,110 @@ async fn test_iceberg_snapshot_creation() {
 
     // Requested LSN is no later than current iceberg snapshot LSN.
     env.initiate_snapshot(/*lsn=*/ 1).await;
-    env.sync_snapshot_completion().await;
+    env.sync_snapshot_completion().await.unwrap();
+}
+
+/// ---- Mock unit test ----
+#[tokio::test]
+async fn test_iceberg_snapshot_failure_mock_test() {
+    let temp_dir = tempdir().unwrap();
+    let mooncake_table_config = TableConfig::new();
+    let mooncake_table_metadata = Arc::new(MooncakeTableMetadata {
+        name: "table_name".to_string(),
+        id: 0,
+        schema: Arc::new(default_schema()),
+        config: mooncake_table_config.clone(),
+        path: temp_dir.path().to_path_buf(),
+        identity: crate::row::IdentityProp::Keys(vec![0]),
+    });
+
+    let mooncake_table_metadata_copy = mooncake_table_metadata.clone();
+    let mut mock_table_manager = MockTableManager::new();
+    mock_table_manager
+        .expect_load_snapshot_from_table()
+        .times(1)
+        .returning(move || {
+            let table_metadata_copy = mooncake_table_metadata_copy.clone();
+            Box::pin(async move { Ok(MooncakeSnapshot::new(table_metadata_copy)) })
+        });
+    mock_table_manager
+        .expect_sync_snapshot()
+        .times(1)
+        .returning(|_| {
+            Box::pin(async move {
+                Err(IcebergError::new(
+                    ErrorKind::Unexpected,
+                    "Intended error for unit test",
+                ))
+            })
+        });
+
+    let mooncake_table = MooncakeTable::new_with_table_manager(
+        mooncake_table_metadata,
+        Box::new(mock_table_manager),
+        mooncake_table_config,
+    )
+    .await
+    .unwrap();
+    let mut env = TestEnvironment::new_with_mooncake_table(temp_dir, mooncake_table).await;
+
+    // Append rows to trigger mooncake and iceberg snapshot.
+    env.append_row(
+        /*id=*/ 1, /*name=*/ "Alice", /*age=*/ 10, /*xact_id=*/ None,
+    )
+    .await;
+    env.commit(/*lsn=*/ 10).await;
+
+    // Initiate snapshot and block wait its completion, check whether error status is correctly propagated.
+    env.initiate_snapshot(/*lsn=*/ 10).await;
+    let res = env.sync_snapshot_completion().await;
+    assert!(res.is_err());
+}
+
+#[tokio::test]
+async fn test_iceberg_drop_table_failure_mock_test() {
+    let temp_dir = tempdir().unwrap();
+    let mooncake_table_config = TableConfig::new();
+    let mooncake_table_metadata = Arc::new(MooncakeTableMetadata {
+        name: "table_name".to_string(),
+        id: 0,
+        schema: Arc::new(default_schema()),
+        config: mooncake_table_config.clone(),
+        path: temp_dir.path().to_path_buf(),
+        identity: crate::row::IdentityProp::Keys(vec![0]),
+    });
+
+    let mooncake_table_metadata_copy = mooncake_table_metadata.clone();
+    let mut mock_table_manager = MockTableManager::new();
+    mock_table_manager
+        .expect_load_snapshot_from_table()
+        .times(1)
+        .returning(move || {
+            let table_metadata_copy = mooncake_table_metadata_copy.clone();
+            Box::pin(async move { Ok(MooncakeSnapshot::new(table_metadata_copy)) })
+        });
+    mock_table_manager
+        .expect_drop_table()
+        .times(1)
+        .returning(|| {
+            Box::pin(async move {
+                Err(IcebergError::new(
+                    ErrorKind::Unexpected,
+                    "Intended error for unit test",
+                ))
+            })
+        });
+
+    let mooncake_table = MooncakeTable::new_with_table_manager(
+        mooncake_table_metadata,
+        Box::new(mock_table_manager),
+        mooncake_table_config,
+    )
+    .await
+    .unwrap();
+    let mut env = TestEnvironment::new_with_mooncake_table(temp_dir, mooncake_table).await;
+
+    // Drop table and block wait its completion, check whether error status is correctly propagated.
+    let res = env.drop_iceberg_table().await;
+    assert!(res.is_err());
 }

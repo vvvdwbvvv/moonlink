@@ -7,6 +7,7 @@ use crate::storage::{load_blob_from_puffin_file, DeletionVector};
 use crate::storage::{verify_files_and_deletions, MooncakeTable};
 use crate::table_handler::{IcebergEventSyncSender, TableEvent, TableHandler}; // Ensure this path is correct
 use crate::union_read::{decode_read_state_for_testing, ReadStateManager};
+use crate::Result;
 use crate::{
     IcebergEventSyncReceiver, IcebergTableEventManager, IcebergTableManager,
     TableConfig as MooncakeTableConfig,
@@ -76,28 +77,11 @@ impl TestEnvironment {
         Self::new(MooncakeTableConfig::default()).await
     }
 
-    /// Creates a new test environment with default settings.
-    pub async fn new(mooncake_table_config: MooncakeTableConfig) -> Self {
-        let schema = default_schema();
-        let temp_dir = tempdir().unwrap();
-        let path = temp_dir.path().to_path_buf();
-
-        // TODO(hjiang): Hard-code iceberg table namespace and table name.
-        let table_name = "table_name";
-        let iceberg_table_config =
-            get_iceberg_manager_config(table_name.to_string(), path.to_str().unwrap().to_string());
-        let mooncake_table = MooncakeTable::new(
-            schema,
-            table_name.to_string(),
-            1,
-            path,
-            IdentityProp::Keys(vec![0]),
-            iceberg_table_config,
-            mooncake_table_config,
-        )
-        .await
-        .unwrap();
-
+    /// Create a new test environment with the given mooncake table.
+    pub(crate) async fn new_with_mooncake_table(
+        temp_dir: TempDir,
+        mooncake_table: MooncakeTable,
+    ) -> Self {
         let (replication_tx, replication_rx) = watch::channel(0u64);
         let (last_commit_tx, last_commit_rx) = watch::channel(0u64);
         let read_state_manager = Arc::new(ReadStateManager::new(
@@ -130,6 +114,28 @@ impl TestEnvironment {
             iceberg_snapshot_manager,
             temp_dir,
         }
+    }
+
+    /// Creates a new test environment with default settings.
+    pub async fn new(mooncake_table_config: MooncakeTableConfig) -> Self {
+        let temp_dir = tempdir().unwrap();
+        let path = temp_dir.path().to_path_buf();
+        let table_name = "table_name";
+        let iceberg_table_config =
+            get_iceberg_manager_config(table_name.to_string(), path.to_str().unwrap().to_string());
+        let mooncake_table = MooncakeTable::new(
+            default_schema(),
+            table_name.to_string(),
+            1,
+            path,
+            IdentityProp::Keys(vec![0]),
+            iceberg_table_config,
+            mooncake_table_config,
+        )
+        .await
+        .unwrap();
+
+        Self::new_with_mooncake_table(temp_dir, mooncake_table).await
     }
 
     /// Create iceberg table manager.
@@ -168,7 +174,7 @@ impl TestEnvironment {
     }
 
     /// Wait iceberg snapshot creation completion.
-    pub async fn sync_snapshot_completion(&mut self) {
+    pub async fn sync_snapshot_completion(&mut self) -> Result<()> {
         self.iceberg_snapshot_manager
             .sync_snapshot_completion()
             .await
@@ -177,7 +183,7 @@ impl TestEnvironment {
     // --- Util functions for iceberg drop table ---
 
     /// Request to drop iceberg table and block wait its completion.
-    pub async fn drop_iceberg_table(&mut self) {
+    pub async fn drop_iceberg_table(&mut self) -> Result<()> {
         self.iceberg_snapshot_manager.drop_table().await
     }
 
