@@ -67,18 +67,6 @@ pub trait TableManager: Send {
     ///   both of which are stored in puffin files.
     /// - For deletion vectors, we store one blob in one puffin file.
     /// - For hash index, we store one mooncake file index in one puffin file.
-    ///
-    /// # Arguments
-    ///
-    /// * disk_files: new data files to be managed by iceberg
-    /// * file_indices: all file indexes which have been persisted, could be either local or remote.
-    ///
-    /// Please notice, it takes full content to commit snapshot.
-    ///
-    /// TODO(hjiang): We're storing the iceberg table status in two places, one for iceberg table manager, another at snapshot.
-    /// Provide delta change interface, so snapshot doesn't need to store everything.
-    ///
-    /// TODO(hjiang): It's ok to take only new moooncake file index, instead of all file indices.
     #[allow(async_fn_in_trait)]
     async fn sync_snapshot(
         &mut self,
@@ -129,6 +117,9 @@ pub struct IcebergTableManager {
     ///
     /// TODO(hjiang): Consider using `MooncakeDataFileRef` as map key.
     pub(crate) persisted_data_files: HashMap<String, DataFileEntry>,
+
+    /// Maps from mooncake file index to remote puffin filepath.
+    pub(crate) persisted_file_indices: HashMap<MooncakeFileIndex, String>,
 }
 
 impl IcebergTableManager {
@@ -144,6 +135,7 @@ impl IcebergTableManager {
             catalog,
             iceberg_table: None,
             persisted_data_files: HashMap::new(),
+            persisted_file_indices: HashMap::new(),
         })
     }
 
@@ -199,8 +191,6 @@ impl IcebergTableManager {
     /// ---------- load snapshot ----------
     ///
     /// Load index file into table manager from the current manifest entry.
-    ///
-    /// TODO(hjiang): Parallelize blob read and recovery.
     async fn load_file_indices_from_manifest_entry(
         &mut self,
         entry: &ManifestEntry,
@@ -217,6 +207,14 @@ impl IcebergTableManager {
             .iter_mut()
             .map(|cur_file_index| cur_file_index.as_mooncake_file_index());
         let file_indices = futures::future::join_all(file_index_futures).await;
+
+        self.persisted_file_indices.reserve(file_indices.len());
+        file_indices.iter().for_each(|cur_file_index| {
+            self.persisted_file_indices.insert(
+                cur_file_index.clone(),
+                entry.data_file().file_path().to_string(),
+            );
+        });
 
         Ok(file_indices)
     }
@@ -375,7 +373,10 @@ impl IcebergTableManager {
     async fn sync_data_files(
         &mut self,
         new_data_files: Vec<MooncakeDataFileRef>,
-    ) -> IcebergResult<(Vec<DataFile>, HashMap<MooncakeDataFileRef, String>)> {
+    ) -> IcebergResult<(
+        Vec<DataFile>,
+        HashMap<String, String>, /*local to remote datafile mapping*/
+    )> {
         // Maps from local data filepath to remote filepath.
         let mut local_data_file_to_remote = HashMap::with_capacity(new_data_files.len());
 
@@ -388,7 +389,7 @@ impl IcebergTableManager {
             )
             .await?;
             local_data_file_to_remote.insert(
-                local_data_file.clone(),
+                local_data_file.file_path().clone(),
                 iceberg_data_file.file_path().to_string(),
             );
             let old_entry = self.persisted_data_files.insert(
@@ -433,20 +434,13 @@ impl IcebergTableManager {
         Ok(puffin_deletion_blobs)
     }
 
-    /// Dump file indexes into the iceberg table, only new file indexes will be persisted into the table.
-    /// Return file index ids which should be added into iceberg table.
-    ///
-    /// TODO(hjiang): Need to configure (1) the number of blobs in a puffin file; and (2) the number of file index in a puffin blob.
-    /// For implementation simpicity, put everything in a single file and a single blob.
-    async fn sync_file_indices(
+    /// Process file indices to import.
+    /// [`local_data_file_to_remote`] should contain all local data filepath to remote data filepath mapping.
+    async fn import_file_indices(
         &mut self,
-        file_indices: &[MooncakeFileIndex],
-        local_data_file_to_remote: HashMap<MooncakeDataFileRef, String>,
+        file_indices_to_import: &[MooncakeFileIndex],
+        local_data_file_to_remote: HashMap<String, String>,
     ) -> IcebergResult<()> {
-        if file_indices.is_empty() {
-            return Ok(());
-        }
-
         let puffin_filepath = self.get_unique_hash_index_v1_filepath();
         let mut puffin_writer = puffin_utils::create_puffin_writer(
             self.iceberg_table.as_ref().unwrap().file_io(),
@@ -460,8 +454,9 @@ impl IcebergTableManager {
         // The hash map here is merely a workaround to pass remote path to iceberg file index structure.
         let mut local_index_file_to_remote = HashMap::new();
 
-        let mut new_file_indices: Vec<&MooncakeFileIndex> = Vec::with_capacity(file_indices.len());
-        for cur_file_index in file_indices.iter() {
+        let mut new_file_indices: Vec<&MooncakeFileIndex> =
+            Vec::with_capacity(file_indices_to_import.len());
+        for cur_file_index in file_indices_to_import.iter() {
             new_file_indices.push(cur_file_index);
             // Upload new index file to iceberg table.
             for cur_index_block in cur_file_index.index_blocks.iter() {
@@ -473,6 +468,8 @@ impl IcebergTableManager {
                 local_index_file_to_remote
                     .insert(cur_index_block.file_path.clone(), remote_index_block);
             }
+            self.persisted_file_indices
+                .insert(cur_file_index.clone(), puffin_filepath.clone());
         }
 
         let file_index_blob = FileIndexBlob::new(
@@ -489,6 +486,57 @@ impl IcebergTableManager {
             .await?;
 
         Ok(())
+    }
+
+    /// Dump file indices into the iceberg table, only new file indices will be persisted into the table.
+    /// Return file index ids which should be added into iceberg table.
+    ///
+    /// TODO(hjiang): Need to configure (1) the number of blobs in a puffin file; and (2) the number of file index in a puffin blob.
+    /// For implementation simpicity, put everything in a single file and a single blob.
+    async fn sync_file_indices(
+        &mut self,
+        file_indices_to_import: &[MooncakeFileIndex],
+        file_indices_to_remove: &[MooncakeFileIndex],
+        local_data_file_to_remote: HashMap<String, String>,
+    ) -> IcebergResult<()> {
+        // Invariant assertion: file indices to remove should only come from compaction, so there must be new file indices to import.
+        if !file_indices_to_remove.is_empty() {
+            assert!(!file_indices_to_import.is_empty());
+        }
+
+        if file_indices_to_import.is_empty() {
+            return Ok(());
+        }
+
+        // Process file indices to import.
+        self.import_file_indices(file_indices_to_import, local_data_file_to_remote)
+            .await?;
+
+        // Process file indices to remove.
+        self.catalog.set_puffin_file_to_remove(
+            file_indices_to_remove
+                .iter()
+                .map(|cur_index| self.persisted_file_indices.remove(cur_index).unwrap())
+                .collect::<HashSet<String>>(),
+        );
+
+        Ok(())
+    }
+
+    /// Util function to merge local to remote data filepath mapping, with already persisted one.
+    fn merge_local_to_remote_data_file_to_remote(
+        &self,
+        mut local_data_file_to_remote: HashMap<String, String>,
+    ) -> HashMap<String, String> {
+        local_data_file_to_remote
+            .reserve(local_data_file_to_remote.len() + self.persisted_data_files.len());
+        for (cur_local_filepath, cur_entry) in self.persisted_data_files.iter() {
+            local_data_file_to_remote.insert(
+                cur_local_filepath.clone(),
+                cur_entry.data_file.file_path().to_string(),
+            );
+        }
+        local_data_file_to_remote
     }
 }
 
@@ -507,14 +555,22 @@ impl TableManager for IcebergTableManager {
             .sync_data_files(std::mem::take(&mut snapshot_payload.data_files))
             .await?;
 
+        // Update local data file to remote mapping.
+        let local_data_file_to_remote =
+            self.merge_local_to_remote_data_file_to_remote(local_data_file_to_remote);
+
         // Persist committed deletion logs.
         let deletion_puffin_blobs = self
             .sync_deletion_vector(std::mem::take(&mut snapshot_payload.new_deletion_vector))
             .await?;
 
         // Persist file index changes.
-        self.sync_file_indices(&snapshot_payload.file_indices, local_data_file_to_remote)
-            .await?;
+        self.sync_file_indices(
+            &snapshot_payload.file_indices_to_import,
+            &snapshot_payload.file_indices_to_remove,
+            local_data_file_to_remote,
+        )
+        .await?;
 
         // Only start append action when there're new data files.
         let mut txn = Transaction::new(self.iceberg_table.as_ref().unwrap());

@@ -8,13 +8,15 @@
 // deletion vector table spec: https://github.com/apache/iceberg/pull/11240
 //
 // puffin blob spec: https://iceberg.apache.org/puffin-spec/?h=deletion#deletion-vector-v1-blob-type
+//
+// TODO(hjiang): Add documentation on how we store puffin blobs inside of puffinf file, what's the relationship between puffin file and manifest file, etc.
 
 use crate::storage::iceberg::deletion_vector::{
     DELETION_VECTOR_CADINALITY, DELETION_VECTOR_REFERENCED_DATA_FILE,
 };
 use crate::storage::iceberg::index::{MOONCAKE_HASH_INDEX_V1, MOONCAKE_HASH_INDEX_V1_CARDINALITY};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 use iceberg::io::FileIO;
@@ -341,9 +343,10 @@ fn create_manifest_writer_builder(
 pub(crate) async fn append_puffin_metadata_and_rewrite(
     table_metadata: &TableMetadata,
     file_io: &FileIO,
-    puffin_blobs: &HashMap<String, Vec<PuffinBlobMetadataProxy>>,
+    puffin_blobs_to_add: &HashMap<String, Vec<PuffinBlobMetadataProxy>>,
+    puffin_blobs_to_remove: &HashSet<String>,
 ) -> IcebergResult<()> {
-    if puffin_blobs.is_empty() {
+    if puffin_blobs_to_add.is_empty() {
         return Ok(());
     }
 
@@ -386,21 +389,43 @@ pub(crate) async fn append_puffin_metadata_and_rewrite(
     // Map from referenced data file to deletion vector manifest entry.
     let mut existing_deletion_vector_entries = HashMap::new();
 
-    // Iterate through all manifest files, keep data manifest files (including data files and hash index files) and merge all deletion vectors.
+    // Iterate through all manifest files, keep data manifest files, process hash index files, and merge all deletion vectors.
     for cur_manifest_file in manifest_list.entries() {
-        if cur_manifest_file.content == ManifestContentType::Data {
+        let manifest = cur_manifest_file.load_manifest(file_io).await?;
+        let (manifest_entries, manifest_metadata) = manifest.into_parts();
+
+        // Keep data files unchanged.
+        // Assumption: we store all data file manifest entries in one manifest file.
+        assert!(!manifest_entries.is_empty());
+        if *manifest_metadata.content() == ManifestContentType::Data
+            && manifest_entries.first().unwrap().file_format() == DataFileFormat::Parquet
+        {
             manifest_list_writer.add_manifests([cur_manifest_file.clone()].into_iter())?;
             continue;
         }
 
-        let manifest = cur_manifest_file.load_manifest(file_io).await?;
-        let (manifest_entries, _) = manifest.into_parts();
+        // Process deletion vector puffin files.
         for cur_manifest_entry in manifest_entries.into_iter() {
-            assert_eq!(
-                cur_manifest_entry.file_format(),
-                DataFileFormat::Puffin,
-                "Expect manifest entry to be either parquet or puffin."
-            );
+            assert_eq!(cur_manifest_entry.file_format(), DataFileFormat::Puffin,);
+
+            // Process file indices: skip those requested to remove, and keep those un-mentioned.
+            if *manifest_metadata.content() == ManifestContentType::Data {
+                // Skip file indices which are requested to remove.
+                if puffin_blobs_to_remove.contains(cur_manifest_entry.data_file().file_path()) {
+                    continue;
+                }
+
+                // Keep file indices which are not requested to remove.
+                init_file_index_manifest_writer(&mut file_index_manifest_writer)?;
+                file_index_manifest_writer.as_mut().unwrap().add_file(
+                    cur_manifest_entry.data_file().clone(),
+                    cur_manifest_entry.sequence_number().unwrap(),
+                )?;
+                continue;
+            }
+
+            // Process deletion vectors.
+            assert_eq!(*manifest_metadata.content(), ManifestContentType::Deletes);
             let old_entry = existing_deletion_vector_entries.insert(
                 cur_manifest_entry
                     .data_file()
@@ -417,7 +442,7 @@ pub(crate) async fn append_puffin_metadata_and_rewrite(
     }
 
     // Append puffin blobs into existing manifest entries.
-    for (puffin_filepath, blob_metadata) in puffin_blobs.iter() {
+    for (puffin_filepath, blob_metadata) in puffin_blobs_to_add.iter() {
         for cur_blob_metadata in blob_metadata.iter() {
             // Handle mooncake hash index v1.
             if cur_blob_metadata.r#type == MOONCAKE_HASH_INDEX_V1 {
