@@ -38,6 +38,9 @@ use mockall::*;
 
 /// Key for iceberg table property, to record flush lsn.
 const MOONCAKE_TABLE_FLUSH_LSN: &str = "mooncake-table-flush-lsn";
+/// Used to represent uninitialized deletion vector.
+/// TODO(hjiang): Consider using `Option<>` to represent uninitialized, which is more rust-idiometic.
+const UNINITIALIZED_BATCH_DELETION_VECTOR_MAX_ROW: usize = 0;
 
 #[derive(Clone, Debug, TypedBuilder)]
 pub struct IcebergTableConfig {
@@ -227,7 +230,7 @@ impl IcebergTableManager {
         assert_eq!(data_file.file_format(), DataFileFormat::Parquet);
         let new_data_file_entry = DataFileEntry {
             data_file: data_file.clone(),
-            deletion_vector: BatchDeletionVector::new(/*max_rows=*/ 0),
+            deletion_vector: BatchDeletionVector::new(UNINITIALIZED_BATCH_DELETION_VECTOR_MAX_ROW),
             persisted_deletion_vector: None,
         };
         let old_entry = self
@@ -364,9 +367,12 @@ impl IcebergTableManager {
 
     /// Dump local data files into iceberg table.
     /// Return new iceberg data files for append transaction, and local data filepath to remote data filepath for index block remapping.
+    ///
+    /// TODO(hjiang): `new_deletion_vector` should use hash map for deletion vector lookup.
     async fn sync_data_files(
         &mut self,
         new_data_files: Vec<MooncakeDataFileRef>,
+        new_deletion_vector: &[(MooncakeDataFileRef, BatchDeletionVector)],
     ) -> IcebergResult<(
         Vec<DataFile>,
         HashMap<String, String>, /*local to remote datafile mapping*/
@@ -386,12 +392,19 @@ impl IcebergTableManager {
                 local_data_file.file_path().clone(),
                 iceberg_data_file.file_path().to_string(),
             );
+
+            // Try get deletion vector batch size.
+            let max_rows = new_deletion_vector
+                .iter()
+                .find(|(f, _)| *f == local_data_file)
+                .map(|(_, dv)| dv.get_max_rows());
+
             let old_entry = self.persisted_data_files.insert(
                 local_data_file.file_path().to_string(),
                 DataFileEntry {
                     data_file: iceberg_data_file.clone(),
                     deletion_vector: BatchDeletionVector::new(
-                        self.mooncake_table_metadata.config.batch_size(),
+                        max_rows.unwrap_or(UNINITIALIZED_BATCH_DELETION_VECTOR_MAX_ROW),
                     ),
                     persisted_deletion_vector: None,
                 },
@@ -414,6 +427,11 @@ impl IcebergTableManager {
                 .get(local_data_file.file_path())
                 .unwrap()
                 .clone();
+
+            if entry.deletion_vector.get_max_rows() == UNINITIALIZED_BATCH_DELETION_VECTOR_MAX_ROW {
+                entry.deletion_vector =
+                    BatchDeletionVector::new(new_deletion_vector.get_max_rows());
+            }
             entry.deletion_vector.merge_with(&new_deletion_vector);
 
             // Data filepath in iceberg table.
@@ -546,7 +564,10 @@ impl TableManager for IcebergTableManager {
 
         // Persist data files.
         let (new_iceberg_data_files, local_data_file_to_remote) = self
-            .sync_data_files(std::mem::take(&mut snapshot_payload.data_files))
+            .sync_data_files(
+                std::mem::take(&mut snapshot_payload.data_files),
+                &snapshot_payload.new_deletion_vector,
+            )
             .await?;
 
         // Update local data file to remote mapping.
