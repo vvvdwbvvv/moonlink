@@ -1,4 +1,6 @@
 use crate::row::MoonlinkRow;
+use crate::storage::index::persisted_bucket_hash_map::GlobalIndexBuilder;
+use crate::storage::mooncake_table::FileIndiceMergeResult;
 use crate::storage::mooncake_table::SnapshotOption;
 use crate::storage::MooncakeTable;
 use crate::table_notify::TableNotify;
@@ -44,7 +46,7 @@ pub struct TableHandler {
     /// Handle to the event processing task
     _event_handle: Option<JoinHandle<()>>,
 
-    /// Sender for the event queue
+    /// Sender for the table event queue
     event_sender: Sender<TableEvent>,
 }
 
@@ -64,14 +66,15 @@ impl TableHandler {
         let (event_sender, event_receiver) = mpsc::channel(100);
 
         // Create channel for internal control events.
-        let (table_notifier_tx, table_notify_rx) = mpsc::channel(100);
-        table.register_table_notify(table_notifier_tx);
+        let (table_notify_tx, table_notify_rx) = mpsc::channel(100);
+        table.register_table_notify(table_notify_tx.clone());
 
         // Spawn the task with the oneshot receiver
         let event_handle = Some(tokio::spawn(async move {
             Self::event_loop(
                 iceberg_event_sync_sender,
                 event_receiver,
+                table_notify_tx,
                 table_notify_rx,
                 table,
             )
@@ -94,10 +97,14 @@ impl TableHandler {
     async fn event_loop(
         iceberg_event_sync_sender: IcebergEventSyncSender,
         mut event_receiver: Receiver<TableEvent>,
+        table_notify_tx: Sender<TableNotify>,
         mut table_notify_rx: Receiver<TableNotify>,
         mut table: MooncakeTable,
     ) {
         let mut periodic_snapshot_interval = time::interval(Duration::from_millis(500));
+
+        // Mooncake table directory.
+        let table_directory = std::path::PathBuf::from(table.get_table_directory());
 
         // Requested minimum LSN for a force snapshot request.
         let mut force_snapshot_lsns: BTreeMap<u64, Vec<Sender<Result<()>>>> = BTreeMap::new();
@@ -110,6 +117,9 @@ impl TableHandler {
 
         // Whether there's an ongoing iceberg snapshot operation.
         let mut iceberg_snapshot_ongoing = false;
+
+        // Whether there's an ongoing index merge operation.s
+        let mut index_merge_ongoing = false;
 
         // Whether current table receives any update events.
         let mut table_updated = false;
@@ -216,6 +226,7 @@ impl TableHandler {
                                 table.create_snapshot(SnapshotOption {
                                     force_create: true,
                                     skip_iceberg_snapshot: iceberg_snapshot_ongoing,
+                                    skip_file_indices_merge: index_merge_ongoing,
                                 });
                                 mooncake_snapshot_ongoing = true;
                             }
@@ -265,7 +276,7 @@ impl TableHandler {
                 // Wait for the mooncake table event notification.
                 Some(event) = table_notify_rx.recv() => {
                     match event {
-                        TableNotify::MooncakeTableSnapshot { lsn, iceberg_snapshot_payload } => {
+                        TableNotify::MooncakeTableSnapshot { lsn, iceberg_snapshot_payload, file_indice_merge_payload } => {
                             // Notify read the mooncake table commit of LSN.
                             table.notify_snapshot_reader(lsn);
 
@@ -274,6 +285,28 @@ impl TableHandler {
                                 if let Some(iceberg_snapshot_payload) = iceberg_snapshot_payload {
                                     table.persist_iceberg_snapshot(iceberg_snapshot_payload);
                                     iceberg_snapshot_ongoing = true;
+                                }
+                            }
+
+                            // Process file indices merge.
+                            // Unlike snapshot, we can actually have multiple file index merge operations ongoing concurrently,
+                            // to simplify workflow we limit at most one ongoing.
+                            if !index_merge_ongoing {
+                                if let Some(file_indice_merge_payload) = file_indice_merge_payload {
+                                    let table_directory_copy = table_directory.clone();
+                                    let table_notify_tx_copy = table_notify_tx.clone();
+                                    index_merge_ongoing = true;
+                                    // Spawn a detached task for index merge, whose completion will notify separately.
+                                    tokio::task::spawn(async move {
+                                        let mut builder = GlobalIndexBuilder::new();
+                                        builder.set_directory(table_directory_copy);
+                                        let merged = builder.build_from_merge(file_indice_merge_payload.file_indices.clone()).await;
+                                        let index_merge_result = FileIndiceMergeResult {
+                                            old_file_indices: file_indice_merge_payload.file_indices,
+                                            merged_file_indices: merged,
+                                        };
+                                        table_notify_tx_copy.send(TableNotify::IndexMerge { index_merge_result }).await.unwrap();
+                                    });
                                 }
                             }
 
@@ -309,6 +342,10 @@ impl TableHandler {
                                 }
                             }
                         }
+                        TableNotify::IndexMerge { index_merge_result } => {
+                            table.set_file_indices_merge_res(index_merge_result);
+                            index_merge_ongoing = false;
+                        }
                     }
                 }
                 // Periodic snapshot based on time
@@ -327,6 +364,7 @@ impl TableHandler {
                                 table.create_snapshot(SnapshotOption {
                                     force_create: true,
                                     skip_iceberg_snapshot: iceberg_snapshot_ongoing,
+                                    skip_file_indices_merge: index_merge_ongoing,
                                 });
                                 mooncake_snapshot_ongoing = true;
                                 continue;
@@ -339,6 +377,7 @@ impl TableHandler {
                     mooncake_snapshot_ongoing = table.create_snapshot(SnapshotOption {
                         force_create: false,
                         skip_iceberg_snapshot: iceberg_snapshot_ongoing,
+                        skip_file_indices_merge: index_merge_ongoing,
                     });
                 }
                 // If all senders have been dropped, exit the loop
