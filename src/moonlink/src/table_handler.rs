@@ -1,4 +1,5 @@
 use crate::row::MoonlinkRow;
+use crate::storage::mooncake_table::SnapshotOption;
 use crate::storage::MooncakeTable;
 use crate::table_notify::TableNotify;
 use crate::{Error, Result};
@@ -212,7 +213,10 @@ impl TableHandler {
 
                             if force_snapshot {
                                 reset_iceberg_state_at_mooncake_snapshot(&mut iceberg_snapshot_result_consumed, &mut iceberg_snapshot_ongoing);
-                                table.force_create_snapshot();
+                                table.create_snapshot(SnapshotOption {
+                                    force_create: true,
+                                    skip_iceberg_snapshot: iceberg_snapshot_ongoing,
+                                });
                                 mooncake_snapshot_ongoing = true;
                             }
                         }
@@ -266,9 +270,6 @@ impl TableHandler {
                             table.notify_snapshot_reader(lsn);
 
                             // Process iceberg snapshot and trigger iceberg snapshot if necessary.
-                            //
-                            // TODO(hjiang): same as mooncake snapshot, there should be at most one iceberg snapshot ongoing; for simplicity, we skip iceberg snapshot if there's already one.
-                            // An optimization is skip generating iceberg snapshot payload at mooncake snapshot if we know it's already taking place, but the risk is missing iceberg snapshot.
                             if can_initiate_iceberg_snapshot(iceberg_snapshot_result_consumed, iceberg_snapshot_ongoing) {
                                 if let Some(iceberg_snapshot_payload) = iceberg_snapshot_payload {
                                     table.persist_iceberg_snapshot(iceberg_snapshot_payload);
@@ -323,7 +324,10 @@ impl TableHandler {
                             if *force_snapshot_lsns.iter().next().as_ref().unwrap().0 <= commit_lsn {
                                 table.flush(/*lsn=*/ commit_lsn).await.unwrap();
                                 reset_iceberg_state_at_mooncake_snapshot(&mut iceberg_snapshot_result_consumed, &mut iceberg_snapshot_ongoing);
-                                table.force_create_snapshot();
+                                table.create_snapshot(SnapshotOption {
+                                    force_create: true,
+                                    skip_iceberg_snapshot: iceberg_snapshot_ongoing,
+                                });
                                 mooncake_snapshot_ongoing = true;
                                 continue;
                             }
@@ -332,7 +336,10 @@ impl TableHandler {
 
                     // Fallback to normal periodic snapshot.
                     reset_iceberg_state_at_mooncake_snapshot(&mut iceberg_snapshot_result_consumed, &mut iceberg_snapshot_ongoing);
-                    mooncake_snapshot_ongoing = table.create_snapshot();
+                    mooncake_snapshot_ongoing = table.create_snapshot(SnapshotOption {
+                        force_create: false,
+                        skip_iceberg_snapshot: iceberg_snapshot_ongoing,
+                    });
                 }
                 // If all senders have been dropped, exit the loop
                 else => {
