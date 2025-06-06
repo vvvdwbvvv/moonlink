@@ -65,7 +65,7 @@ impl ReplicationConnection {
         });
         postgres_client
             .simple_query(
-                "DROP PUBLICATION IF EXISTS moonlink_pub; CREATE PUBLICATION moonlink_pub;",
+                "DROP PUBLICATION IF EXISTS moonlink_pub; CREATE PUBLICATION moonlink_pub WITH (publish_via_partition_root = true);",
             )
             .await
             .map_err(PostgresSourceError::from)?;
