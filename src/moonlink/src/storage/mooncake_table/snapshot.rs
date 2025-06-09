@@ -339,20 +339,26 @@ impl SnapshotTableState {
         // TODO(hjiang): Implement a naive mechanism first, which compacts as long as there's deleted rows.
         let mut tentative_data_files_to_compact = HashMap::new();
         // TODO(hjiang): We should be able to early exit, if left items are not enough to reach the compaction threshold.
-        for (cur_data_file, cur_deletion) in all_disk_files.iter() {
-            // Doesn't compact those with no deletion logs.
-            if cur_deletion.batch_deletion_vector.is_empty() {
-                assert!(cur_deletion.puffin_deletion_blob.is_none());
-                continue;
-            }
+        for (cur_data_file, disk_file_entry) in all_disk_files.iter() {
             // Doesn't compact those unpersisted files.
             if unpersisted_data_files.contains(cur_data_file) {
                 continue;
             }
 
+            // Skip compaction if the file size exceeds threshold, AND it has no persisted deletion vectors.
+            if disk_file_entry.file_size
+                >= self
+                    .mooncake_table_config
+                    .data_compaction_config
+                    .data_file_final_size as usize
+                && disk_file_entry.batch_deletion_vector.is_empty()
+            {
+                continue;
+            }
+
             let old_entry = tentative_data_files_to_compact.insert(
                 cur_data_file.clone(),
-                cur_deletion.puffin_deletion_blob.clone(),
+                disk_file_entry.puffin_deletion_blob.clone(),
             );
             assert!(old_entry.is_none());
         }
@@ -565,7 +571,6 @@ impl SnapshotTableState {
             // If no deletion record for this file, directly remove it, no need to do remapping.
             let old_entry = old_entry.unwrap();
             if old_entry.batch_deletion_vector.is_empty() {
-                assert!(old_entry.puffin_deletion_blob.is_some());
                 continue;
             }
 
@@ -780,6 +785,7 @@ impl SnapshotTableState {
         // Apply data compaction to committed deletion logs.
         self.remap_and_prune_deletion_logs_after_compaction(&mut task);
 
+        // After data compaction and index merge changes have been applied to snapshot, processed deletion record will point to the new record location.
         self.rows = take(&mut task.new_rows);
         self.process_deletion_log(&mut task).await;
 
