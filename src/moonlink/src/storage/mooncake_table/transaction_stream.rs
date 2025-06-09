@@ -1,6 +1,8 @@
 use super::*;
 use crate::storage::index::Index;
+use crate::storage::mooncake_table::DiskFileEntry;
 use crate::storage::storage_utils::ProcessedDeletionRecord;
+use more_asserts as ma;
 /// Used to track the state of a streamed transaction
 /// Holds appending rows in memslice and files.
 /// Deletes are more complex,
@@ -14,7 +16,7 @@ pub(super) struct TransactionStreamState {
     local_deletions: Vec<ProcessedDeletionRecord>,
     pending_deletions_in_main_mem_slice: Vec<RawDeletionRecord>,
     flushed_file_index: MooncakeIndex,
-    flushed_files: hashbrown::HashMap<MooncakeDataFileRef, BatchDeletionVector>,
+    flushed_files: hashbrown::HashMap<MooncakeDataFileRef, DiskFileEntry>,
 }
 
 pub enum TransactionStreamOutput {
@@ -26,7 +28,7 @@ pub struct TransactionStreamCommit {
     xact_id: u32,
     commit_lsn: u64,
     flushed_file_index: MooncakeIndex,
-    flushed_files: hashbrown::HashMap<MooncakeDataFileRef, BatchDeletionVector>,
+    flushed_files: hashbrown::HashMap<MooncakeDataFileRef, DiskFileEntry>,
     local_deletions: Vec<ProcessedDeletionRecord>,
     pending_deletions: Vec<RawDeletionRecord>,
 }
@@ -132,11 +134,11 @@ impl MooncakeTable {
                 let RecordLocation::DiskFile(file_id, row_id) = loc else {
                     panic!("Unexpected record location: {:?}", record);
                 };
-                let (file, dv) = stream_state
+                let (file, disk_file_entry) = stream_state
                     .flushed_files
                     .get_key_value_mut(&file_id)
                     .expect("missing disk file");
-                if dv.is_deleted(row_id) {
+                if disk_file_entry.batch_deletion_vector.is_deleted(row_id) {
                     continue;
                 }
                 if record.row_identity.is_none()
@@ -151,7 +153,7 @@ impl MooncakeTable {
                         pos: loc,
                         lsn: record.lsn,
                     });
-                    dv.delete_row(row_id);
+                    disk_file_entry.batch_deletion_vector.delete_row(row_id);
                     return;
                 }
             }
@@ -192,10 +194,16 @@ impl MooncakeTable {
             )
             .await?;
 
-            for (file, num_rows) in disk_slice.output_files().iter() {
+            for (file, file_attrs) in disk_slice.output_files().iter() {
+                ma::assert_gt!(file_attrs.file_size, 0);
+                let disk_file_entry = DiskFileEntry {
+                    file_size: file_attrs.file_size,
+                    batch_deletion_vector: BatchDeletionVector::new(file_attrs.row_num),
+                    puffin_deletion_blob: None,
+                };
                 stream_state
                     .flushed_files
-                    .insert(file.clone(), BatchDeletionVector::new(*num_rows));
+                    .insert(file.clone(), disk_file_entry);
             }
             let index = disk_slice.take_index();
             if let Some(index) = index {
@@ -252,17 +260,16 @@ impl SnapshotTableState {
             match output {
                 TransactionStreamOutput::Commit(commit) => {
                     // add files
-                    commit.flushed_files.into_iter().for_each(|(file, dv)| {
-                        task.disk_file_lsn_map
-                            .insert(file.file_id(), commit.commit_lsn);
-                        self.current_snapshot.disk_files.insert(
-                            file,
-                            DiskFileDeletionVector {
-                                batch_deletion_vector: dv,
-                                puffin_deletion_blob: None,
-                            },
-                        );
-                    });
+                    commit
+                        .flushed_files
+                        .into_iter()
+                        .for_each(|(file, disk_file_entry)| {
+                            task.disk_file_lsn_map
+                                .insert(file.file_id(), commit.commit_lsn);
+                            self.current_snapshot
+                                .disk_files
+                                .insert(file, disk_file_entry);
+                        });
                     // add index
                     commit
                         .flushed_file_index

@@ -1,8 +1,7 @@
 use super::data_batches::{create_batch_from_rows, InMemoryBatch};
 use super::delete_vector::BatchDeletionVector;
 use super::{
-    DiskFileDeletionVector, IcebergSnapshotPayload, Snapshot, SnapshotTask, TableConfig,
-    TableMetadata,
+    DiskFileEntry, IcebergSnapshotPayload, Snapshot, SnapshotTask, TableConfig, TableMetadata,
 };
 use crate::error::Result;
 use crate::storage::compaction::table_compaction::{CompactedDataEntry, DataCompactionPayload};
@@ -545,9 +544,11 @@ impl SnapshotTableState {
         // Process new data files to import.
         ma::assert_ge!(self.current_snapshot.disk_files.len(), old_data_files.len());
         for (cur_new_data_file, cur_entry) in new_data_files.iter() {
+            ma::assert_gt!(cur_entry.file_size, 0);
             self.current_snapshot.disk_files.insert(
                 cur_new_data_file.clone(),
-                DiskFileDeletionVector {
+                DiskFileEntry {
+                    file_size: cur_entry.file_size,
                     batch_deletion_vector: BatchDeletionVector::new(
                         /*max_rows=*/ cur_entry.num_rows,
                     ),
@@ -937,11 +938,13 @@ impl SnapshotTableState {
             // register new files
             self.current_snapshot
                 .disk_files
-                .extend(slice.output_files().iter().map(|(f, rows)| {
+                .extend(slice.output_files().iter().map(|(f, file_attrs)| {
+                    ma::assert_gt!(file_attrs.file_size, 0);
                     (
                         f.clone(),
-                        DiskFileDeletionVector {
-                            batch_deletion_vector: BatchDeletionVector::new(*rows),
+                        DiskFileEntry {
+                            file_size: file_attrs.file_size,
+                            batch_deletion_vector: BatchDeletionVector::new(file_attrs.row_num),
                             puffin_deletion_blob: None,
                         },
                     )
