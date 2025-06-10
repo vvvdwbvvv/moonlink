@@ -336,12 +336,13 @@ impl IcebergTableManager {
         for (data_filepath, data_file_entry) in self.persisted_data_files.iter() {
             let file_id = data_file_to_file_id.remove(data_filepath).unwrap();
             let data_file = create_data_file(file_id.0, data_filepath.to_string());
-            let _file_indice = data_file_to_file_indices.remove(&data_file).unwrap();
+            let file_indice = data_file_to_file_indices.remove(&data_file).unwrap();
 
             mooncake_snapshot.disk_files.insert(
                 data_file,
                 DiskFileEntry {
                     file_size: data_file_entry.data_file.file_size_in_bytes() as usize,
+                    file_indice: Some(file_indice),
                     puffin_deletion_blob: data_file_entry.persisted_deletion_vector.clone(),
                     batch_deletion_vector: data_file_entry.deletion_vector.clone(),
                 },

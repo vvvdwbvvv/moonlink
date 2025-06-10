@@ -338,8 +338,9 @@ impl SnapshotTableState {
             .iter()
             .cloned()
             .collect::<HashSet<_>>();
-        // TODO(hjiang): Implement a naive mechanism first, which compacts as long as there's deleted rows.
         let mut tentative_data_files_to_compact = HashMap::new();
+        let mut tentative_file_indices_to_compact = vec![];
+
         // TODO(hjiang): We should be able to early exit, if left items are not enough to reach the compaction threshold.
         for (cur_data_file, disk_file_entry) in all_disk_files.iter() {
             // Doesn't compact those unpersisted files.
@@ -358,11 +359,21 @@ impl SnapshotTableState {
                 continue;
             }
 
+            // Tentatively decide data file to compact.
             let old_entry = tentative_data_files_to_compact.insert(
                 cur_data_file.clone(),
                 disk_file_entry.puffin_deletion_blob.clone(),
             );
             assert!(old_entry.is_none());
+            // Tentatively decide corresponding file indices to compact.
+            let cur_file_index = all_disk_files
+                .get(cur_data_file)
+                .unwrap()
+                .file_indice
+                .as_ref()
+                .unwrap()
+                .clone();
+            tentative_file_indices_to_compact.push(cur_file_index);
         }
 
         if tentative_data_files_to_compact.len()
@@ -374,24 +385,9 @@ impl SnapshotTableState {
             return None;
         }
 
-        // TODO(hjiang): Current implementation take the easy path to code, which does a sequential scan to get all file indices.
-        // If turns out to have performance issue, store file indices along with disk files.
-        let all_file_indices = &self.current_snapshot.indices.file_indices;
-        let mut file_indices_to_compact = vec![];
-        for cur_file_indice in all_file_indices.iter() {
-            if cur_file_indice
-                .files
-                .iter()
-                .any(|cur_file| tentative_data_files_to_compact.contains_key(cur_file))
-            {
-                file_indices_to_compact.push(cur_file_indice.clone());
-            }
-        }
-        assert!(!file_indices_to_compact.is_empty());
-
         Some(DataCompactionPayload {
             disk_files: tentative_data_files_to_compact,
-            file_indices: file_indices_to_compact,
+            file_indices: tentative_file_indices_to_compact,
         })
     }
 
@@ -518,6 +514,30 @@ impl SnapshotTableState {
             return;
         }
 
+        // Update disk files' corresponding file indices.
+        for cur_file_index in old_file_indices.iter() {
+            for cur_data_file in cur_file_index.files.iter() {
+                // File indices change could be caused by data compaction, so it's possible the disk file doesn't exist in current snapshot any more.
+                if let Some(disk_file_entry) =
+                    self.current_snapshot.disk_files.get_mut(cur_data_file)
+                {
+                    disk_file_entry.file_indice = None;
+                }
+            }
+        }
+        // Precondition: if any, data files have already been updated to disk files, so all data files referenced by new file indices already exists.
+        for cur_file_index in new_file_indices.iter() {
+            for cur_data_file in cur_file_index.files.iter() {
+                let data_file_entry = self
+                    .current_snapshot
+                    .disk_files
+                    .get_mut(cur_data_file)
+                    .unwrap();
+                data_file_entry.file_indice = Some(cur_file_index.clone());
+            }
+        }
+
+        // Update current snapshot's file indices.
         let file_indices = std::mem::take(&mut self.current_snapshot.indices.file_indices);
         ma::assert_le!(old_file_indices.len(), file_indices.len());
         let updated_file_indices_len = file_indices.len() - old_file_indices.len() + 1 /*merged file indice*/;
@@ -557,6 +577,8 @@ impl SnapshotTableState {
                 cur_new_data_file.clone(),
                 DiskFileEntry {
                     file_size: cur_entry.file_size,
+                    // Current implementation ensures only one file index for all new compacted data files.
+                    file_indice: None,
                     batch_deletion_vector: BatchDeletionVector::new(
                         /*max_rows=*/ cur_entry.num_rows,
                     ),
@@ -626,14 +648,15 @@ impl SnapshotTableState {
             return;
         }
 
-        self.update_file_indices_to_mooncake_snapshot_impl(
-            old_compacted_file_indices,
-            new_compacted_file_indices,
-        );
+        // NOTICE: Update data files before file indices, so when update file indices, data files for new file indices already exist in disk files map.
         self.update_data_files_to_mooncake_snapshot_impl(
             old_compacted_data_files,
             new_compacted_data_files,
             remapped_data_files_after_compaction,
+        );
+        self.update_file_indices_to_mooncake_snapshot_impl(
+            old_compacted_file_indices,
+            new_compacted_file_indices.clone(),
         );
     }
 
@@ -732,6 +755,55 @@ impl SnapshotTableState {
                 continue;
             }
             Self::remap_record_location_after_compaction(cur_deletion_log.as_mut().unwrap(), task);
+        }
+    }
+
+    fn get_iceberg_snapshot_payload(
+        &self,
+        flush_lsn: u64,
+        new_committed_deletion_logs: HashMap<MooncakeDataFileRef, BatchDeletionVector>,
+    ) -> IcebergSnapshotPayload {
+        IcebergSnapshotPayload {
+            flush_lsn,
+            import_payload: IcebergSnapshotImportPayload {
+                data_files: self
+                    .unpersisted_iceberg_records
+                    .unpersisted_data_files
+                    .to_vec(),
+                new_deletion_vector: new_committed_deletion_logs,
+                file_indices: self
+                    .unpersisted_iceberg_records
+                    .unpersisted_file_indices
+                    .to_vec(),
+            },
+            index_merge_payload: IcebergSnapshotIndexMergePayload {
+                new_file_indices_to_import: self
+                    .unpersisted_iceberg_records
+                    .merged_file_indices_to_add
+                    .to_vec(),
+                old_file_indices_to_remove: self
+                    .unpersisted_iceberg_records
+                    .merged_file_indices_to_remove
+                    .to_vec(),
+            },
+            data_compaction_payload: IcebergSnapshotDataCompactionPayload {
+                new_data_files_to_import: self
+                    .unpersisted_iceberg_records
+                    .compacted_data_files_to_add
+                    .to_vec(),
+                old_data_files_to_remove: self
+                    .unpersisted_iceberg_records
+                    .compacted_data_files_to_remove
+                    .to_vec(),
+                new_file_indices_to_import: self
+                    .unpersisted_iceberg_records
+                    .compacted_file_indices_to_add
+                    .to_vec(),
+                old_file_indices_to_remove: self
+                    .unpersisted_iceberg_records
+                    .compacted_file_indices_to_remove
+                    .to_vec(),
+            },
         }
     }
 
@@ -856,49 +928,18 @@ impl SnapshotTableState {
                 || flush_by_merge_file_indices
                 || flush_by_data_compaction
             {
-                iceberg_snapshot_payload = Some(IcebergSnapshotPayload {
-                    flush_lsn,
-                    import_payload: IcebergSnapshotImportPayload {
-                        data_files: self
-                            .unpersisted_iceberg_records
-                            .unpersisted_data_files
-                            .to_vec(),
-                        new_deletion_vector: aggregated_committed_deletion_logs,
-                        file_indices: self
-                            .unpersisted_iceberg_records
-                            .unpersisted_file_indices
-                            .to_vec(),
-                    },
-                    index_merge_payload: IcebergSnapshotIndexMergePayload {
-                        new_file_indices_to_import: self
-                            .unpersisted_iceberg_records
-                            .merged_file_indices_to_add
-                            .to_vec(),
-                        old_file_indices_to_remove: self
-                            .unpersisted_iceberg_records
-                            .merged_file_indices_to_remove
-                            .to_vec(),
-                    },
-                    data_compaction_payload: IcebergSnapshotDataCompactionPayload {
-                        new_data_files_to_import: self
-                            .unpersisted_iceberg_records
-                            .compacted_data_files_to_add
-                            .to_vec(),
-                        old_data_files_to_remove: self
-                            .unpersisted_iceberg_records
-                            .compacted_data_files_to_remove
-                            .to_vec(),
-                        new_file_indices_to_import: self
-                            .unpersisted_iceberg_records
-                            .compacted_file_indices_to_add
-                            .to_vec(),
-                        old_file_indices_to_remove: self
-                            .unpersisted_iceberg_records
-                            .compacted_file_indices_to_remove
-                            .to_vec(),
-                    },
-                });
+                iceberg_snapshot_payload =
+                    Some(self.get_iceberg_snapshot_payload(
+                        flush_lsn,
+                        aggregated_committed_deletion_logs,
+                    ));
             }
+        }
+
+        // Expensive assertion, which is only enabled in unit tests.
+        #[cfg(test)]
+        {
+            self.assert_current_snapshot_consistent();
         }
 
         (
@@ -907,6 +948,33 @@ impl SnapshotTableState {
             data_compaction_payload,
             file_indices_merge_payload,
         )
+    }
+
+    // Test util function to assert current snapshot is at a consistent state.
+    #[cfg(test)]
+    fn assert_current_snapshot_consistent(&self) {
+        // Check file indices and disk files are consistent.
+        //
+        // (1) Get data file to file indices mapping from [`disk_files`].
+        let mut data_file_to_file_indices_1 =
+            HashMap::with_capacity(self.current_snapshot.disk_files.len());
+        for (cur_disk_file, cur_disk_file_entry) in self.current_snapshot.disk_files.iter() {
+            let cur_file_index = cur_disk_file_entry.file_indice.as_ref().unwrap().clone();
+            data_file_to_file_indices_1.insert(cur_disk_file.clone(), cur_file_index);
+        }
+        // (2) Get data file to file indices mapping from [`file_indices`].
+        let mut data_file_to_file_indices_2 =
+            HashMap::with_capacity(self.current_snapshot.disk_files.len());
+        let file_indices = &self.current_snapshot.indices.file_indices;
+        for cur_file_index in file_indices {
+            for cur_data_file in cur_file_index.files.iter() {
+                let old_entry = data_file_to_file_indices_2
+                    .insert(cur_data_file.clone(), cur_file_index.clone());
+                assert!(old_entry.is_none());
+            }
+        }
+        // Assert mapping inferred from disk files and file indices are the same.
+        assert_eq!(data_file_to_file_indices_1, data_file_to_file_indices_2);
     }
 
     fn merge_mem_indices(&mut self, task: &mut SnapshotTask) {
@@ -954,6 +1022,7 @@ impl SnapshotTableState {
                         f.clone(),
                         DiskFileEntry {
                             file_size: file_attrs.file_size,
+                            file_indice: Some(slice.get_file_indice().as_ref().unwrap().clone()),
                             batch_deletion_vector: BatchDeletionVector::new(file_attrs.row_num),
                             puffin_deletion_blob: None,
                         },
