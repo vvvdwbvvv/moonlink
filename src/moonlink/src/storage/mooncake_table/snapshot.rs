@@ -4,7 +4,9 @@ use super::{
     DiskFileEntry, IcebergSnapshotPayload, Snapshot, SnapshotTask, TableConfig, TableMetadata,
 };
 use crate::error::Result;
-use crate::storage::compaction::table_compaction::{CompactedDataEntry, DataCompactionPayload};
+use crate::storage::compaction::table_compaction::{
+    CompactedDataEntry, DataCompactionPayload, RemappedRecordLocation,
+};
 use crate::storage::iceberg::iceberg_table_manager::TableManager;
 use crate::storage::iceberg::puffin_utils::PuffinBlobRef;
 use crate::storage::index::{FileIndex, Index};
@@ -538,8 +540,8 @@ impl SnapshotTableState {
     fn update_data_files_to_mooncake_snapshot_impl(
         &mut self,
         old_data_files: HashSet<MooncakeDataFileRef>,
-        new_data_files: HashMap<MooncakeDataFileRef, CompactedDataEntry>,
-        remapped_data_files_after_compaction: HashMap<RecordLocation, RecordLocation>,
+        new_data_files: Vec<(MooncakeDataFileRef, CompactedDataEntry)>,
+        remapped_data_files_after_compaction: HashMap<RecordLocation, RemappedRecordLocation>,
     ) {
         if old_data_files.is_empty() {
             assert!(new_data_files.is_empty());
@@ -583,17 +585,14 @@ impl SnapshotTableState {
                     remapped_data_files_after_compaction.get(&old_record_location);
                 // Case-1: The old record still exists, need to remap.
                 if let Some(new_record_location) = new_record_location {
-                    // TODO(hjiang): A quick hack, there's only one compacted data file.
-                    let new_data_file = new_data_files.iter().next().unwrap().0.clone();
-
                     let new_deletion_entry = self
                         .current_snapshot
                         .disk_files
-                        .get_mut(&new_data_file)
+                        .get_mut(&new_record_location.new_data_file)
                         .unwrap();
                     new_deletion_entry
                         .batch_deletion_vector
-                        .delete_row(new_record_location.get_row_idx());
+                        .delete_row(new_record_location.record_location.get_row_idx());
                 }
                 // Case-2: The old record has already been compacted, directly skip.
             }
@@ -614,10 +613,10 @@ impl SnapshotTableState {
     fn update_data_compaction_to_mooncake_snapshot(
         &mut self,
         old_compacted_data_files: HashSet<MooncakeDataFileRef>,
-        new_compacted_data_files: HashMap<MooncakeDataFileRef, CompactedDataEntry>,
+        new_compacted_data_files: Vec<(MooncakeDataFileRef, CompactedDataEntry)>,
         old_compacted_file_indices: HashSet<FileIndex>,
         new_compacted_file_indices: Vec<FileIndex>,
-        remapped_data_files_after_compaction: HashMap<RecordLocation, RecordLocation>,
+        remapped_data_files_after_compaction: HashMap<RecordLocation, RemappedRecordLocation>,
     ) {
         if old_compacted_data_files.is_empty() {
             assert!(new_compacted_data_files.is_empty());
@@ -660,9 +659,14 @@ impl SnapshotTableState {
     }
 
     fn buffer_unpersisted_iceberg_compaction_data(&mut self, task: &SnapshotTask) {
+        let mut new_compacted_data_files = Vec::with_capacity(task.new_compacted_data_files.len());
+        for (new_data_file, _) in task.new_compacted_data_files.iter() {
+            new_compacted_data_files.push(new_data_file.clone());
+        }
+
         self.unpersisted_iceberg_records
             .compacted_data_files_to_add
-            .extend(task.new_compacted_data_files.keys().cloned().to_owned());
+            .extend(new_compacted_data_files);
         self.unpersisted_iceberg_records
             .compacted_data_files_to_remove
             .extend(task.old_compacted_data_files.to_owned());
@@ -687,7 +691,7 @@ impl SnapshotTableState {
         if new_record_location.is_none() {
             return false;
         }
-        deletion_log.pos = new_record_location.unwrap();
+        deletion_log.pos = new_record_location.unwrap().record_location;
         true
     }
 
