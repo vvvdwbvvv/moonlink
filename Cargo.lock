@@ -2146,6 +2146,7 @@ dependencies = [
  "tokio",
  "tokio-bitstream-io",
  "tokio-retry2",
+ "tracing",
  "typed-builder 0.20.1",
  "url",
  "uuid",
@@ -2164,6 +2165,7 @@ dependencies = [
  "thiserror 2.0.12",
  "tokio",
  "tokio-postgres",
+ "tracing-subscriber",
 ]
 
 [[package]]
