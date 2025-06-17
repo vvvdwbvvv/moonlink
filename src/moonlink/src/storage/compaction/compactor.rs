@@ -135,8 +135,6 @@ impl CompactionBuilder {
 
     /// Util function to read the given parquet file, apply the corresponding deletion vector, and write it to the given arrow writer.
     /// Return the data file mapping.
-    ///
-    /// TODO(hjiang): The compacted file won't be closed and will be reused, should set a threshold.
     async fn apply_deletion_vector_and_write(
         &mut self,
         old_data_file: MooncakeDataFileRef,
@@ -281,8 +279,8 @@ impl CompactionBuilder {
         let old_data_files = self
             .compaction_payload
             .disk_files
-            .keys()
-            .cloned()
+            .iter()
+            .map(|(f, _)| f.clone())
             .collect::<HashSet<_>>();
         let old_file_indices = self
             .compaction_payload
