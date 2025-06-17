@@ -4,8 +4,12 @@ version = { workspace = true }
 edition = { workspace = true }
 license = { workspace = true }
 
+[features]
+profiling = []
+
 [dependencies]
 arrow-array.workspace = true
+console-subscriber = { workspace = true }
 moonlink = { path = "../moonlink", features = ["test-utils"] }
 moonlink_connectors = { path = "../moonlink_connectors" }
 parquet = { workspace = true, features = ["arrow"] }
