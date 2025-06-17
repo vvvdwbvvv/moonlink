@@ -220,6 +220,34 @@ async fn check_only_fake_file_in_cache(data_file_cache: &ObjectStorageCache) {
     );
 }
 
+/// Test scenario: when shutdown table, all cache entries should be unpinned.
+#[tokio::test]
+async fn test_shutdown_table() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let cache_config = ObjectStorageCacheConfig::new(
+        INFINITE_LARGE_DATA_FILE_CACHE_SIZE,
+        temp_dir.path().to_str().unwrap().to_string(),
+    );
+    let data_file_cache = ObjectStorageCache::new(cache_config);
+
+    let (mut table, mut table_notify) =
+        prepare_test_disk_file(&temp_dir, data_file_cache.clone()).await;
+    let (_, _, _, files_to_delete) = table
+        .create_mooncake_snapshot_for_test(&mut table_notify)
+        .await;
+    assert!(files_to_delete.is_empty());
+
+    // Shutdown the table, which unreferences all cache handles in the snapshot.
+    table.shutdown().await;
+
+    // Check cache state.
+    assert_eq!(data_file_cache.cache.read().await.evictable_cache.len(), 1);
+    assert_eq!(
+        data_file_cache.cache.read().await.non_evictable_cache.len(),
+        0,
+    );
+}
+
 /// Test scenario: no remote, local, not used + use => no remote, local, in use
 #[tokio::test]
 async fn test_5_read_4() {
@@ -237,7 +265,7 @@ async fn test_5_read_4() {
         .await;
     assert!(files_to_delete.is_empty());
     let snapshot_read_output = table.request_read().await.unwrap();
-    let _read_state = snapshot_read_output.take_as_read_state().await;
+    let read_state = snapshot_read_output.take_as_read_state().await;
 
     // Check data file has been pinned in mooncake table.
     let disk_files = table.get_disk_files_for_snapshot().await;
@@ -266,6 +294,24 @@ async fn test_5_read_4() {
             .get_non_evictable_entry_ref_count(&get_unique_table_file_id(file.file_id()))
             .await,
         2
+    );
+
+    // Drop all read states and check reference count.
+    drop_read_states(vec![read_state], &mut table, &mut table_notify).await;
+    let (_, _, _, files_to_delete) = table
+        .create_mooncake_snapshot_for_test(&mut table_notify)
+        .await;
+    assert!(files_to_delete.is_empty());
+    assert_eq!(data_file_cache.cache.read().await.evictable_cache.len(), 0);
+    assert_eq!(
+        data_file_cache.cache.read().await.non_evictable_cache.len(),
+        1,
+    );
+    assert_eq!(
+        data_file_cache
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(file.file_id()))
+            .await,
+        1
     );
 }
 
@@ -325,7 +371,7 @@ async fn test_4_3() {
 
     // Read and increment reference count.
     let snapshot_read_output = table.request_read().await.unwrap();
-    let _read_state = snapshot_read_output.take_as_read_state().await;
+    let read_state = snapshot_read_output.take_as_read_state().await;
 
     // Create iceberg snapshot and reflect persistence result to mooncake snapshot.
     table
@@ -355,6 +401,18 @@ async fn test_4_3() {
             .get_non_evictable_entry_ref_count(&get_unique_table_file_id(file.file_id()))
             .await,
         1
+    );
+
+    // Drop all read states and check reference count.
+    drop_read_states(vec![read_state], &mut table, &mut table_notify).await;
+    let (_, _, _, files_to_delete) = table
+        .create_mooncake_snapshot_for_test(&mut table_notify)
+        .await;
+    assert!(files_to_delete.is_empty());
+    assert_eq!(data_file_cache.cache.read().await.evictable_cache.len(), 1);
+    assert_eq!(
+        data_file_cache.cache.read().await.non_evictable_cache.len(),
+        0,
     );
 }
 
@@ -573,7 +631,7 @@ async fn test_3_read_and_read_over_and_pinned_3() {
 
     // Read and increment reference count.
     let snapshot_read_output_1 = table.request_read().await.unwrap();
-    let _read_state_1 = snapshot_read_output_1.take_as_read_state().await;
+    let read_state_1 = snapshot_read_output_1.take_as_read_state().await;
 
     // Create iceberg snapshot and reflect persistence result to mooncake snapshot.
     table
@@ -615,6 +673,18 @@ async fn test_3_read_and_read_over_and_pinned_3() {
             .get_non_evictable_entry_ref_count(&get_unique_table_file_id(file.file_id()))
             .await,
         1,
+    );
+
+    // Drop all read states and check reference count.
+    drop_read_states(vec![read_state_1], &mut table, &mut table_notify).await;
+    let (_, _, _, files_to_delete) = table
+        .create_mooncake_snapshot_for_test(&mut table_notify)
+        .await;
+    assert!(files_to_delete.is_empty());
+    assert_eq!(data_file_cache.cache.read().await.evictable_cache.len(), 1);
+    assert_eq!(
+        data_file_cache.cache.read().await.non_evictable_cache.len(),
+        0,
     );
 }
 
