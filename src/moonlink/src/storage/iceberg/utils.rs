@@ -270,6 +270,11 @@ pub(crate) async fn upload_index_file(
     Ok(remote_filepath)
 }
 
+/// Util function to convert the given error to iceberg "unexpected" error.
+pub(crate) fn to_iceberg_error<E: std::fmt::Debug>(err: E) -> IcebergError {
+    IcebergError::new(iceberg::ErrorKind::Unexpected, format!("Error: {:?}", err))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
