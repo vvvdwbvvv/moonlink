@@ -202,11 +202,12 @@ impl DiskSliceWriter {
         let list = self
             .old_index
             .remap_into_vec(&self.batch_id_to_idx, &self.row_offset_mapping);
-
+        let file_id =
+            get_unique_file_id_for_flush(self.table_auto_incr_id as u64, self.files.len() as u64);
         let mut index_builder = GlobalIndexBuilder::new();
         index_builder.set_files(self.files.iter().map(|(file, _)| file.clone()).collect());
         index_builder.set_directory(self.dir_path.clone());
-        self.new_index = Some(index_builder.build_from_flush(list).await);
+        self.new_index = Some(index_builder.build_from_flush(list, file_id).await);
         Ok(())
     }
 

@@ -199,6 +199,7 @@ impl IcebergTableManager {
         &mut self,
         entry: &ManifestEntry,
         file_io: &FileIO,
+        next_file_id: &mut u64,
     ) -> IcebergResult<FileIndicesRecoveryResult> {
         if !utils::is_file_index(entry) {
             return Ok(FileIndicesRecoveryResult {
@@ -216,7 +217,7 @@ impl IcebergTableManager {
             HashMap::with_capacity(self.remote_data_file_to_file_id.len());
         for mut cur_iceberg_file_indice in file_index_blob.file_indices.into_iter() {
             let cur_mooncake_file_indice = cur_iceberg_file_indice
-                .as_mooncake_file_index(&self.remote_data_file_to_file_id)
+                .as_mooncake_file_index(&self.remote_data_file_to_file_id, next_file_id)
                 .await;
             file_indices.push(cur_mooncake_file_indice.clone());
 
@@ -489,7 +490,7 @@ impl IcebergTableManager {
                 )
                 .is_none());
 
-            // Record all imported iceberg data files.
+            // Record all imported iceberg data files, with file id unchanged.
             new_remote_data_files.push(create_data_file(
                 local_data_file.file_id().0,
                 iceberg_data_file.file_path().to_string(),
@@ -569,13 +570,33 @@ impl IcebergTableManager {
         Ok(puffin_deletion_blobs)
     }
 
-    /// Process file indices to import, and return file indices with all local filepaths updated to their remote filepaths.
+    /// Update data file path pointed by file indices, from local filepath to remote, with file id unchanged.
+    ///
+    /// # Arguments:
+    ///
+    /// * local_data_file_to_remote: contains mappings from newly imported data files to remote paths.
+    fn get_updated_file_indices_at_import(
+        old_file_index: &MooncakeFileIndex,
+        local_data_file_to_remote: &HashMap<String, String>,
+    ) -> MooncakeFileIndex {
+        let mut new_file_index = old_file_index.clone();
+        for cur_data_file in new_file_index.files.iter_mut() {
+            let remote_data_file = local_data_file_to_remote
+                .get(cur_data_file.file_path())
+                .unwrap_or(cur_data_file.file_path())
+                .clone();
+            *cur_data_file = create_data_file(cur_data_file.file_id().0, remote_data_file);
+        }
+        new_file_index
+    }
+
+    /// Process file indices to import.
     /// [`local_data_file_to_remote`] should contain all local data filepath to remote data filepath mapping.
     async fn import_file_indices(
         &mut self,
         file_indices_to_import: &[MooncakeFileIndex],
         local_data_file_to_remote: HashMap<String, String>,
-    ) -> IcebergResult<Vec<MooncakeFileIndex>> {
+    ) -> IcebergResult<()> {
         let puffin_filepath = self.get_unique_hash_index_v1_filepath();
         let mut puffin_writer = puffin_utils::create_puffin_writer(
             self.iceberg_table.as_ref().unwrap().file_io(),
@@ -597,11 +618,13 @@ impl IcebergTableManager {
             for cur_index_block in cur_file_index.index_blocks.iter() {
                 let remote_index_block = utils::upload_index_file(
                     self.iceberg_table.as_ref().unwrap(),
-                    &cur_index_block.file_path,
+                    cur_index_block.index_file.file_path(),
                 )
                 .await?;
-                local_index_file_to_remote
-                    .insert(cur_index_block.file_path.clone(), remote_index_block);
+                local_index_file_to_remote.insert(
+                    cur_index_block.index_file.file_path().to_string(),
+                    remote_index_block,
+                );
             }
             self.persisted_file_indices
                 .insert(cur_file_index.clone(), puffin_filepath.clone());
@@ -620,20 +643,15 @@ impl IcebergTableManager {
             .record_puffin_metadata_and_close(puffin_filepath, puffin_writer)
             .await?;
 
-        // Get file indices with remote file paths.
-        let mut remote_file_indices = Vec::with_capacity(file_index_blob.file_indices.len());
-        for mut cur_file_index in file_index_blob.file_indices {
-            let cur_remote_file_index = cur_file_index
-                .as_mooncake_file_index(&self.remote_data_file_to_file_id)
-                .await;
-            remote_file_indices.push(cur_remote_file_index);
-        }
-
-        Ok(remote_file_indices)
+        Ok(())
     }
 
     /// Dump file indices into the iceberg table, only new file indices will be persisted into the table.
     /// Return file index ids which should be added into iceberg table.
+    ///
+    /// # Arguments:
+    ///
+    /// * local_data_file_to_remote: contains mappings from newly imported data files to remote paths.
     ///
     /// TODO(hjiang): Need to configure (1) the number of blobs in a puffin file; and (2) the number of file index in a puffin blob.
     /// For implementation simpicity, put everything in a single file and a single blob.
@@ -647,9 +665,16 @@ impl IcebergTableManager {
             return Ok(vec![]);
         }
 
-        // Process file indices to import.
-        let remote_file_indices = self
-            .import_file_indices(file_indices_to_import, local_data_file_to_remote)
+        // Update local file indices pointing from local data file path to remote one.
+        let remote_file_indices = file_indices_to_import
+            .iter()
+            .map(|old_file_index| {
+                Self::get_updated_file_indices_at_import(old_file_index, &local_data_file_to_remote)
+            })
+            .collect::<Vec<_>>();
+
+        // Import new file indices.
+        self.import_file_indices(file_indices_to_import, local_data_file_to_remote)
             .await?;
 
         // Process file indices to remove.
@@ -786,7 +811,11 @@ impl TableManager for IcebergTableManager {
             }
             for entry in manifest_entries.iter() {
                 let recovered_file_indices = self
-                    .load_file_indices_from_manifest_entry(entry.as_ref(), &file_io)
+                    .load_file_indices_from_manifest_entry(
+                        entry.as_ref(),
+                        &file_io,
+                        &mut next_file_id,
+                    )
                     .await?;
                 loaded_file_indices.extend(recovered_file_indices.file_indices);
                 file_id_to_file_indices.extend(recovered_file_indices.file_id_to_file_indices);
