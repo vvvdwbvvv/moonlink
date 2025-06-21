@@ -89,7 +89,9 @@ impl<T: Eq + Hash> ReplicationManager<T> {
     /// Drop table specified by the given table id.
     /// Precondition: the table has been registered, otherwise panics.
     pub async fn drop_table(&mut self, external_table_id: T) -> Result<()> {
-        let (table_uri, table_id) = self.table_info.get(&external_table_id).unwrap().clone();
+        let Some((table_uri, table_id)) = self.table_info.get(&external_table_id).cloned() else {
+            return Ok(());
+        };
         info!(table_id, %table_uri, "dropping table through manager");
         let repl_conn = self.connections.get_mut(&table_uri).unwrap();
         repl_conn.drop_table(table_id).await?;

@@ -93,9 +93,9 @@ impl<T: Eq + Hash + Clone> MoonlinkBackend<T> {
         Ok(())
     }
 
-    pub async fn drop_table(&self, external_table_id: T) -> Result<()> {
+    pub async fn drop_table(&self, table_id: T) -> Result<()> {
         let mut manager = self.replication_manager.write().await;
-        manager.drop_table(external_table_id).await?;
+        manager.drop_table(table_id).await?;
         Ok(())
     }
 
