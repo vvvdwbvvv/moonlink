@@ -91,17 +91,13 @@ async fn test_1_persist_2() {
 
     let (mut table, mut table_notify) =
         prepare_test_deletion_vector_for_read(&temp_dir, object_storage_cache.clone()).await;
-    table
-        .create_mooncake_and_iceberg_snapshot_for_test(&mut table_notify)
-        .await
-        .unwrap();
-    let (_, _, _, files_to_delete) = table
-        .create_mooncake_snapshot_for_test(&mut table_notify)
-        .await;
+    create_mooncake_and_iceberg_snapshot_for_test(&mut table, &mut table_notify).await;
+    let (_, _, _, files_to_delete) =
+        create_mooncake_snapshot_for_test(&mut table, &mut table_notify).await;
     assert!(files_to_delete.is_empty());
 
     // Check data file has been pinned in mooncake table.
-    let disk_files = table.get_disk_files_for_snapshot().await;
+    let disk_files = get_disk_files_for_snapshot(&table).await;
     assert_eq!(disk_files.len(), 1);
     let (_, disk_file_entry) = disk_files.iter().next().unwrap();
     let puffin_blob_ref = disk_file_entry.puffin_deletion_blob.as_ref().unwrap();
@@ -154,13 +150,9 @@ async fn test_1_recover_2() {
     let (mut table, mut table_notify) =
         prepare_test_deletion_vector_for_read(&temp_dir, ObjectStorageCache::new(cache_config))
             .await;
-    table
-        .create_mooncake_and_iceberg_snapshot_for_test(&mut table_notify)
-        .await
-        .unwrap();
-    let (_, _, _, files_to_delete) = table
-        .create_mooncake_snapshot_for_test(&mut table_notify)
-        .await;
+    create_mooncake_and_iceberg_snapshot_for_test(&mut table, &mut table_notify).await;
+    let (_, _, _, files_to_delete) =
+        create_mooncake_snapshot_for_test(&mut table, &mut table_notify).await;
     assert!(files_to_delete.is_empty());
 
     // Now the disk file and deletion vector has been persist into iceberg.
@@ -232,21 +224,17 @@ async fn test_2_read() {
 
     let (mut table, mut table_notify) =
         prepare_test_deletion_vector_for_read(&temp_dir, object_storage_cache.clone()).await;
-    table
-        .create_mooncake_and_iceberg_snapshot_for_test(&mut table_notify)
-        .await
-        .unwrap();
-    let (_, _, _, files_to_delete) = table
-        .create_mooncake_snapshot_for_test(&mut table_notify)
-        .await;
+    create_mooncake_and_iceberg_snapshot_for_test(&mut table, &mut table_notify).await;
+    let (_, _, _, files_to_delete) =
+        create_mooncake_snapshot_for_test(&mut table, &mut table_notify).await;
     assert!(files_to_delete.is_empty());
 
     // Use by read.
-    let snapshot_read_output = table.request_read().await.unwrap();
+    let snapshot_read_output = perform_read_request_for_test(&mut table).await;
     let read_state = snapshot_read_output.take_as_read_state().await;
 
     // Check data file has been pinned in mooncake table.
-    let disk_files = table.get_disk_files_for_snapshot().await;
+    let disk_files = get_disk_files_for_snapshot(&table).await;
     assert_eq!(disk_files.len(), 1);
     let (_, disk_file_entry) = disk_files.iter().next().unwrap();
     let puffin_blob_ref = disk_file_entry.puffin_deletion_blob.as_ref().unwrap();
@@ -387,17 +375,13 @@ async fn test_2_compact() {
             object_storage_cache.clone(),
         )
         .await;
-    table
-        .create_mooncake_and_iceberg_snapshot_for_test(&mut table_notify)
-        .await
-        .unwrap();
-    let (_, _, data_compaction_payload, files_to_delete) = table
-        .create_mooncake_snapshot_for_test(&mut table_notify)
-        .await;
+    create_mooncake_and_iceberg_snapshot_for_test(&mut table, &mut table_notify).await;
+    let (_, _, data_compaction_payload, files_to_delete) =
+        create_mooncake_snapshot_for_test(&mut table, &mut table_notify).await;
     assert!(files_to_delete.is_empty());
 
     // Get old snapshot disk files.
-    let disk_files = table.get_disk_files_for_snapshot().await;
+    let disk_files = get_disk_files_for_snapshot(&table).await;
     assert_eq!(disk_files.len(), 2);
     let mut old_compacted_puffin_file_ids = vec![];
     let mut old_compacted_puffin_files = vec![];
@@ -421,7 +405,7 @@ async fn test_2_compact() {
         );
     }
     assert_eq!(old_compacted_puffin_files.len(), 2);
-    let old_compacted_index_block_files = table.get_index_block_files().await;
+    let old_compacted_index_block_files = get_index_block_filepaths(&table).await;
     assert_eq!(old_compacted_index_block_files.len(), 2);
 
     // Check cache state.
@@ -466,9 +450,12 @@ async fn test_2_compact() {
     );
 
     // Use by compaction.
-    let evicted_files = table
-        .perform_data_compaction_for_test(&mut table_notify, data_compaction_payload.unwrap())
-        .await;
+    let evicted_files = perform_data_compaction_for_test(
+        &mut table,
+        &mut table_notify,
+        data_compaction_payload.unwrap(),
+    )
+    .await;
     // Include both two data files and their puffin files, index blocks.
     assert_eq!(evicted_files.len(), 6);
     assert!(evicted_files.contains(&old_compacted_puffin_files[0]));
@@ -477,7 +464,7 @@ async fn test_2_compact() {
     assert!(evicted_files.contains(&old_compacted_index_block_files[1]));
 
     // Check data file has been pinned in mooncake table.
-    let disk_files = table.get_disk_files_for_snapshot().await;
+    let disk_files = get_disk_files_for_snapshot(&table).await;
     assert!(disk_files.is_empty());
 
     // Check cache state.

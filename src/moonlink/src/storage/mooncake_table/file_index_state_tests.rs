@@ -89,13 +89,9 @@ async fn test_1_recover_3() {
 
     let (mut table, mut table_notify) =
         prepare_test_disk_file(&temp_dir, ObjectStorageCache::new(cache_config)).await;
-    table
-        .create_mooncake_and_iceberg_snapshot_for_test(&mut table_notify)
-        .await
-        .unwrap();
-    let (_, _, _, files_to_delete) = table
-        .create_mooncake_snapshot_for_test(&mut table_notify)
-        .await;
+    create_mooncake_and_iceberg_snapshot_for_test(&mut table, &mut table_notify).await;
+    let (_, _, _, files_to_delete) =
+        create_mooncake_snapshot_for_test(&mut table, &mut table_notify).await;
     assert!(files_to_delete.is_empty());
 
     // Now the disk file and deletion vector has been persist into iceberg.
@@ -265,34 +261,26 @@ async fn test_3_index_merge() {
 
     let (mut table, mut table_notify) =
         prepare_test_disk_files_for_index_merge(&temp_dir, object_storage_cache.clone()).await;
-    table
-        .create_mooncake_and_iceberg_snapshot_for_test(&mut table_notify)
-        .await
-        .unwrap();
-    let (_, index_merge_payload, _, files_to_delete) = table
-        .create_mooncake_snapshot_for_test(&mut table_notify)
-        .await;
-
-    println!("===iceberg finished====");
-
+    create_mooncake_and_iceberg_snapshot_for_test(&mut table, &mut table_notify).await;
+    let (_, index_merge_payload, _, files_to_delete) =
+        create_mooncake_snapshot_for_test(&mut table, &mut table_notify).await;
     assert!(files_to_delete.is_empty());
     let index_merge_payload = index_merge_payload.unwrap();
 
     // Get data files and old merged index block files.
-    let disk_files = table.get_disk_files_for_snapshot().await;
+    let disk_files = get_disk_files_for_snapshot(&table).await;
     assert_eq!(disk_files.len(), 2);
-    let mut old_compacted_index_block_files = table.get_index_block_files().await;
+    let mut old_compacted_index_block_files = get_index_block_filepaths(&table).await;
     assert_eq!(old_compacted_index_block_files.len(), 2);
     old_compacted_index_block_files.sort();
 
     // Perform index merge and sync.
-    let mut evicted_files_to_delete = table
-        .perform_index_merge_for_test(&mut table_notify, index_merge_payload)
-        .await;
+    let mut evicted_files_to_delete =
+        perform_index_merge_for_test(&mut table, &mut table_notify, index_merge_payload).await;
     evicted_files_to_delete.sort();
     assert_eq!(old_compacted_index_block_files, evicted_files_to_delete);
 
-    let merged_file_indices = table.get_index_block_files().await;
+    let merged_file_indices = get_index_block_filepaths(&table).await;
     assert_eq!(merged_file_indices.len(), 1);
 
     // Check cache state.

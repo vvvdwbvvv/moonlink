@@ -31,6 +31,7 @@ use crate::storage::iceberg::test_utils::{
     load_arrow_batch, validate_recovered_snapshot,
 };
 use crate::storage::index::{FileIndex, MooncakeIndex};
+use crate::storage::mooncake_table::state_test_utils::*;
 use crate::storage::mooncake_table::Snapshot;
 use crate::storage::storage_utils::{
     FileId, MooncakeDataFileRef, ProcessedDeletionRecord, RawDeletionRecord, RecordLocation,
@@ -275,14 +276,13 @@ async fn test_compaction_1_1_1() {
     let _ = prepare_committed_and_flushed_data_files(&mut table).await;
 
     // Perform mooncake and iceberg snapshot, and data compaction.
-    table
-        .create_mooncake_and_iceberg_snapshot_for_data_compaction_for_test(
-            &mut receiver,
-            /*injected_committed_deletion_rows=*/ vec![],
-            /*injected_uncommitted_deletion_rows=*/ vec![],
-        )
-        .await
-        .unwrap();
+    create_mooncake_and_iceberg_snapshot_for_data_compaction_for_test(
+        &mut table,
+        &mut receiver,
+        /*injected_committed_deletion_rows=*/ vec![],
+        /*injected_uncommitted_deletion_rows=*/ vec![],
+    )
+    .await;
 
     // Check iceberg snapshot status.
     let (next_file_id, snapshot) = iceberg_table_manager_to_load
@@ -302,7 +302,7 @@ async fn test_compaction_1_1_1() {
     .await;
 
     // Check disk files for the current mooncake snapshot.
-    let disk_files = table.get_disk_files_for_snapshot().await;
+    let disk_files = get_disk_files_for_snapshot(&table).await;
     assert_eq!(disk_files.len(), 1);
     let (_, disk_file_entry) = disk_files.iter().next().unwrap();
     assert!(disk_file_entry.puffin_deletion_blob.is_none());
@@ -310,7 +310,7 @@ async fn test_compaction_1_1_1() {
 
     // Check deletion log for the current mooncake snapshot.
     let (committed_deletion_log, uncommitted_deletion_log) =
-        table.get_deletion_logs_for_snapshot().await;
+        get_deletion_logs_for_snapshot(&table).await;
     assert!(committed_deletion_log.is_empty());
     assert!(uncommitted_deletion_log.is_empty());
 }
@@ -333,14 +333,13 @@ async fn test_compaction_1_1_2() {
     let injected_uncommitted_deletion_rows = vec![
         (rows[3].clone(), /*lsn=*/ 7), // Belong to the second data file.
     ];
-    table
-        .create_mooncake_and_iceberg_snapshot_for_data_compaction_for_test(
-            &mut receiver,
-            injected_committed_deletion_rows,
-            injected_uncommitted_deletion_rows,
-        )
-        .await
-        .unwrap();
+    create_mooncake_and_iceberg_snapshot_for_data_compaction_for_test(
+        &mut table,
+        &mut receiver,
+        injected_committed_deletion_rows,
+        injected_uncommitted_deletion_rows,
+    )
+    .await;
 
     // Check iceberg snapshot status.
     let (next_file_id, snapshot) = iceberg_table_manager_to_load
@@ -360,7 +359,7 @@ async fn test_compaction_1_1_2() {
     .await;
 
     // Check disk files for the current mooncake snapshot.
-    let disk_files = table.get_disk_files_for_snapshot().await;
+    let disk_files = get_disk_files_for_snapshot(&table).await;
     assert_eq!(disk_files.len(), 1);
     let (compacted_data_file, disk_file_entry) = disk_files.iter().next().unwrap();
     assert!(disk_file_entry.puffin_deletion_blob.is_none());
@@ -373,7 +372,7 @@ async fn test_compaction_1_1_2() {
 
     // Check deletion log for the current mooncake snapshot.
     let (committed_deletion_log, uncommitted_deletion_log) =
-        table.get_deletion_logs_for_snapshot().await;
+        get_deletion_logs_for_snapshot(&table).await;
 
     // Check committed deletion logs.
     assert_eq!(committed_deletion_log.len(), 1);
@@ -411,15 +410,13 @@ async fn test_compaction_1_2_1() {
     // Delete one row and commit.
     table.delete(rows[0].clone(), /*lsn=*/ 2).await;
     table.commit(/*lsn=*/ 3);
-
-    table
-        .create_mooncake_and_iceberg_snapshot_for_data_compaction_for_test(
-            &mut receiver,
-            /*injected_committed_deletion_rows=*/ vec![],
-            /*injected_uncommitted_deletion_rows=*/ vec![],
-        )
-        .await
-        .unwrap();
+    create_mooncake_and_iceberg_snapshot_for_data_compaction_for_test(
+        &mut table,
+        &mut receiver,
+        /*injected_committed_deletion_rows=*/ vec![],
+        /*injected_uncommitted_deletion_rows=*/ vec![],
+    )
+    .await;
 
     // Check iceberg snapshot status.
     let (next_file_id, snapshot) = iceberg_table_manager_to_load
@@ -439,7 +436,7 @@ async fn test_compaction_1_2_1() {
     .await;
 
     // Check disk files for the current mooncake snapshot.
-    let disk_files = table.get_disk_files_for_snapshot().await;
+    let disk_files = get_disk_files_for_snapshot(&table).await;
     assert_eq!(disk_files.len(), 1);
     let (compacted_data_file, disk_file_entry) = disk_files.iter().next().unwrap();
     assert!(disk_file_entry.puffin_deletion_blob.is_none());
@@ -452,7 +449,7 @@ async fn test_compaction_1_2_1() {
 
     // Check deletion log for the current mooncake snapshot.
     let (committed_deletion_log, uncommitted_deletion_log) =
-        table.get_deletion_logs_for_snapshot().await;
+        get_deletion_logs_for_snapshot(&table).await;
 
     // Check committed deletion logs.
     assert_eq!(committed_deletion_log.len(), 1);
@@ -490,14 +487,13 @@ async fn test_compaction_1_2_2() {
     let injected_uncommitted_deletion_rows = vec![
         (rows[3].clone(), /*lsn=*/ 7), // Belong to the second data file.
     ];
-    table
-        .create_mooncake_and_iceberg_snapshot_for_data_compaction_for_test(
-            &mut receiver,
-            injected_committed_deletion_rows,
-            injected_uncommitted_deletion_rows,
-        )
-        .await
-        .unwrap();
+    create_mooncake_and_iceberg_snapshot_for_data_compaction_for_test(
+        &mut table,
+        &mut receiver,
+        injected_committed_deletion_rows,
+        injected_uncommitted_deletion_rows,
+    )
+    .await;
 
     // Check iceberg snapshot status.
     let (next_file_id, snapshot) = iceberg_table_manager_to_load
@@ -517,7 +513,7 @@ async fn test_compaction_1_2_2() {
     .await;
 
     // Check disk files for the current mooncake snapshot.
-    let disk_files = table.get_disk_files_for_snapshot().await;
+    let disk_files = get_disk_files_for_snapshot(&table).await;
     assert_eq!(disk_files.len(), 1);
     let (compacted_data_file, disk_file_entry) = disk_files.iter().next().unwrap();
     assert!(disk_file_entry.puffin_deletion_blob.is_none());
@@ -530,7 +526,7 @@ async fn test_compaction_1_2_2() {
 
     // Check deletion log for the current mooncake snapshot.
     let (committed_deletion_log, uncommitted_deletion_log) =
-        table.get_deletion_logs_for_snapshot().await;
+        get_deletion_logs_for_snapshot(&table).await;
 
     // Check committed deletion logs.
     assert_eq!(committed_deletion_log.len(), 2);
@@ -580,14 +576,13 @@ async fn test_compaction_2_2_1() {
     table.commit(/*lsn=*/ 5);
 
     // Perform mooncake and iceberg snapshot, and data compaction.
-    table
-        .create_mooncake_and_iceberg_snapshot_for_data_compaction_for_test(
-            &mut receiver,
-            /*injected_committed_deletion_rows=*/ vec![],
-            /*injected_uncommitted_deletion_rows=*/ vec![],
-        )
-        .await
-        .unwrap();
+    create_mooncake_and_iceberg_snapshot_for_data_compaction_for_test(
+        &mut table,
+        &mut receiver,
+        /*injected_committed_deletion_rows=*/ vec![],
+        /*injected_uncommitted_deletion_rows=*/ vec![],
+    )
+    .await;
 
     // Check iceberg snapshot status.
     let (next_file_id, snapshot) = iceberg_table_manager_to_load
@@ -607,7 +602,7 @@ async fn test_compaction_2_2_1() {
     .await;
 
     // Check disk files for the current mooncake snapshot.
-    let disk_files = table.get_disk_files_for_snapshot().await;
+    let disk_files = get_disk_files_for_snapshot(&table).await;
     assert_eq!(disk_files.len(), 1);
     let (compacted_data_file, disk_file_entry) = disk_files.iter().next().unwrap();
     assert!(disk_file_entry.puffin_deletion_blob.is_none());
@@ -620,7 +615,7 @@ async fn test_compaction_2_2_1() {
 
     // Check deletion log for the current mooncake snapshot.
     let (committed_deletion_log, uncommitted_deletion_log) =
-        table.get_deletion_logs_for_snapshot().await;
+        get_deletion_logs_for_snapshot(&table).await;
     assert!(uncommitted_deletion_log.is_empty());
 
     assert_eq!(committed_deletion_log.len(), 1);
@@ -659,14 +654,13 @@ async fn test_compaction_2_2_2() {
     let injected_uncommitted_deletion_rows = vec![
         (rows[3].clone(), /*lsn=*/ 7), // Belong to the second data file.
     ];
-    table
-        .create_mooncake_and_iceberg_snapshot_for_data_compaction_for_test(
-            &mut receiver,
-            injected_committed_deletion_rows,
-            injected_uncommitted_deletion_rows,
-        )
-        .await
-        .unwrap();
+    create_mooncake_and_iceberg_snapshot_for_data_compaction_for_test(
+        &mut table,
+        &mut receiver,
+        injected_committed_deletion_rows,
+        injected_uncommitted_deletion_rows,
+    )
+    .await;
 
     // Check iceberg snapshot status.
     let (next_file_id, snapshot) = iceberg_table_manager_to_load
@@ -686,7 +680,7 @@ async fn test_compaction_2_2_2() {
     .await;
 
     // Check disk files for the current mooncake snapshot.
-    let disk_files = table.get_disk_files_for_snapshot().await;
+    let disk_files = get_disk_files_for_snapshot(&table).await;
     assert_eq!(disk_files.len(), 1);
     let (compacted_data_file, disk_file_entry) = disk_files.iter().next().unwrap();
     assert!(disk_file_entry.puffin_deletion_blob.is_none());
@@ -700,7 +694,7 @@ async fn test_compaction_2_2_2() {
 
     // Check deletion log for the current mooncake snapshot.
     let (committed_deletion_log, uncommitted_deletion_log) =
-        table.get_deletion_logs_for_snapshot().await;
+        get_deletion_logs_for_snapshot(&table).await;
 
     // Check committed deletion logs.
     assert_eq!(committed_deletion_log.len(), 2);
@@ -751,14 +745,13 @@ async fn test_compaction_2_3_1() {
     table.flush(/*lsn=*/ 5).await.unwrap();
 
     // Perform mooncake and iceberg snapshot, and data compaction.
-    table
-        .create_mooncake_and_iceberg_snapshot_for_data_compaction_for_test(
-            &mut receiver,
-            /*injected_committed_deletion_rows=*/ vec![],
-            /*injected_uncommitted_deletion_rows=*/ vec![],
-        )
-        .await
-        .unwrap();
+    create_mooncake_and_iceberg_snapshot_for_data_compaction_for_test(
+        &mut table,
+        &mut receiver,
+        /*injected_committed_deletion_rows=*/ vec![],
+        /*injected_uncommitted_deletion_rows=*/ vec![],
+    )
+    .await;
 
     // Check iceberg snapshot status.
     let (next_file_id, snapshot) = iceberg_table_manager_to_load
@@ -778,7 +771,7 @@ async fn test_compaction_2_3_1() {
     .await;
 
     // Check disk files for the current mooncake snapshot.
-    let disk_files = table.get_disk_files_for_snapshot().await;
+    let disk_files = get_disk_files_for_snapshot(&table).await;
     assert_eq!(disk_files.len(), 1);
     let (_, disk_file_entry) = disk_files.iter().next().unwrap();
     assert!(disk_file_entry.puffin_deletion_blob.is_none());
@@ -786,7 +779,7 @@ async fn test_compaction_2_3_1() {
 
     // Check deletion log for current snapshot.
     let (committed_deletion_log, uncommitted_deletion_log) =
-        table.get_deletion_logs_for_snapshot().await;
+        get_deletion_logs_for_snapshot(&table).await;
     assert!(committed_deletion_log.is_empty());
     assert!(uncommitted_deletion_log.is_empty());
 }
@@ -818,14 +811,13 @@ async fn test_compaction_2_3_2() {
     let injected_uncommitted_deletion_rows = vec![
         (rows[3].clone(), /*lsn=*/ 7), // Belong to the second data file.
     ];
-    table
-        .create_mooncake_and_iceberg_snapshot_for_data_compaction_for_test(
-            &mut receiver,
-            injected_committed_deletion_rows,
-            injected_uncommitted_deletion_rows,
-        )
-        .await
-        .unwrap();
+    create_mooncake_and_iceberg_snapshot_for_data_compaction_for_test(
+        &mut table,
+        &mut receiver,
+        injected_committed_deletion_rows,
+        injected_uncommitted_deletion_rows,
+    )
+    .await;
 
     // Check iceberg snapshot status.
     let (next_file_id, snapshot) = iceberg_table_manager_to_load
@@ -845,7 +837,7 @@ async fn test_compaction_2_3_2() {
     .await;
 
     // Check disk files for the current mooncake snapshot.
-    let disk_files = table.get_disk_files_for_snapshot().await;
+    let disk_files = get_disk_files_for_snapshot(&table).await;
     assert_eq!(disk_files.len(), 1);
     let (compacted_data_file, disk_file_entry) = disk_files.iter().next().unwrap();
     assert!(disk_file_entry.puffin_deletion_blob.is_none());
@@ -867,7 +859,7 @@ async fn test_compaction_2_3_2() {
 
     // Check comitted deletion logs.
     let (committed_deletion_log, uncommitted_deletion_log) =
-        table.get_deletion_logs_for_snapshot().await;
+        get_deletion_logs_for_snapshot(&table).await;
 
     assert_eq!(committed_deletion_log.len(), 1);
     let (file_id_1, row_idx_1) = parse_processed_deletion_log(&committed_deletion_log[0]);
@@ -913,14 +905,13 @@ async fn test_compaction_3_2_1() {
     table.commit(/*lsn=*/ 9);
 
     // Perform mooncake and iceberg snapshot, and data compaction.
-    table
-        .create_mooncake_and_iceberg_snapshot_for_data_compaction_for_test(
-            &mut receiver,
-            /*injected_committed_deletion_rows=*/ vec![],
-            /*injected_uncommitted_deletion_rows=*/ vec![],
-        )
-        .await
-        .unwrap();
+    create_mooncake_and_iceberg_snapshot_for_data_compaction_for_test(
+        &mut table,
+        &mut receiver,
+        /*injected_committed_deletion_rows=*/ vec![],
+        /*injected_uncommitted_deletion_rows=*/ vec![],
+    )
+    .await;
 
     // Check iceberg snapshot status.
     let (next_file_id, snapshot) = iceberg_table_manager_to_load
@@ -940,7 +931,7 @@ async fn test_compaction_3_2_1() {
     .await;
 
     // Check disk files for the current mooncake snapshot.
-    let disk_files = table.get_disk_files_for_snapshot().await;
+    let disk_files = get_disk_files_for_snapshot(&table).await;
     assert_eq!(disk_files.len(), 1);
     let (compacted_data_file, disk_file_entry) = disk_files.iter().next().unwrap();
     assert!(disk_file_entry.puffin_deletion_blob.is_none());
@@ -949,7 +940,7 @@ async fn test_compaction_3_2_1() {
 
     // Check deletion log for the current mooncake snapshot.
     let (committed_deletion_log, uncommitted_deletion_log) =
-        table.get_deletion_logs_for_snapshot().await;
+        get_deletion_logs_for_snapshot(&table).await;
     assert!(uncommitted_deletion_log.is_empty());
 
     assert_eq!(committed_deletion_log.len(), 4);
@@ -994,14 +985,13 @@ async fn test_compaction_3_3_1() {
     table.flush(/*lsn=*/ 7).await.unwrap();
 
     // Perform mooncake and iceberg snapshot, and data compaction.
-    table
-        .create_mooncake_and_iceberg_snapshot_for_data_compaction_for_test(
-            &mut receiver,
-            /*injected_committed_deletion_rows=*/ vec![],
-            /*injected_uncommitted_deletion_rows=*/ vec![],
-        )
-        .await
-        .unwrap();
+    create_mooncake_and_iceberg_snapshot_for_data_compaction_for_test(
+        &mut table,
+        &mut receiver,
+        /*injected_committed_deletion_rows=*/ vec![],
+        /*injected_uncommitted_deletion_rows=*/ vec![],
+    )
+    .await;
 
     // Check iceberg snapshot status.
     let (next_file_id, snapshot) = iceberg_table_manager_to_load
@@ -1021,12 +1011,12 @@ async fn test_compaction_3_3_1() {
     .await;
 
     // Check disk files for the current mooncake snapshot.
-    let disk_files = table.get_disk_files_for_snapshot().await;
+    let disk_files = get_disk_files_for_snapshot(&table).await;
     assert!(disk_files.is_empty());
 
     // Check deletion log for the current mooncake snapshot.
     let (committed_deletion_log, uncommitted_deletion_log) =
-        table.get_deletion_logs_for_snapshot().await;
+        get_deletion_logs_for_snapshot(&table).await;
     assert!(committed_deletion_log.is_empty());
     assert!(uncommitted_deletion_log.is_empty());
 }
