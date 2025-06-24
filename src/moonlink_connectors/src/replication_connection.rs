@@ -10,6 +10,7 @@ use moonlink::{IcebergTableEventManager, ObjectStorageCache, ReadStateManager};
 use std::sync::Arc;
 use tokio::pin;
 use tokio::time::Duration;
+use tokio_postgres::error::SqlState;
 use tokio_postgres::types::PgLsn;
 
 use crate::pg_replicate::replication_state::ReplicationState;
@@ -53,6 +54,8 @@ pub struct ReplicationConnection {
     slot_name: String,
     /// Object storage cache.
     object_storage_cache: ObjectStorageCache,
+    /// Background retry handles for drop operations.
+    retry_handles: Vec<JoinHandle<Result<()>>>,
 }
 
 impl ReplicationConnection {
@@ -120,6 +123,7 @@ impl ReplicationConnection {
             replication_started: false,
             slot_name,
             object_storage_cache,
+            retry_handles: Vec::new(),
         })
     }
 
@@ -156,22 +160,66 @@ impl ReplicationConnection {
         Ok(())
     }
 
-    async fn remove_table_from_publication(&self, table_name: &str) -> Result<()> {
+    fn retry_drop(uri: &str, drop_query: &str) -> JoinHandle<Result<()>> {
+        debug!("spawning retry drop");
+        let uri = uri.to_string();
+        let drop_query = drop_query.to_string();
+        tokio::spawn(async move {
+            let (drop_client, _) = connect(&uri, NoTls)
+                .await
+                .map_err(PostgresSourceError::from)?;
+            drop_client
+                .simple_query(&drop_query)
+                .await
+                .map_err(PostgresSourceError::from)?;
+            Ok(())
+        })
+    }
+
+    /// Clean up completed retry handles.
+    fn cleanup_completed_retries(&mut self) {
+        debug!("cleaning up completed retry handles");
+        self.retry_handles.retain(|handle| !handle.is_finished());
+    }
+
+    async fn attempt_drop_else_retry(&mut self, drop_query: &str) -> Result<()> {
+        // Clean up any completed retry handles first
+        self.cleanup_completed_retries();
+
+        let timed_drop_query = format!("SET LOCAL lock_timeout = '100ms'; {}", drop_query);
+
         self.postgres_client
-            .simple_query(&format!(
-                "ALTER PUBLICATION moonlink_pub DROP TABLE {};",
-                table_name
-            ))
+            .simple_query(&timed_drop_query)
             .await
-            .unwrap();
+            .or_else(|e| match e.code() {
+                Some(&SqlState::LOCK_NOT_AVAILABLE) => {
+                    warn!("lock not available, retrying");
+                    // Store the handle so we can track its completion
+                    let handle = Self::retry_drop(&self.uri, drop_query);
+                    self.retry_handles.push(handle);
+                    Ok(vec![])
+                }
+                Some(&SqlState::UNDEFINED_TABLE) => {
+                    warn!("table already dropped, skipping");
+                    Ok(vec![])
+                }
+                _ => Err(PostgresSourceError::from(e)),
+            })?;
         Ok(())
     }
 
-    pub async fn drop_publication(&self) -> Result<()> {
-        self.postgres_client
-            .simple_query("DROP PUBLICATION IF EXISTS moonlink_pub;")
-            .await
-            .map_err(PostgresSourceError::from)?;
+    async fn remove_table_from_publication(&mut self, table_name: &str) -> Result<()> {
+        self.attempt_drop_else_retry(&format!(
+            "ALTER PUBLICATION moonlink_pub DROP TABLE {};",
+            table_name
+        ))
+        .await?;
+        Ok(())
+    }
+
+    pub async fn drop_publication(&mut self) -> Result<()> {
+        self.attempt_drop_else_retry("DROP PUBLICATION IF EXISTS moonlink_pub;")
+            .await?;
         Ok(())
     }
 
@@ -353,23 +401,42 @@ impl ReplicationConnection {
         self.uri == uri
     }
 
-    pub async fn shutdown(&mut self) -> Result<()> {
-        info!("shutting down replication connection");
-        if self.replication_started {
-            if let Err(e) = self.cmd_tx.send(Command::Shutdown).await {
-                warn!(error = ?e, "failed to send shutdown command");
-            }
-            if let Some(handle) = self.handle.take() {
+    /// Wait for all pending retry operations to complete.
+    async fn wait_for_pending_retries(&mut self) {
+        if !self.retry_handles.is_empty() {
+            info!(
+                "waiting for {} pending retry operations",
+                self.retry_handles.len()
+            );
+            let handles = std::mem::take(&mut self.retry_handles);
+            for handle in handles {
                 let _ = handle.await;
             }
-            self.replication_started = false;
         }
+    }
 
-        self.drop_publication().await?;
-        self.drop_replication_slot().await?;
+    pub fn shutdown(mut self) -> JoinHandle<Result<()>> {
+        tokio::spawn(async move {
+            info!("shutting down replication connection");
+            if self.replication_started {
+                if let Err(e) = self.cmd_tx.send(Command::Shutdown).await {
+                    warn!(error = ?e, "failed to send shutdown command");
+                }
+                if let Some(handle) = self.handle.take() {
+                    let _ = handle.await;
+                }
+                self.replication_started = false;
+            }
 
-        info!("replication connection shut down");
-        Ok(())
+            self.drop_publication().await?;
+            self.drop_replication_slot().await?;
+
+            // Wait for any pending retry operations to complete
+            self.wait_for_pending_retries().await;
+
+            info!("replication connection shut down");
+            Ok(())
+        })
     }
 }
 
