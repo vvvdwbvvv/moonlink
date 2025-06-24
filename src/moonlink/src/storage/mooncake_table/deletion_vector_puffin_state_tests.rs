@@ -2,6 +2,7 @@ use tempfile::TempDir;
 use tokio::sync::mpsc::Receiver;
 
 use crate::row::{MoonlinkRow, RowValue};
+use crate::storage::cache::object_storage::test_utils::*;
 /// Possible states:
 /// (1) No deletion vector
 /// (2) Deletion vector referenced, not requested to delete
@@ -88,7 +89,7 @@ async fn test_1_persist_2() {
         temp_dir.path().to_str().unwrap().to_string(),
         /*optimize_local_filesystem=*/ false,
     );
-    let object_storage_cache = ObjectStorageCache::new(cache_config);
+    let mut object_storage_cache = ObjectStorageCache::new(cache_config);
 
     let (mut table, mut table_notify) =
         prepare_test_deletion_vector_for_read(&temp_dir, object_storage_cache.clone()).await;
@@ -104,33 +105,9 @@ async fn test_1_persist_2() {
     let puffin_blob_ref = disk_file_entry.puffin_deletion_blob.as_ref().unwrap();
 
     // Check cache state.
-    assert_eq!(
-        object_storage_cache
-            .cache
-            .read()
-            .await
-            .evicted_entries
-            .len(),
-        0,
-    );
-    assert_eq!(
-        object_storage_cache
-            .cache
-            .read()
-            .await
-            .evictable_cache
-            .len(),
-        1, // Data file.
-    );
-    assert_eq!(
-        object_storage_cache
-            .cache
-            .read()
-            .await
-            .non_evictable_cache
-            .len(),
-        2, // Puffin file and index block.
-    );
+    assert_pending_eviction_entries_size(&mut object_storage_cache, /*expected_count=*/ 0).await;
+    assert_evictable_cache_size(&mut object_storage_cache, /*expected_count=*/ 1).await; // Data file.
+    assert_non_evictable_cache_size(&mut object_storage_cache, /*expected_count=*/ 2).await; // Puffin file and index block.
     assert_eq!(
         object_storage_cache
             .get_non_evictable_entry_ref_count(&puffin_blob_ref.puffin_file_cache_handle.file_id)
@@ -158,7 +135,7 @@ async fn test_1_recover_2() {
     assert!(files_to_delete.is_empty());
 
     // Now the disk file and deletion vector has been persist into iceberg.
-    let object_storage_cache_for_recovery = ObjectStorageCache::default_for_test(&temp_dir);
+    let mut object_storage_cache_for_recovery = ObjectStorageCache::default_for_test(&temp_dir);
     let mut iceberg_table_manager_to_recover = IcebergTableManager::new(
         table.metadata.clone(),
         object_storage_cache_for_recovery.clone(),
@@ -178,33 +155,21 @@ async fn test_1_recover_2() {
     let puffin_blob_ref = disk_file_entry.puffin_deletion_blob.as_ref().unwrap();
 
     // Check cache state.
-    assert_eq!(
-        object_storage_cache_for_recovery
-            .cache
-            .read()
-            .await
-            .evicted_entries
-            .len(),
-        0,
-    );
-    assert_eq!(
-        object_storage_cache_for_recovery
-            .cache
-            .read()
-            .await
-            .evictable_cache
-            .len(),
-        0,
-    );
-    assert_eq!(
-        object_storage_cache_for_recovery
-            .cache
-            .read()
-            .await
-            .non_evictable_cache
-            .len(),
-        2, // Puffin file and index block.
-    );
+    assert_pending_eviction_entries_size(
+        &mut object_storage_cache_for_recovery,
+        /*expected_count=*/ 0,
+    )
+    .await;
+    assert_evictable_cache_size(
+        &mut object_storage_cache_for_recovery,
+        /*expected_count=*/ 0,
+    )
+    .await;
+    assert_non_evictable_cache_size(
+        &mut object_storage_cache_for_recovery,
+        /*expected_count=*/ 2,
+    )
+    .await; // Puffin file and index block.
     assert_eq!(
         object_storage_cache_for_recovery
             .get_non_evictable_entry_ref_count(&puffin_blob_ref.puffin_file_cache_handle.file_id)
@@ -223,7 +188,7 @@ async fn test_2_read() {
         temp_dir.path().to_str().unwrap().to_string(),
         /*optimize_local_filesystem=*/ false,
     );
-    let object_storage_cache = ObjectStorageCache::new(cache_config);
+    let mut object_storage_cache = ObjectStorageCache::new(cache_config);
 
     let (mut table, mut table_notify) =
         prepare_test_deletion_vector_for_read(&temp_dir, object_storage_cache.clone()).await;
@@ -243,24 +208,9 @@ async fn test_2_read() {
     let puffin_blob_ref = disk_file_entry.puffin_deletion_blob.as_ref().unwrap();
 
     // Check cache state.
-    assert_eq!(
-        object_storage_cache
-            .cache
-            .read()
-            .await
-            .evictable_cache
-            .len(),
-        0,
-    );
-    assert_eq!(
-        object_storage_cache
-            .cache
-            .read()
-            .await
-            .non_evictable_cache
-            .len(),
-        3, // Puffin file, data file, and index block.
-    );
+    assert_pending_eviction_entries_size(&mut object_storage_cache, /*expected_count=*/ 0).await;
+    assert_evictable_cache_size(&mut object_storage_cache, /*expected_count=*/ 0).await;
+    assert_non_evictable_cache_size(&mut object_storage_cache, /*expected_count=*/ 3).await; // Puffin file, data file, and index block.
     assert_eq!(
         object_storage_cache
             .get_non_evictable_entry_ref_count(&puffin_blob_ref.puffin_file_cache_handle.file_id)
@@ -276,33 +226,9 @@ async fn test_2_read() {
     )
     .await;
     assert!(files_to_delete.is_empty());
-    assert_eq!(
-        object_storage_cache
-            .cache
-            .read()
-            .await
-            .evicted_entries
-            .len(),
-        0,
-    );
-    assert_eq!(
-        object_storage_cache
-            .cache
-            .read()
-            .await
-            .evictable_cache
-            .len(),
-        1, // data file
-    );
-    assert_eq!(
-        object_storage_cache
-            .cache
-            .read()
-            .await
-            .non_evictable_cache
-            .len(),
-        2, // puffin file and index block.
-    );
+    assert_pending_eviction_entries_size(&mut object_storage_cache, /*expected_count=*/ 0).await;
+    assert_evictable_cache_size(&mut object_storage_cache, /*expected_count=*/ 1).await; // data file
+    assert_non_evictable_cache_size(&mut object_storage_cache, /*expected_count=*/ 2).await; // puffin file and index block.
     assert_eq!(
         object_storage_cache
             .get_non_evictable_entry_ref_count(&puffin_blob_ref.puffin_file_cache_handle.file_id)
@@ -371,7 +297,7 @@ async fn test_2_compact() {
         temp_dir.path().to_str().unwrap().to_string(),
         /*optimize_local_filesystem=*/ false,
     );
-    let object_storage_cache = ObjectStorageCache::new(cache_config);
+    let mut object_storage_cache = ObjectStorageCache::new(cache_config);
 
     let (mut table, mut table_notify) =
         prepare_test_disk_files_with_deletion_vector_for_compaction(
@@ -413,33 +339,9 @@ async fn test_2_compact() {
     assert_eq!(old_compacted_index_block_files.len(), 2);
 
     // Check cache state.
-    assert_eq!(
-        object_storage_cache
-            .cache
-            .read()
-            .await
-            .evicted_entries
-            .len(),
-        0,
-    );
-    assert_eq!(
-        object_storage_cache
-            .cache
-            .read()
-            .await
-            .evictable_cache
-            .len(),
-        2, // Data files.
-    );
-    assert_eq!(
-        object_storage_cache
-            .cache
-            .read()
-            .await
-            .non_evictable_cache
-            .len(),
-        4, // Puffin files and index blocks.
-    );
+    assert_pending_eviction_entries_size(&mut object_storage_cache, /*expected_count=*/ 0).await;
+    assert_evictable_cache_size(&mut object_storage_cache, /*expected_count=*/ 2).await; // data files
+    assert_non_evictable_cache_size(&mut object_storage_cache, /*expected_count=*/ 4).await; // Puffin files and index blocks.
     assert_eq!(
         object_storage_cache
             .get_non_evictable_entry_ref_count(&old_compacted_puffin_file_ids[0])
@@ -472,31 +374,7 @@ async fn test_2_compact() {
     assert!(disk_files.is_empty());
 
     // Check cache state.
-    assert_eq!(
-        object_storage_cache
-            .cache
-            .read()
-            .await
-            .evicted_entries
-            .len(),
-        0,
-    );
-    assert_eq!(
-        object_storage_cache
-            .cache
-            .read()
-            .await
-            .evictable_cache
-            .len(),
-        0,
-    );
-    assert_eq!(
-        object_storage_cache
-            .cache
-            .read()
-            .await
-            .non_evictable_cache
-            .len(),
-        0,
-    );
+    assert_pending_eviction_entries_size(&mut object_storage_cache, /*expected_count=*/ 0).await;
+    assert_evictable_cache_size(&mut object_storage_cache, /*expected_count=*/ 0).await;
+    assert_non_evictable_cache_size(&mut object_storage_cache, /*expected_count=*/ 0).await;
 }
