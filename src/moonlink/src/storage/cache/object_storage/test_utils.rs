@@ -4,13 +4,25 @@ use tokio::io::AsyncWriteExt;
 
 use crate::storage::cache::object_storage::cache_config::ObjectStorageCacheConfig;
 use crate::storage::cache::object_storage::object_storage_cache::ObjectStorageCache;
+use crate::storage::storage_utils::FileId;
+use crate::storage::storage_utils::TableId;
 use crate::storage::storage_utils::TableUniqueFileId;
 
 /// Content for test files.
 pub(crate) const CONTENT: &[u8; 10] = b"0123456789";
-/// File path for two test files.
-pub(crate) const TEST_FILENAME_1: &str = "remote-1.parquet";
-pub(crate) const TEST_FILENAME_2: &str = "remote-2.parquet";
+/// File path for two test cache files.
+pub(crate) const TEST_CACHE_FILENAME_1: &str = "cache-1.parquet";
+pub(crate) const TEST_CACHE_FILENAME_2: &str = "cache-2.parquet";
+/// File path for two test remote files.
+pub(crate) const TEST_REMOTE_FILENAME_1: &str = "remote-1.parquet";
+
+/// Test util function to return table unique id, with table id hard-coded to 0.
+pub(crate) fn get_table_unique_file_id(file_id: u64) -> TableUniqueFileId {
+    TableUniqueFileId {
+        table_id: TableId(0),
+        file_id: FileId(file_id),
+    }
+}
 
 /// Util function to prepare a test file.
 pub(crate) async fn create_test_file(
@@ -38,17 +50,18 @@ pub(crate) fn get_test_cache_config(tmp_dir: &TempDir) -> ObjectStorageCacheConf
         // Set max bytes larger than one file, but less than two files.
         max_bytes: 15,
         cache_directory: tmp_dir.path().to_str().unwrap().to_string(),
+        optimize_local_filesystem: false,
     }
 }
 
-/// Test util function to create object storage cache.
+/// Test util function to create object storage cache, with local filesystem optimization disabled.
 pub(crate) fn get_test_object_storage_cache(tmp_dir: &TempDir) -> ObjectStorageCache {
     let config = get_test_cache_config(tmp_dir);
     ObjectStorageCache::new(config)
 }
 
-/// Test util function to get cache file number.
-pub(crate) async fn check_cache_file_count(tmp_dir: &TempDir, expected_count: usize) {
+/// Test util function to get file number under the given directory.
+pub(crate) async fn check_directory_file_count(tmp_dir: &TempDir, expected_count: usize) {
     let mut actual_count = 0;
     let mut entries = tokio::fs::read_dir(tmp_dir.path()).await.unwrap();
     while let Some(entry) = entries.next_entry().await.unwrap() {

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::storage::cache::object_storage::base_cache::{CacheEntry, CacheTrait, FileMetadata};
 use crate::storage::cache::object_storage::cache_config::ObjectStorageCacheConfig;
 use crate::storage::cache::object_storage::cache_handle::NonEvictableHandle;
+use crate::storage::path_utils;
 use crate::storage::storage_utils::TableUniqueFileId;
 use crate::Result;
 
@@ -21,6 +22,9 @@ pub(crate) struct CacheEntryWrapper {
     pub(crate) cache_entry: CacheEntry,
     /// Reference count.
     pub(crate) reference_count: u32,
+    /// Whether the cache file could be deleted.
+    /// It's set to false when local filesystem optimization turned on, and we use remote file as local cache at the same time.
+    pub(crate) deletable: bool,
 }
 
 /// A cache entry could be either evictable or non-evictable.
@@ -28,9 +32,12 @@ pub(crate) struct CacheEntryWrapper {
 /// (1) fetch and mark as non-evictable on access
 /// (2) dereference after usage, down-level to evictable when it's unreferenced
 pub(crate) struct ObjectStorageCacheInternal {
+    /// Cache configuration.
+    #[allow(dead_code)]
+    config: ObjectStorageCacheConfig,
     /// Current number of bytes of all cache entries, which only accounts overall bytes for evictable cache and non-evictable cache.
     pub(crate) cur_bytes: u64,
-    /// Deleted entries, which should be evicted right away, and should never be referenced again.
+    /// Deleted entries, which should be evicted right away after no reference count, and should never be referenced again.
     pub(crate) evicted_entries: HashSet<TableUniqueFileId>,
     /// Evictable object storage cache entries.
     pub(crate) evictable_cache: LruCache<TableUniqueFileId, CacheEntryWrapper>,
@@ -47,29 +54,32 @@ impl ObjectStorageCacheInternal {
     ///
     /// Return
     /// - whether cache entries eviction succeeds or not.
-    /// - data files which get evicted from LRU cache, and will be deleted locally.
+    /// - evicted files to delete
     fn evict_cache_entries(
         &mut self,
         max_bytes: u64,
         tolerate_insufficiency: bool,
     ) -> (bool, Vec<String>) {
-        let mut evicted_data_files = vec![];
+        let mut evicted_files_to_delete = vec![];
         while self.cur_bytes > max_bytes {
             if self.evictable_cache.is_empty() {
                 assert!(
                     tolerate_insufficiency,
                     "Cannot reduce disk usage by evicting entries."
                 );
-                return (false, evicted_data_files);
+                return (false, evicted_files_to_delete);
             }
             let (_, mut cache_entry_wrapper) = self.evictable_cache.pop_lru().unwrap();
             assert_eq!(cache_entry_wrapper.reference_count, 0);
             self.cur_bytes -= cache_entry_wrapper.cache_entry.file_metadata.file_size;
-            let cache_filepath =
-                std::mem::take(&mut cache_entry_wrapper.cache_entry.cache_filepath);
-            evicted_data_files.push(cache_filepath);
+
+            if cache_entry_wrapper.deletable {
+                let cache_filepath =
+                    std::mem::take(&mut cache_entry_wrapper.cache_entry.cache_filepath);
+                evicted_files_to_delete.push(cache_filepath);
+            }
         }
-        (true, evicted_data_files)
+        (true, evicted_files_to_delete)
     }
 
     /// Util function to insert into non-evictable cache.
@@ -93,13 +103,13 @@ impl ObjectStorageCacheInternal {
             .non_evictable_cache
             .insert(file_id, cache_entry_wrapper)
             .is_none());
-        let (evict_succ, files_to_delete) =
+        let (evict_succ, evicted_files_to_delete) =
             self.evict_cache_entries(max_bytes, tolerate_insufficiency);
         if !evict_succ {
             assert!(self.non_evictable_cache.remove(&file_id).is_some());
         }
 
-        (evict_succ, files_to_delete)
+        (evict_succ, evicted_files_to_delete)
     }
 
     /// Mark the requested cache entry as deleted, and return evicted files.
@@ -108,13 +118,16 @@ impl ObjectStorageCacheInternal {
         file_id: TableUniqueFileId,
         panic_if_non_existent: bool,
     ) -> Vec<String> {
-        let mut evicted_files = vec![];
+        let mut evicted_files_to_delete = vec![];
 
         // If the requested entries are already evictable, remove it directly.
         if let Some((_, cache_entry_wrapper)) = self.evictable_cache.pop_entry(&file_id) {
             assert_eq!(cache_entry_wrapper.reference_count, 0);
             self.cur_bytes -= cache_entry_wrapper.cache_entry.file_metadata.file_size;
-            evicted_files.push(cache_entry_wrapper.cache_entry.cache_filepath);
+
+            if cache_entry_wrapper.deletable {
+                evicted_files_to_delete.push(cache_entry_wrapper.cache_entry.cache_filepath);
+            }
         }
         // Otherwise, we leave a marker, so when the entries get unreferences it will be deleted.
         else {
@@ -129,18 +142,17 @@ impl ObjectStorageCacheInternal {
             }
         }
 
-        evicted_files
+        evicted_files_to_delete
     }
 
     /// Unreference the given cache entry.
     pub(super) fn unreference(&mut self, file_id: TableUniqueFileId) -> Vec<String> {
         let cache_entry_wrapper = self.non_evictable_cache.get_mut(&file_id);
-        assert!(cache_entry_wrapper.is_some());
         let cache_entry_wrapper = cache_entry_wrapper.unwrap();
         cache_entry_wrapper.reference_count -= 1;
 
         // Aggregate cache entries to delete.
-        let mut entries_to_delete = vec![];
+        let mut evicted_files_to_delete = vec![];
 
         // Down-level to evictable if reference count goes away.
         if cache_entry_wrapper.reference_count == 0 {
@@ -153,7 +165,10 @@ impl ObjectStorageCacheInternal {
                     cache_entry_wrapper.cache_entry.file_metadata.file_size
                 );
                 self.cur_bytes -= cache_entry_wrapper.cache_entry.file_metadata.file_size;
-                entries_to_delete.push(cache_entry_wrapper.cache_entry.cache_filepath);
+
+                if cache_entry_wrapper.deletable {
+                    evicted_files_to_delete.push(cache_entry_wrapper.cache_entry.cache_filepath);
+                }
             }
             // The cache entry is not requested to delete.
             else {
@@ -161,7 +176,37 @@ impl ObjectStorageCacheInternal {
             }
         }
 
-        entries_to_delete
+        evicted_files_to_delete
+    }
+
+    /// Attempt to replace an evictable cache entry with remote path, if the filepath lives on local filesystem.
+    /// Return evicted files to delete.
+    #[allow(dead_code)]
+    pub(super) fn try_replace_evictable_with_remote(
+        &mut self,
+        file_id: &TableUniqueFileId,
+        remote_path: &str,
+    ) -> Vec<String> {
+        // Local filesystem optimization doesn't apply here.
+        if !self.config.optimize_local_filesystem {
+            return vec![];
+        }
+        if !path_utils::is_local_filepath(remote_path) {
+            return vec![];
+        }
+
+        // Only replace with remote filepath when requested file lives at evictable cache.
+        if let Some(cache_entry_wrapper) = self.evictable_cache.get_mut(file_id) {
+            let old_cache_filepath =
+                std::mem::take(&mut cache_entry_wrapper.cache_entry.cache_filepath);
+            cache_entry_wrapper.cache_entry.cache_filepath = remote_path.to_string();
+            cache_entry_wrapper.deletable = false;
+
+            return vec![old_cache_filepath];
+        }
+
+        // Otherwise, do nothing.
+        vec![]
     }
 
     /// ================================
@@ -201,8 +246,9 @@ impl ObjectStorageCache {
     pub fn new(config: ObjectStorageCacheConfig) -> Self {
         let evictable_cache = LruCache::unbounded();
         Self {
-            config,
+            config: config.clone(),
             cache: Arc::new(RwLock::new(ObjectStorageCacheInternal {
+                config,
                 cur_bytes: 0,
                 evicted_entries: HashSet::new(),
                 evictable_cache,
@@ -227,6 +273,31 @@ impl ObjectStorageCache {
         Ok(CacheEntry {
             cache_filepath: dst_filepath,
             file_metadata: FileMetadata { file_size },
+        })
+    }
+
+    /// Get cache entry from remote filepath [`src`].
+    async fn get_cache_handle_from_remote(&self, src: &str) -> Result<CacheEntryWrapper> {
+        // If the remote filepath indicates a local filesystem one, use it as cache as well.
+        if self.config.optimize_local_filesystem && path_utils::is_local_filepath(src) {
+            let file_size = tokio::fs::metadata(src).await?.len();
+            let cache_entry = CacheEntry {
+                cache_filepath: src.to_string(),
+                file_metadata: FileMetadata { file_size },
+            };
+            return Ok(CacheEntryWrapper {
+                cache_entry,
+                reference_count: 1,
+                deletable: false,
+            });
+        }
+
+        // The requested item doesn't exist, perform IO operations to load.
+        let cache_entry = self.load_from_remote(src).await?;
+        Ok(CacheEntryWrapper {
+            cache_entry,
+            reference_count: 1,
+            deletable: true,
         })
     }
 
@@ -278,10 +349,14 @@ impl CacheTrait for ObjectStorageCache {
         let cache_entry_wrapper = CacheEntryWrapper {
             cache_entry: cache_entry.clone(),
             reference_count: 1,
+            deletable: true,
         };
+        let file_size = cache_entry.file_metadata.file_size;
+        let non_evictable_handle =
+            NonEvictableHandle::new(file_id, cache_entry, self.cache.clone());
 
         let mut guard = self.cache.write().await;
-        guard.cur_bytes += cache_entry.file_metadata.file_size;
+        guard.cur_bytes += file_size;
 
         let cache_files_to_delete = guard
             .insert_non_evictable(
@@ -291,9 +366,6 @@ impl CacheTrait for ObjectStorageCache {
                 /*tolerate_insufficiency=*/ false,
             )
             .1;
-        let non_evictable_handle =
-            NonEvictableHandle::new(file_id, cache_entry, self.cache.clone());
-
         (non_evictable_handle, cache_files_to_delete)
     }
 
@@ -309,26 +381,26 @@ impl CacheTrait for ObjectStorageCache {
             let mut guard = self.cache.write().await;
 
             // Check non-evictable cache.
-            let mut value = guard.non_evictable_cache.get_mut(&file_id);
-            if value.is_some() {
-                ma::assert_gt!(value.as_ref().unwrap().reference_count, 0);
-                value.as_mut().unwrap().reference_count += 1;
-                let cache_entry = value.as_ref().unwrap().cache_entry.clone();
+            let value = guard.non_evictable_cache.get_mut(&file_id);
+            if let Some(value) = value {
+                ma::assert_gt!(value.reference_count, 0);
+                value.reference_count += 1;
+                let cache_entry = value.cache_entry.clone();
                 let non_evictable_handle =
                     NonEvictableHandle::new(file_id, cache_entry, self.cache.clone());
                 return Ok((Some(non_evictable_handle), /*files_to_delete=*/ vec![]));
             }
 
             // Check evictable cache.
-            let mut value = guard.evictable_cache.pop(&file_id);
-            if value.is_some() {
-                assert_eq!(value.as_ref().unwrap().reference_count, 0);
-                value.as_mut().unwrap().reference_count += 1;
-                let cache_entry = value.as_ref().unwrap().cache_entry.clone();
+            let value = guard.evictable_cache.pop(&file_id);
+            if let Some(mut value) = value {
+                assert_eq!(value.reference_count, 0);
+                value.reference_count += 1;
+                let cache_entry = value.cache_entry.clone();
                 let files_to_delete = guard
                     .insert_non_evictable(
                         file_id,
-                        value.unwrap(),
+                        value,
                         self.config.max_bytes,
                         /*tolerate_insufficiency=*/ true,
                     )
@@ -340,19 +412,14 @@ impl CacheTrait for ObjectStorageCache {
             }
         }
 
-        // The requested item doesn't exist, perform IO operations to load.
-        //
-        // TODO(hjiang):
-        // 1. IO operations should leverage opendal, use tokio::fs as of now to validate cache functionality.
-        // 2. We could have different requests for the same remote filepath, should able to avoid wasted repeated IO.
-        let cache_entry = self.load_from_remote(remote_filepath).await?;
-        let cache_entry_wrapper = CacheEntryWrapper {
-            cache_entry: cache_entry.clone(),
-            reference_count: 1,
-        };
-        let file_size = cache_entry.file_metadata.file_size;
-        let non_evictable_handle =
-            NonEvictableHandle::new(file_id, cache_entry.clone(), self.cache.clone());
+        // Place IO operation out of critical section.
+        let cache_entry_wrapper = self.get_cache_handle_from_remote(remote_filepath).await?;
+        let file_size = cache_entry_wrapper.cache_entry.file_metadata.file_size;
+        let non_evictable_handle = NonEvictableHandle::new(
+            file_id,
+            cache_entry_wrapper.cache_entry.clone(),
+            self.cache.clone(),
+        );
 
         {
             let mut guard = self.cache.write().await;
@@ -392,6 +459,30 @@ mod tests {
 
     use tempfile::tempdir;
 
+    /// Test util function to get cache entry.
+    async fn get_cache_handle_impl(
+        file_index: i32,
+        remote_file_directory: std::path::PathBuf,
+        mut object_storage_cache: ObjectStorageCache,
+    ) -> NonEvictableHandle {
+        let filename = format!("{}.parquet", file_index);
+        let test_file = create_test_file(remote_file_directory.as_path(), &filename).await;
+        let data_file = create_data_file(
+            /*file_id=*/ file_index as u64,
+            test_file.to_str().unwrap().to_string(),
+        );
+        let unique_file_id = TableUniqueFileId {
+            table_id: TableId(0),
+            file_id: data_file.file_id(),
+        };
+        let (cache_handle, cache_to_delete) = object_storage_cache
+            .get_cache_entry(unique_file_id, data_file.file_path())
+            .await
+            .unwrap();
+        assert!(cache_to_delete.is_empty());
+        cache_handle.unwrap()
+    }
+
     #[tokio::test]
     async fn test_concurrent_object_storage_cache() {
         const PARALLEL_TASK_NUM: usize = 10;
@@ -404,30 +495,15 @@ mod tests {
             // Set max bytes larger than one file, but less than two files.
             max_bytes: (CONTENT.len() * PARALLEL_TASK_NUM) as u64,
             cache_directory: cache_file_directory.path().to_str().unwrap().to_string(),
+            optimize_local_filesystem: false,
         };
         let cache = ObjectStorageCache::new(config);
 
         for idx in 0..PARALLEL_TASK_NUM {
-            let mut temp_cache = cache.clone();
-            let remote_file_directory = remote_file_directory.path().to_path_buf();
-
+            let temp_cache = cache.clone();
+            let remote_file_dir_pathbuf = remote_file_directory.path().to_path_buf();
             let handle = tokio::task::spawn_blocking(async move || -> NonEvictableHandle {
-                let filename = format!("{}.parquet", idx);
-                let test_file = create_test_file(remote_file_directory.as_path(), &filename).await;
-                let data_file = create_data_file(
-                    /*file_id=*/ idx as u64,
-                    test_file.to_str().unwrap().to_string(),
-                );
-                let unique_file_id = TableUniqueFileId {
-                    table_id: TableId(0),
-                    file_id: data_file.file_id(),
-                };
-                let (cache_handle, cache_to_delete) = temp_cache
-                    .get_cache_entry(unique_file_id, data_file.file_path())
-                    .await
-                    .unwrap();
-                assert!(cache_to_delete.is_empty());
-                cache_handle.unwrap()
+                get_cache_handle_impl(idx as i32, remote_file_dir_pathbuf, temp_cache).await
             });
             handle_futures.push(handle);
         }
@@ -446,6 +522,50 @@ mod tests {
             cache.cache.read().await.non_evictable_cache.len(),
             PARALLEL_TASK_NUM
         );
-        check_cache_file_count(&cache_file_directory, PARALLEL_TASK_NUM).await;
+        check_directory_file_count(&cache_file_directory, PARALLEL_TASK_NUM).await;
+        check_directory_file_count(&remote_file_directory, PARALLEL_TASK_NUM).await;
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_cache_access_with_local_optimization() {
+        const PARALLEL_TASK_NUM: usize = 10;
+        let mut handle_futures = Vec::with_capacity(PARALLEL_TASK_NUM);
+
+        let cache_file_directory = tempdir().unwrap();
+        let remote_file_directory = tempdir().unwrap();
+
+        let config = ObjectStorageCacheConfig {
+            // Set max bytes larger than one file, but less than two files.
+            max_bytes: (CONTENT.len() * PARALLEL_TASK_NUM) as u64,
+            cache_directory: cache_file_directory.path().to_str().unwrap().to_string(),
+            optimize_local_filesystem: true,
+        };
+        let cache = ObjectStorageCache::new(config);
+
+        for idx in 0..PARALLEL_TASK_NUM {
+            let temp_cache = cache.clone();
+            let remote_file_dir_pathbuf = remote_file_directory.path().to_path_buf();
+            let handle = tokio::task::spawn_blocking(async move || -> NonEvictableHandle {
+                get_cache_handle_impl(idx as i32, remote_file_dir_pathbuf, temp_cache).await
+            });
+            handle_futures.push(handle);
+        }
+
+        let results = futures::future::join_all(handle_futures).await;
+        for cur_handle_future in results.into_iter() {
+            let non_evictable_handle = cur_handle_future.unwrap().await;
+            check_file_content(&non_evictable_handle.cache_entry.cache_filepath).await;
+            assert_eq!(
+                non_evictable_handle.cache_entry.file_metadata.file_size as usize,
+                CONTENT.len()
+            );
+        }
+        assert_eq!(cache.cache.read().await.evictable_cache.len(), 0);
+        assert_eq!(
+            cache.cache.read().await.non_evictable_cache.len(),
+            PARALLEL_TASK_NUM
+        );
+        check_directory_file_count(&cache_file_directory, 0).await;
+        check_directory_file_count(&remote_file_directory, PARALLEL_TASK_NUM).await;
     }
 }
