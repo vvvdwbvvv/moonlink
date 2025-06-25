@@ -1,3 +1,4 @@
+use itertools::Itertools;
 use rstest::rstest;
 use tempfile::TempDir;
 use tokio::sync::mpsc::Receiver;
@@ -166,25 +167,9 @@ async fn test_5_read_4_by_batch_write(#[case] optimize_local_filesystem: bool) {
     let snapshot_read_output = perform_read_request_for_test(&mut table).await;
     let read_state = snapshot_read_output.take_as_read_state().await;
 
-    // Check data file has been pinned in mooncake table.
-    let disk_files = get_disk_files_for_snapshot(&table).await;
-    assert_eq!(disk_files.len(), 1);
-    let (file, disk_file_entry) = disk_files.iter().next().unwrap();
-    assert!(disk_file_entry.cache_handle.is_some());
-
-    let index_block_file_ids = get_index_block_file_ids(&table).await;
-    assert_eq!(index_block_file_ids.len(), 1);
-
-    assert_eq!(
-        file.file_path(),
-        &disk_file_entry
-            .cache_handle
-            .as_ref()
-            .unwrap()
-            .cache_entry
-            .cache_filepath
-    );
-    assert!(is_local_file(file, &temp_dir));
+    // Check data file has been recorded in mooncake table.
+    let data_file_id = get_only_local_data_file_id(&table, &temp_dir).await;
+    let index_block_file_id = get_only_index_block_file_id(&table).await;
 
     // Check cache state.
     assert_pending_eviction_entries_size(&mut cache, /*expected_count=*/ 0).await;
@@ -192,13 +177,13 @@ async fn test_5_read_4_by_batch_write(#[case] optimize_local_filesystem: bool) {
     assert_non_evictable_cache_size(&mut cache, /*expected_count=*/ 2).await; // data file and index block file
     assert_eq!(
         cache
-            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(file.file_id()))
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(data_file_id))
             .await,
         2
     );
     assert_eq!(
         cache
-            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_ids[0]))
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_id))
             .await,
         1,
     );
@@ -216,13 +201,13 @@ async fn test_5_read_4_by_batch_write(#[case] optimize_local_filesystem: bool) {
     assert_non_evictable_cache_size(&mut cache, /*expected_count=*/ 2).await; // data file and index block file
     assert_eq!(
         cache
-            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(file.file_id()))
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(data_file_id))
             .await,
         1
     );
     assert_eq!(
         cache
-            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_ids[0]))
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_id))
             .await,
         1,
     );
@@ -247,25 +232,9 @@ async fn test_5_read_4_by_stream_write(#[case] optimize_local_filesystem: bool) 
     let snapshot_read_output = perform_read_request_for_test(&mut table).await;
     let read_state = snapshot_read_output.take_as_read_state().await;
 
-    // Check data file has been pinned in mooncake table.
-    let disk_files = get_disk_files_for_snapshot(&table).await;
-    assert_eq!(disk_files.len(), 1);
-    let (file, disk_file_entry) = disk_files.iter().next().unwrap();
-    assert!(disk_file_entry.cache_handle.is_some());
-
-    let index_block_file_ids = get_index_block_file_ids(&table).await;
-    assert_eq!(index_block_file_ids.len(), 1);
-
-    assert_eq!(
-        file.file_path(),
-        &disk_file_entry
-            .cache_handle
-            .as_ref()
-            .unwrap()
-            .cache_entry
-            .cache_filepath
-    );
-    assert!(is_local_file(file, &temp_dir));
+    // Check data file has been recorded in mooncake table.
+    let file_id = get_only_local_data_file_id(&table, &temp_dir).await;
+    let index_block_file_id = get_only_index_block_file_id(&table).await;
 
     // Check cache state.
     assert_pending_eviction_entries_size(&mut cache, /*expected_count=*/ 0).await;
@@ -273,13 +242,13 @@ async fn test_5_read_4_by_stream_write(#[case] optimize_local_filesystem: bool) 
     assert_non_evictable_cache_size(&mut cache, /*expected_count=*/ 2).await; // data file and index block file
     assert_eq!(
         cache
-            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(file.file_id()))
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(file_id))
             .await,
         2
     );
     assert_eq!(
         cache
-            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_ids[0]))
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_id))
             .await,
         1,
     );
@@ -297,13 +266,13 @@ async fn test_5_read_4_by_stream_write(#[case] optimize_local_filesystem: bool) 
     assert_non_evictable_cache_size(&mut cache, /*expected_count=*/ 2).await; // data file and index block file
     assert_eq!(
         cache
-            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(file.file_id()))
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(file_id))
             .await,
         1
     );
     assert_eq!(
         cache
-            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_ids[0]))
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_id))
             .await,
         1,
     );
@@ -324,23 +293,17 @@ async fn test_5_1_without_local_optimization() {
         create_mooncake_snapshot_for_test(&mut table, &mut table_notify).await;
     assert!(files_to_delete.is_empty());
 
-    // Check data file has been pinned in mooncake table.
-    let disk_files = get_disk_files_for_snapshot(&table).await;
-    assert_eq!(disk_files.len(), 1);
-    let (file, disk_file_entry) = disk_files.iter().next().unwrap();
-    assert!(disk_file_entry.cache_handle.is_none());
-    assert!(is_remote_file(file, &temp_dir));
-
-    let index_block_file_ids = get_index_block_file_ids(&table).await;
-    assert_eq!(index_block_file_ids.len(), 1);
+    // Check data file has been recorded in mooncake table.
+    let _ = get_only_remote_data_file_id(&table, &temp_dir).await;
+    let index_block_file_id = get_only_index_block_file_id(&table).await;
 
     // Check cache state.
     assert_pending_eviction_entries_size(&mut cache, /*expected_count=*/ 0).await;
-    assert_evictable_cache_size(&mut cache, /*expected_count=*/ 1).await;
+    assert_evictable_cache_size(&mut cache, /*expected_count=*/ 1).await; // data file
     assert_non_evictable_cache_size(&mut cache, /*expected_count=*/ 1).await; // index block file
     assert_eq!(
         cache
-            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_ids[0]))
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_id))
             .await,
         1,
     );
@@ -357,30 +320,25 @@ async fn test_5_1_with_local_optimization() {
     let (mut table, mut table_notify) =
         prepare_test_disk_file_for_read(&temp_dir, cache.clone()).await;
     create_mooncake_and_iceberg_snapshot_for_test(&mut table, &mut table_notify).await;
-    let local_data_file = get_only_data_filepath(&table).await;
+    let local_data_files_and_index_blocks = get_data_files_and_index_block_files(&table).await;
 
     // Till now, iceberg snapshot has been persisted, need an extra mooncake snapshot to reflect persistence result.
-    let (_, _, _, files_to_delete) =
+    let (_, _, _, mut files_to_delete) =
         create_mooncake_snapshot_for_test(&mut table, &mut table_notify).await;
-    assert_eq!(files_to_delete, vec![local_data_file]);
+    files_to_delete.sort();
+    assert_eq!(files_to_delete, local_data_files_and_index_blocks);
 
-    // Check data file has been pinned in mooncake table.
-    let disk_files = get_disk_files_for_snapshot(&table).await;
-    assert_eq!(disk_files.len(), 1);
-    let (file, disk_file_entry) = disk_files.iter().next().unwrap();
-    assert!(disk_file_entry.cache_handle.is_none());
-    assert!(is_remote_file(file, &temp_dir));
-
-    let index_block_file_ids = get_index_block_file_ids(&table).await;
-    assert_eq!(index_block_file_ids.len(), 1);
+    // Check data file has been recorded in mooncake table.
+    let _ = get_only_remote_data_file_id(&table, &temp_dir).await;
+    let index_block_file_id = get_only_index_block_file_id(&table).await;
 
     // Check cache state.
     assert_pending_eviction_entries_size(&mut cache, /*expected_count=*/ 0).await;
-    assert_evictable_cache_size(&mut cache, /*expected_count=*/ 1).await;
+    assert_evictable_cache_size(&mut cache, /*expected_count=*/ 1).await; // data file
     assert_non_evictable_cache_size(&mut cache, /*expected_count=*/ 1).await; // index block file
     assert_eq!(
         cache
-            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_ids[0]))
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_id))
             .await,
         1,
     );
@@ -388,13 +346,11 @@ async fn test_5_1_with_local_optimization() {
 
 /// Test scenario: no remote, local, in use + persist => remote, local, in use
 #[tokio::test]
-#[rstest]
-#[case(true)]
-#[case(false)]
-async fn test_4_3(#[case] optimize_local_filesystem: bool) {
+async fn test_4_3_with_local_filesystem_optimization() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let mut cache =
-        create_object_storage_cache_with_one_file_size(&temp_dir, optimize_local_filesystem);
+    let mut cache = create_object_storage_cache_with_one_file_size(
+        &temp_dir, /*optimize_local_filesystem=*/ false,
+    );
 
     let (mut table, mut table_notify) =
         prepare_test_disk_file_for_read(&temp_dir, cache.clone()).await;
@@ -412,15 +368,9 @@ async fn test_4_3(#[case] optimize_local_filesystem: bool) {
         create_mooncake_snapshot_for_test(&mut table, &mut table_notify).await;
     assert!(files_to_delete.is_empty());
 
-    // Check data file has been pinned in mooncake table.
-    let disk_files = get_disk_files_for_snapshot(&table).await;
-    assert_eq!(disk_files.len(), 1);
-    let (file, disk_file_entry) = disk_files.iter().next().unwrap();
-    assert!(disk_file_entry.cache_handle.is_none());
-    assert!(is_remote_file(file, &temp_dir));
-
-    let index_block_file_ids = get_index_block_file_ids(&table).await;
-    assert_eq!(index_block_file_ids.len(), 1);
+    // Check data file has been recorded in mooncake table.
+    let data_file_id = get_only_remote_data_file_id(&table, &temp_dir).await;
+    let index_block_file_id = get_only_index_block_file_id(&table).await;
 
     // Check cache state.
     assert_pending_eviction_entries_size(&mut cache, /*expected_count=*/ 0).await;
@@ -428,13 +378,13 @@ async fn test_4_3(#[case] optimize_local_filesystem: bool) {
     assert_non_evictable_cache_size(&mut cache, /*expected_count=*/ 2).await; // data file and index block file
     assert_eq!(
         cache
-            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(file.file_id()))
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(data_file_id))
             .await,
         1
     );
     assert_eq!(
         cache
-            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_ids[0]))
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_id))
             .await,
         1,
     );
@@ -448,11 +398,79 @@ async fn test_4_3(#[case] optimize_local_filesystem: bool) {
     .await;
     assert!(files_to_delete.is_empty());
     assert_pending_eviction_entries_size(&mut cache, /*expected_count=*/ 0).await;
-    assert_evictable_cache_size(&mut cache, /*expected_count=*/ 1).await;
+    assert_evictable_cache_size(&mut cache, /*expected_count=*/ 1).await; // data file
     assert_non_evictable_cache_size(&mut cache, /*expected_count=*/ 1).await; // index block file
     assert_eq!(
         cache
-            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_ids[0]))
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_id))
+            .await,
+        1,
+    );
+}
+
+/// State transfer is the same as [`test_4_3_without_local_filesystem_optimization`].
+/// Test scenario: no remote, local, in use + persist => remote, local, in use
+#[tokio::test]
+async fn test_4_3_without_local_filesystem_optimization() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut cache = create_object_storage_cache_with_one_file_size(
+        &temp_dir, /*optimize_local_filesystem=*/ true,
+    );
+
+    let (mut table, mut table_notify) =
+        prepare_test_disk_file_for_read(&temp_dir, cache.clone()).await;
+    let (_, _, _, files_to_delete) =
+        create_mooncake_snapshot_for_test(&mut table, &mut table_notify).await;
+    assert!(files_to_delete.is_empty());
+
+    // Get index block files.
+    let local_index_block = get_only_index_block_filepath(&table).await;
+
+    // Read and increment reference count.
+    let snapshot_read_output = perform_read_request_for_test(&mut table).await;
+    let read_state = snapshot_read_output.take_as_read_state().await;
+
+    // Create iceberg snapshot and reflect persistence result to mooncake snapshot.
+    create_mooncake_and_iceberg_snapshot_for_test(&mut table, &mut table_notify).await;
+    let (_, _, _, files_to_delete) =
+        create_mooncake_snapshot_for_test(&mut table, &mut table_notify).await;
+    assert_eq!(files_to_delete, vec![local_index_block]);
+
+    // Check data file has been recorded in mooncake table.
+    let data_file_id = get_only_remote_data_file_id(&table, &temp_dir).await;
+    let index_block_file_id = get_only_index_block_file_id(&table).await;
+
+    // Check cache state.
+    assert_pending_eviction_entries_size(&mut cache, /*expected_count=*/ 0).await;
+    assert_evictable_cache_size(&mut cache, /*expected_count=*/ 0).await;
+    assert_non_evictable_cache_size(&mut cache, /*expected_count=*/ 2).await; // data file and index block file
+    assert_eq!(
+        cache
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(data_file_id))
+            .await,
+        1
+    );
+    assert_eq!(
+        cache
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_id))
+            .await,
+        1,
+    );
+
+    // Drop all read states and check reference count.
+    let files_to_delete = drop_read_states_and_create_mooncake_snapshot(
+        vec![read_state],
+        &mut table,
+        &mut table_notify,
+    )
+    .await;
+    assert!(files_to_delete.is_empty());
+    assert_pending_eviction_entries_size(&mut cache, /*expected_count=*/ 0).await;
+    assert_evictable_cache_size(&mut cache, /*expected_count=*/ 1).await; // data file
+    assert_non_evictable_cache_size(&mut cache, /*expected_count=*/ 1).await; // index block file
+    assert_eq!(
+        cache
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_id))
             .await,
         1,
     );
@@ -486,15 +504,9 @@ async fn test_4_read_4(#[case] optimize_local_filesystem: bool) {
     // Read and increment reference count for the third time.
     let read_state_3 = snapshot_read_output_2_clone.take_as_read_state().await;
 
-    // Check data file has been pinned in mooncake table.
-    let disk_files = get_disk_files_for_snapshot(&table).await;
-    assert_eq!(disk_files.len(), 1);
-    let (file, disk_file_entry) = disk_files.iter().next().unwrap();
-    assert!(disk_file_entry.cache_handle.is_some());
-    assert!(is_local_file(file, &temp_dir));
-
-    let index_block_file_ids = get_index_block_file_ids(&table).await;
-    assert_eq!(index_block_file_ids.len(), 1);
+    // Check data file has been recorded in mooncake table.
+    let data_file_id = get_only_local_data_file_id(&table, &temp_dir).await;
+    let index_block_file_id = get_only_index_block_file_id(&table).await;
 
     // Check cache state.
     assert_pending_eviction_entries_size(&mut cache, /*expected_count=*/ 0).await;
@@ -502,13 +514,13 @@ async fn test_4_read_4(#[case] optimize_local_filesystem: bool) {
     assert_non_evictable_cache_size(&mut cache, /*expected_count=*/ 2).await; // data file and index block file
     assert_eq!(
         cache
-            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(file.file_id()))
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(data_file_id))
             .await,
         4,
     );
     assert_eq!(
         cache
-            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_ids[0]))
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_id))
             .await,
         1,
     );
@@ -526,7 +538,13 @@ async fn test_4_read_4(#[case] optimize_local_filesystem: bool) {
     assert_non_evictable_cache_size(&mut cache, /*expected_count=*/ 2).await; // data file and index block file
     assert_eq!(
         cache
-            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(file.file_id()))
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(data_file_id))
+            .await,
+        1,
+    );
+    assert_eq!(
+        cache
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_id))
             .await,
         1,
     );
@@ -565,15 +583,9 @@ async fn test_4_read_and_read_over_4(#[case] optimize_local_filesystem: bool) {
         create_mooncake_snapshot_for_test(&mut table, &mut table_notify).await;
     assert!(files_to_delete.is_empty());
 
-    // Check data file has been pinned in mooncake table.
-    let disk_files = get_disk_files_for_snapshot(&table).await;
-    assert_eq!(disk_files.len(), 1);
-    let (file, disk_file_entry) = disk_files.iter().next().unwrap();
-    assert!(disk_file_entry.cache_handle.is_some());
-    assert!(is_local_file(file, &temp_dir));
-
-    let index_block_file_ids = get_index_block_file_ids(&table).await;
-    assert_eq!(index_block_file_ids.len(), 1);
+    // Check data file has been recorded in mooncake table.
+    let data_file_id = get_only_local_data_file_id(&table, &temp_dir).await;
+    let index_block_file_id = get_only_index_block_file_id(&table).await;
 
     // Check cache state.
     assert_pending_eviction_entries_size(&mut cache, /*expected_count=*/ 0).await;
@@ -581,13 +593,13 @@ async fn test_4_read_and_read_over_4(#[case] optimize_local_filesystem: bool) {
     assert_non_evictable_cache_size(&mut cache, /*expected_count=*/ 2).await; // data file and index block file
     assert_eq!(
         cache
-            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(file.file_id()))
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(data_file_id))
             .await,
         2
     );
     assert_eq!(
         cache
-            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_ids[0]))
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_id))
             .await,
         1,
     );
@@ -605,13 +617,13 @@ async fn test_4_read_and_read_over_4(#[case] optimize_local_filesystem: bool) {
     assert_non_evictable_cache_size(&mut cache, /*expected_count=*/ 2).await; // data file and index block file
     assert_eq!(
         cache
-            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(file.file_id()))
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(data_file_id))
             .await,
         1
     );
     assert_eq!(
         cache
-            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_ids[0]))
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_id))
             .await,
         1,
     );
@@ -619,13 +631,11 @@ async fn test_4_read_and_read_over_4(#[case] optimize_local_filesystem: bool) {
 
 /// Test scenario: remote, local, in use + use => remote, local, in use
 #[tokio::test]
-#[rstest]
-#[case(true)]
-#[case(false)]
-async fn test_3_read_3(#[case] optimize_local_filesystem: bool) {
+async fn test_3_read_3_without_filesystem_optimization() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let mut cache =
-        create_object_storage_cache_with_one_file_size(&temp_dir, optimize_local_filesystem);
+    let mut cache = create_object_storage_cache_with_one_file_size(
+        &temp_dir, /*optimize_local_filesystem=*/ false,
+    );
 
     let (mut table, mut table_notify) =
         prepare_test_disk_file_for_read(&temp_dir, cache.clone()).await;
@@ -647,15 +657,9 @@ async fn test_3_read_3(#[case] optimize_local_filesystem: bool) {
     let snapshot_read_output_2 = perform_read_request_for_test(&mut table).await;
     let read_state_2 = snapshot_read_output_2.take_as_read_state().await;
 
-    // Check data file has been pinned in mooncake table.
-    let disk_files = get_disk_files_for_snapshot(&table).await;
-    assert_eq!(disk_files.len(), 1);
-    let (file, disk_file_entry) = disk_files.iter().next().unwrap();
-    assert!(disk_file_entry.cache_handle.is_none());
-    assert!(is_remote_file(file, &temp_dir));
-
-    let index_block_file_ids = get_index_block_file_ids(&table).await;
-    assert_eq!(index_block_file_ids.len(), 1);
+    // Check data file has been recorded in mooncake table.
+    let data_file_id = get_only_remote_data_file_id(&table, &temp_dir).await;
+    let index_block_file_id = get_only_index_block_file_id(&table).await;
 
     // Check cache state.
     assert_pending_eviction_entries_size(&mut cache, /*expected_count=*/ 0).await;
@@ -663,13 +667,13 @@ async fn test_3_read_3(#[case] optimize_local_filesystem: bool) {
     assert_non_evictable_cache_size(&mut cache, /*expected_count=*/ 2).await; // data file and index block file
     assert_eq!(
         cache
-            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(file.file_id()))
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(data_file_id))
             .await,
         2,
     );
     assert_eq!(
         cache
-            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_ids[0]))
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_id))
             .await,
         1,
     );
@@ -687,7 +691,79 @@ async fn test_3_read_3(#[case] optimize_local_filesystem: bool) {
     assert_non_evictable_cache_size(&mut cache, /*expected_count=*/ 1).await; // index block file
     assert_eq!(
         cache
-            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_ids[0]))
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_id))
+            .await,
+        1,
+    );
+}
+
+/// State transfer is the same as [`test_3_read_3_with_filesystem_optimization`].
+/// Test scenario: remote, local, in use + use => remote, local, in use
+#[tokio::test]
+async fn test_3_read_3_with_filesystem_optimization() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut cache = create_object_storage_cache_with_one_file_size(
+        &temp_dir, /*optimize_local_filesystem=*/ true,
+    );
+
+    let (mut table, mut table_notify) =
+        prepare_test_disk_file_for_read(&temp_dir, cache.clone()).await;
+    let (_, _, _, files_to_delete) =
+        create_mooncake_snapshot_for_test(&mut table, &mut table_notify).await;
+    assert!(files_to_delete.is_empty());
+
+    // Read and increment reference count.
+    let snapshot_read_output_1 = perform_read_request_for_test(&mut table).await;
+    let read_state_1 = snapshot_read_output_1.take_as_read_state().await;
+
+    // Get local index block.
+    let local_index_block = get_only_index_block_filepath(&table).await;
+
+    // Create iceberg snapshot and reflect persistence result to mooncake snapshot.
+    create_mooncake_and_iceberg_snapshot_for_test(&mut table, &mut table_notify).await;
+    let (_, _, _, files_to_delete) =
+        create_mooncake_snapshot_for_test(&mut table, &mut table_notify).await;
+    assert_eq!(files_to_delete, vec![local_index_block]);
+
+    // Read and increment reference count.
+    let snapshot_read_output_2 = perform_read_request_for_test(&mut table).await;
+    let read_state_2 = snapshot_read_output_2.take_as_read_state().await;
+
+    // Check data file has been recorded in mooncake table.
+    let data_file_id = get_only_remote_data_file_id(&table, &temp_dir).await;
+    let index_block_file_id = get_only_index_block_file_id(&table).await;
+
+    // Check cache state.
+    assert_pending_eviction_entries_size(&mut cache, /*expected_count=*/ 0).await;
+    assert_evictable_cache_size(&mut cache, /*expected_count=*/ 0).await;
+    assert_non_evictable_cache_size(&mut cache, /*expected_count=*/ 2).await; // data file and index block file
+    assert_eq!(
+        cache
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(data_file_id))
+            .await,
+        2,
+    );
+    assert_eq!(
+        cache
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_id))
+            .await,
+        1,
+    );
+
+    // Drop all read states and check reference count.
+    let files_to_delete = drop_read_states_and_create_mooncake_snapshot(
+        vec![read_state_1, read_state_2],
+        &mut table,
+        &mut table_notify,
+    )
+    .await;
+    assert!(files_to_delete.is_empty());
+    assert_pending_eviction_entries_size(&mut cache, /*expected_count=*/ 0).await;
+    assert_evictable_cache_size(&mut cache, /*expected_count=*/ 1).await;
+    assert_non_evictable_cache_size(&mut cache, /*expected_count=*/ 1).await; // index block file
+    assert_eq!(
+        cache
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_id))
             .await,
         1,
     );
@@ -695,13 +771,11 @@ async fn test_3_read_3(#[case] optimize_local_filesystem: bool) {
 
 /// Test scenario: remote, local, in use + use over & pinned => remote, local, in use
 #[tokio::test]
-#[rstest]
-#[case(true)]
-#[case(false)]
-async fn test_3_read_and_read_over_and_pinned_3(#[case] optimize_local_filesystem: bool) {
+async fn test_3_read_and_read_over_and_pinned_3_without_local_filesystem_optimization() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let mut cache =
-        create_object_storage_cache_with_one_file_size(&temp_dir, optimize_local_filesystem);
+    let mut cache = create_object_storage_cache_with_one_file_size(
+        &temp_dir, /*optimize_local_filesystem=*/ false,
+    );
 
     let (mut table, mut table_notify) =
         prepare_test_disk_file_for_read(&temp_dir, cache.clone()).await;
@@ -730,15 +804,9 @@ async fn test_3_read_and_read_over_and_pinned_3(#[case] optimize_local_filesyste
         create_mooncake_snapshot_for_test(&mut table, &mut table_notify).await;
     assert!(files_to_delete.is_empty());
 
-    // Check data file has been pinned in mooncake table.
-    let disk_files = get_disk_files_for_snapshot(&table).await;
-    assert_eq!(disk_files.len(), 1);
-    let (file, disk_file_entry) = disk_files.iter().next().unwrap();
-    assert!(disk_file_entry.cache_handle.is_none());
-    assert!(is_remote_file(file, &temp_dir));
-
-    let index_block_file_ids = get_index_block_file_ids(&table).await;
-    assert_eq!(index_block_file_ids.len(), 1);
+    // Check data file has been recorded in mooncake table.
+    let data_file_id = get_only_remote_data_file_id(&table, &temp_dir).await;
+    let index_block_file_id = get_only_index_block_file_id(&table).await;
 
     // Check cache state.
     assert_pending_eviction_entries_size(&mut cache, /*expected_count=*/ 0).await;
@@ -746,13 +814,13 @@ async fn test_3_read_and_read_over_and_pinned_3(#[case] optimize_local_filesyste
     assert_non_evictable_cache_size(&mut cache, /*expected_count=*/ 2).await; // data file and index block file
     assert_eq!(
         cache
-            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(file.file_id()))
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(data_file_id))
             .await,
         1,
     );
     assert_eq!(
         cache
-            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_ids[0]))
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_id))
             .await,
         1,
     );
@@ -770,7 +838,86 @@ async fn test_3_read_and_read_over_and_pinned_3(#[case] optimize_local_filesyste
     assert_non_evictable_cache_size(&mut cache, /*expected_count=*/ 1).await; // index block file
     assert_eq!(
         cache
-            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_ids[0]))
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_id))
+            .await,
+        1,
+    );
+}
+
+/// State transfer is the same as [`test_3_read_and_read_over_and_pinned_3_with_local_filesystem_optimization`].
+/// Test scenario: remote, local, in use + use over & pinned => remote, local, in use
+#[tokio::test]
+async fn test_3_read_and_read_over_and_pinned_3_with_local_filesystem_optimization() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut cache = create_object_storage_cache_with_one_file_size(
+        &temp_dir, /*optimize_local_filesystem=*/ true,
+    );
+
+    let (mut table, mut table_notify) =
+        prepare_test_disk_file_for_read(&temp_dir, cache.clone()).await;
+    let (_, _, _, files_to_delete) =
+        create_mooncake_snapshot_for_test(&mut table, &mut table_notify).await;
+    assert!(files_to_delete.is_empty());
+
+    // Read and increment reference count.
+    let snapshot_read_output_1 = perform_read_request_for_test(&mut table).await;
+    let read_state_1 = snapshot_read_output_1.take_as_read_state().await;
+
+    // Get local index file.
+    let local_index_block = get_only_index_block_filepath(&table).await;
+
+    // Create iceberg snapshot and reflect persistence result to mooncake snapshot.
+    create_mooncake_and_iceberg_snapshot_for_test(&mut table, &mut table_notify).await;
+    let (_, _, _, files_to_delete) =
+        create_mooncake_snapshot_for_test(&mut table, &mut table_notify).await;
+    assert_eq!(files_to_delete, vec![local_index_block]);
+
+    // Read and increment reference count.
+    let snapshot_read_output_2 = perform_read_request_for_test(&mut table).await;
+    let read_state_2 = snapshot_read_output_2.take_as_read_state().await;
+    drop(read_state_2);
+    sync_read_request_for_test(&mut table, &mut table_notify).await;
+
+    // Create a mooncake snapshot to reflect read request completion result.
+    let (_, _, _, files_to_delete) =
+        create_mooncake_snapshot_for_test(&mut table, &mut table_notify).await;
+    assert!(files_to_delete.is_empty());
+
+    // Check data file has been recorded in mooncake table.
+    let data_file_id = get_only_remote_data_file_id(&table, &temp_dir).await;
+    let index_block_file_id = get_only_index_block_file_id(&table).await;
+
+    // Check cache state.
+    assert_pending_eviction_entries_size(&mut cache, /*expected_count=*/ 0).await;
+    assert_evictable_cache_size(&mut cache, /*expected_count=*/ 0).await;
+    assert_non_evictable_cache_size(&mut cache, /*expected_count=*/ 2).await; // data file and index block file
+    assert_eq!(
+        cache
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(data_file_id))
+            .await,
+        1,
+    );
+    assert_eq!(
+        cache
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_id))
+            .await,
+        1,
+    );
+
+    // Drop all read states and check reference count.
+    let files_to_delete = drop_read_states_and_create_mooncake_snapshot(
+        vec![read_state_1],
+        &mut table,
+        &mut table_notify,
+    )
+    .await;
+    assert!(files_to_delete.is_empty());
+    assert_pending_eviction_entries_size(&mut cache, /*expected_count=*/ 0).await;
+    assert_evictable_cache_size(&mut cache, /*expected_count=*/ 1).await;
+    assert_non_evictable_cache_size(&mut cache, /*expected_count=*/ 1).await; // index block file
+    assert_eq!(
+        cache
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_id))
             .await,
         1,
     );
@@ -806,15 +953,9 @@ async fn test_3_read_and_read_over_and_unpinned_1_without_local_optimization() {
         create_mooncake_snapshot_for_test(&mut table, &mut table_notify).await;
     assert!(files_to_delete.is_empty());
 
-    // Check data file has been pinned in mooncake table.
-    let disk_files = get_disk_files_for_snapshot(&table).await;
-    assert_eq!(disk_files.len(), 1);
-    let (file, disk_file_entry) = disk_files.iter().next().unwrap();
-    assert!(disk_file_entry.cache_handle.is_none());
-    assert!(is_remote_file(file, &temp_dir));
-
-    let index_block_file_ids = get_index_block_file_ids(&table).await;
-    assert_eq!(index_block_file_ids.len(), 1);
+    // Check data file has been recorded in mooncake table.
+    let _ = get_only_remote_data_file_id(&table, &temp_dir).await;
+    let index_block_file_id = get_only_index_block_file_id(&table).await;
 
     // Check cache state.
     assert_pending_eviction_entries_size(&mut cache, /*expected_count=*/ 0).await;
@@ -822,7 +963,7 @@ async fn test_3_read_and_read_over_and_unpinned_1_without_local_optimization() {
     assert_non_evictable_cache_size(&mut cache, /*expected_count=*/ 1).await; // index block file
     assert_eq!(
         cache
-            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_ids[0]))
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_id))
             .await,
         1,
     );
@@ -844,11 +985,11 @@ async fn test_3_read_and_read_over_and_unpinned_1_with_local_optimization() {
 
     // Create iceberg snapshot and reflect persistence result to mooncake snapshot.
     create_mooncake_and_iceberg_snapshot_for_test(&mut table, &mut table_notify).await;
-    let local_data_file = get_only_data_filepath(&table).await;
+    let local_data_files_and_index_blocks = get_data_files_and_index_block_files(&table).await;
 
     let (_, _, _, files_to_delete) =
         create_mooncake_snapshot_for_test(&mut table, &mut table_notify).await;
-    assert_eq!(files_to_delete, vec![local_data_file]);
+    assert_eq!(files_to_delete, local_data_files_and_index_blocks);
 
     // Read and increment reference count.
     let snapshot_read_output = perform_read_request_for_test(&mut table).await;
@@ -861,15 +1002,9 @@ async fn test_3_read_and_read_over_and_unpinned_1_with_local_optimization() {
         create_mooncake_snapshot_for_test(&mut table, &mut table_notify).await;
     assert!(files_to_delete.is_empty());
 
-    // Check data file has been pinned in mooncake table.
-    let disk_files = get_disk_files_for_snapshot(&table).await;
-    assert_eq!(disk_files.len(), 1);
-    let (file, disk_file_entry) = disk_files.iter().next().unwrap();
-    assert!(disk_file_entry.cache_handle.is_none());
-    assert!(is_remote_file(file, &temp_dir));
-
-    let index_block_file_ids = get_index_block_file_ids(&table).await;
-    assert_eq!(index_block_file_ids.len(), 1);
+    // Check data file has been recorded in mooncake table.
+    let _ = get_only_remote_data_file_id(&table, &temp_dir).await;
+    let index_block_file_id = get_only_index_block_file_id(&table).await;
 
     // Check cache state.
     assert_pending_eviction_entries_size(&mut cache, /*expected_count=*/ 0).await;
@@ -877,7 +1012,7 @@ async fn test_3_read_and_read_over_and_unpinned_1_with_local_optimization() {
     assert_non_evictable_cache_size(&mut cache, /*expected_count=*/ 1).await; // index block file
     assert_eq!(
         cache
-            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_ids[0]))
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_id))
             .await,
         1,
     );
@@ -906,15 +1041,9 @@ async fn test_1_read_and_pinned_3_without_local_optimization() {
     let snapshot_read_output = perform_read_request_for_test(&mut table).await;
     let read_state = snapshot_read_output.take_as_read_state().await;
 
-    // Check data file has been pinned in mooncake table.
-    let disk_files = get_disk_files_for_snapshot(&table).await;
-    assert_eq!(disk_files.len(), 1);
-    let (file, disk_file_entry) = disk_files.iter().next().unwrap();
-    assert!(disk_file_entry.cache_handle.is_none());
-    assert!(is_remote_file(file, &temp_dir));
-
-    let index_block_file_ids = get_index_block_file_ids(&table).await;
-    assert_eq!(index_block_file_ids.len(), 1);
+    // Check data file has been recorded in mooncake table.
+    let data_file_id = get_only_remote_data_file_id(&table, &temp_dir).await;
+    let index_block_file_id = get_only_index_block_file_id(&table).await;
 
     // Check cache state.
     assert_pending_eviction_entries_size(&mut cache, /*expected_count=*/ 0).await;
@@ -922,13 +1051,13 @@ async fn test_1_read_and_pinned_3_without_local_optimization() {
     assert_non_evictable_cache_size(&mut cache, /*expected_count=*/ 2).await; // data file and index block file
     assert_eq!(
         cache
-            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(file.file_id()))
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(data_file_id))
             .await,
         1,
     );
     assert_eq!(
         cache
-            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_ids[0]))
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_id))
             .await,
         1,
     );
@@ -946,7 +1075,7 @@ async fn test_1_read_and_pinned_3_without_local_optimization() {
     assert_non_evictable_cache_size(&mut cache, /*expected_count=*/ 1).await; // index block file
     assert_eq!(
         cache
-            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_ids[0]))
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_id))
             .await,
         1,
     );
@@ -968,25 +1097,19 @@ async fn test_1_read_and_pinned_3_with_local_optimization() {
 
     // Create iceberg snapshot and reflect persistence result to mooncake snapshot.
     create_mooncake_and_iceberg_snapshot_for_test(&mut table, &mut table_notify).await;
-    let local_data_file = get_only_data_filepath(&table).await;
+    let data_files_and_index_blocks = get_data_files_and_index_block_files(&table).await;
 
     let (_, _, _, files_to_delete) =
         create_mooncake_snapshot_for_test(&mut table, &mut table_notify).await;
-    assert_eq!(files_to_delete, vec![local_data_file]);
+    assert_eq!(files_to_delete, data_files_and_index_blocks);
 
     // Read and increment reference count.
     let snapshot_read_output = perform_read_request_for_test(&mut table).await;
     let read_state = snapshot_read_output.take_as_read_state().await;
 
-    // Check data file has been pinned in mooncake table.
-    let disk_files = get_disk_files_for_snapshot(&table).await;
-    assert_eq!(disk_files.len(), 1);
-    let (file, disk_file_entry) = disk_files.iter().next().unwrap();
-    assert!(disk_file_entry.cache_handle.is_none());
-    assert!(is_remote_file(file, &temp_dir));
-
-    let index_block_file_ids = get_index_block_file_ids(&table).await;
-    assert_eq!(index_block_file_ids.len(), 1);
+    // Check data file has been recorded in mooncake table.
+    let data_file_id = get_only_remote_data_file_id(&table, &temp_dir).await;
+    let index_block_file_id = get_only_index_block_file_id(&table).await;
 
     // Check cache state.
     assert_pending_eviction_entries_size(&mut cache, /*expected_count=*/ 0).await;
@@ -994,13 +1117,13 @@ async fn test_1_read_and_pinned_3_with_local_optimization() {
     assert_non_evictable_cache_size(&mut cache, /*expected_count=*/ 2).await; // data file and index block file
     assert_eq!(
         cache
-            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(file.file_id()))
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(data_file_id))
             .await,
         1,
     );
     assert_eq!(
         cache
-            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_ids[0]))
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_id))
             .await,
         1,
     );
@@ -1018,7 +1141,7 @@ async fn test_1_read_and_pinned_3_with_local_optimization() {
     assert_non_evictable_cache_size(&mut cache, /*expected_count=*/ 1).await; // index block file
     assert_eq!(
         cache
-            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_ids[0]))
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_id))
             .await,
         1,
     );
@@ -1051,23 +1174,17 @@ async fn test_1_read_and_unpinned_3_without_local_optimization() {
     let snapshot_read_output = perform_read_request_for_test(&mut table).await;
     let read_state = snapshot_read_output.take_as_read_state().await;
 
-    // Check data file has been pinned in mooncake table.
-    let disk_files = get_disk_files_for_snapshot(&table).await;
-    assert_eq!(disk_files.len(), 1);
-    let (file, disk_file_entry) = disk_files.iter().next().unwrap();
-    assert!(disk_file_entry.cache_handle.is_none());
-    assert!(is_remote_file(file, &temp_dir));
-
-    let index_block_file_ids = get_index_block_file_ids(&table).await;
-    assert_eq!(index_block_file_ids.len(), 1);
+    // Check data file has been recorded in mooncake table.
+    let data_file_id = get_only_remote_data_file_id(&table, &temp_dir).await;
+    let _ = get_only_index_block_file_id(&table).await;
 
     // Check cache state.
-    check_file_not_pinned(&cache, file.file_id()).await;
+    check_file_not_pinned(&cache, data_file_id).await;
     check_file_pinned(&cache, FAKE_FILE_ID.file_id).await;
 
     // Drop all read states and check reference count.
     drop_read_states(vec![read_state], &mut table, &mut table_notify).await;
-    check_file_not_pinned(&cache, file.file_id()).await;
+    check_file_not_pinned(&cache, data_file_id).await;
     check_file_pinned(&cache, FAKE_FILE_ID.file_id).await;
 }
 
@@ -1088,11 +1205,12 @@ async fn test_1_read_and_unpinned_3_with_local_optimization() {
 
     // Create iceberg snapshot and reflect persistence result to mooncake snapshot.
     create_mooncake_and_iceberg_snapshot_for_test(&mut table, &mut table_notify).await;
-    let local_data_file = get_only_data_filepath(&table).await;
+    let local_data_files_and_index_blocks = get_data_files_and_index_block_files(&table).await;
 
-    let (_, _, _, files_to_delete) =
+    let (_, _, _, mut files_to_delete) =
         create_mooncake_snapshot_for_test(&mut table, &mut table_notify).await;
-    assert_eq!(files_to_delete, vec![local_data_file]);
+    files_to_delete.sort();
+    assert_eq!(files_to_delete, local_data_files_and_index_blocks);
 
     // Import second data file into cache, so the cached entry will be evicted.
     import_fake_cache_entry(&temp_dir, &mut cache).await;
@@ -1101,23 +1219,17 @@ async fn test_1_read_and_unpinned_3_with_local_optimization() {
     let snapshot_read_output = perform_read_request_for_test(&mut table).await;
     let read_state = snapshot_read_output.take_as_read_state().await;
 
-    // Check data file has been pinned in mooncake table.
-    let disk_files = get_disk_files_for_snapshot(&table).await;
-    assert_eq!(disk_files.len(), 1);
-    let (file, disk_file_entry) = disk_files.iter().next().unwrap();
-    assert!(disk_file_entry.cache_handle.is_none());
-    assert!(is_remote_file(file, &temp_dir));
-
-    let index_block_file_ids = get_index_block_file_ids(&table).await;
-    assert_eq!(index_block_file_ids.len(), 1);
+    // Check data file has been recorded in mooncake table.
+    let data_file_id = get_only_remote_data_file_id(&table, &temp_dir).await;
+    let _ = get_only_index_block_file_id(&table).await;
 
     // Check cache state.
-    check_file_not_pinned(&cache, file.file_id()).await;
+    check_file_not_pinned(&cache, data_file_id).await;
     check_file_pinned(&cache, FAKE_FILE_ID.file_id).await;
 
     // Drop all read states and check reference count.
     drop_read_states(vec![read_state], &mut table, &mut table_notify).await;
-    check_file_not_pinned(&cache, file.file_id()).await;
+    check_file_not_pinned(&cache, data_file_id).await;
     check_file_pinned(&cache, FAKE_FILE_ID.file_id).await;
 }
 
@@ -1164,15 +1276,9 @@ async fn test_2_read_and_pinned_3_without_local_optimization() {
     )
     .await;
 
-    // Check data file has been pinned in mooncake table.
-    let disk_files = get_disk_files_for_snapshot(&table).await;
-    assert_eq!(disk_files.len(), 1);
-    let (file, disk_file_entry) = disk_files.iter().next().unwrap();
-    assert!(disk_file_entry.cache_handle.is_none());
-    assert!(is_remote_file(file, &temp_dir));
-
-    let index_block_file_ids = get_index_block_file_ids(&table).await;
-    assert_eq!(index_block_file_ids.len(), 1);
+    // Check data file has been recorded in mooncake table.
+    let data_file_id = get_only_remote_data_file_id(&table, &temp_dir).await;
+    let index_block_file_id = get_only_index_block_file_id(&table).await;
 
     // Check cache state.
     assert_pending_eviction_entries_size(&mut cache, /*expected_count=*/ 0).await;
@@ -1180,13 +1286,13 @@ async fn test_2_read_and_pinned_3_without_local_optimization() {
     assert_non_evictable_cache_size(&mut cache, /*expected_count=*/ 2).await; // data file and index block file
     assert_eq!(
         cache
-            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(file.file_id()))
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(data_file_id))
             .await,
         1,
     );
     assert_eq!(
         cache
-            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_ids[0]))
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_id))
             .await,
         1,
     );
@@ -1204,7 +1310,7 @@ async fn test_2_read_and_pinned_3_without_local_optimization() {
     assert_non_evictable_cache_size(&mut cache, /*expected_count=*/ 1).await; // index block file
     assert_eq!(
         cache
-            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_ids[0]))
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_id))
             .await,
         1,
     );
@@ -1227,11 +1333,12 @@ async fn test_2_read_and_pinned_3_with_local_optimization() {
 
     // Create iceberg snapshot and reflect persistence result to mooncake snapshot.
     create_mooncake_and_iceberg_snapshot_for_test(&mut table, &mut table_notify).await;
-    let local_data_file = get_only_data_filepath(&table).await;
+    let local_data_files_and_index_blocks = get_data_files_and_index_block_files(&table).await;
 
-    let (_, _, _, files_to_delete) =
+    let (_, _, _, mut files_to_delete) =
         create_mooncake_snapshot_for_test(&mut table, &mut table_notify).await;
-    assert_eq!(files_to_delete, vec![local_data_file]);
+    files_to_delete.sort();
+    assert_eq!(files_to_delete, local_data_files_and_index_blocks);
 
     // Import second data file into cache, so the cached entry will be evicted.
     let mut fake_cache_handle = import_fake_cache_entry(&temp_dir, &mut cache).await;
@@ -1256,15 +1363,9 @@ async fn test_2_read_and_pinned_3_with_local_optimization() {
     )
     .await;
 
-    // Check data file has been pinned in mooncake table.
-    let disk_files = get_disk_files_for_snapshot(&table).await;
-    assert_eq!(disk_files.len(), 1);
-    let (file, disk_file_entry) = disk_files.iter().next().unwrap();
-    assert!(disk_file_entry.cache_handle.is_none());
-    assert!(is_remote_file(file, &temp_dir));
-
-    let index_block_file_ids = get_index_block_file_ids(&table).await;
-    assert_eq!(index_block_file_ids.len(), 1);
+    // Check data file has been recorded in mooncake table.
+    let data_file_id = get_only_remote_data_file_id(&table, &temp_dir).await;
+    let index_block_file_id = get_only_index_block_file_id(&table).await;
 
     // Check cache state.
     assert_pending_eviction_entries_size(&mut cache, /*expected_count=*/ 0).await;
@@ -1272,13 +1373,13 @@ async fn test_2_read_and_pinned_3_with_local_optimization() {
     assert_non_evictable_cache_size(&mut cache, /*expected_count=*/ 2).await; // data file and index block file
     assert_eq!(
         cache
-            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(file.file_id()))
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(data_file_id))
             .await,
         1,
     );
     assert_eq!(
         cache
-            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_ids[0]))
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_id))
             .await,
         1,
     );
@@ -1296,7 +1397,7 @@ async fn test_2_read_and_pinned_3_with_local_optimization() {
     assert_non_evictable_cache_size(&mut cache, /*expected_count=*/ 1).await; // index block file
     assert_eq!(
         cache
-            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_ids[0]))
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(index_block_file_id))
             .await,
         1,
     );
@@ -1334,18 +1435,12 @@ async fn test_2_read_and_unpinned_2_without_local_optimization() {
     let snapshot_read_output_2 = perform_read_request_for_test(&mut table).await;
     let read_state_2 = snapshot_read_output_2.take_as_read_state().await;
 
-    // Check data file has been pinned in mooncake table.
-    let disk_files = get_disk_files_for_snapshot(&table).await;
-    assert_eq!(disk_files.len(), 1);
-    let (file, disk_file_entry) = disk_files.iter().next().unwrap();
-    assert!(disk_file_entry.cache_handle.is_none());
-    assert!(is_remote_file(file, &temp_dir));
-
-    let index_block_file_ids = get_index_block_file_ids(&table).await;
-    assert_eq!(index_block_file_ids.len(), 1);
+    // Check data file has been recorded in mooncake table.
+    let data_file_id = get_only_remote_data_file_id(&table, &temp_dir).await;
+    let _ = get_only_index_block_file_id(&table).await;
 
     // Check cache state.
-    check_file_not_pinned(&cache, file.file_id()).await;
+    check_file_not_pinned(&cache, data_file_id).await;
     check_file_pinned(&cache, FAKE_FILE_ID.file_id).await;
 
     // Drop all read states and check reference count; cache only manages fake file here.
@@ -1356,7 +1451,7 @@ async fn test_2_read_and_unpinned_2_without_local_optimization() {
     )
     .await;
     assert!(files_to_delete.is_empty());
-    check_file_not_pinned(&cache, file.file_id()).await;
+    check_file_not_pinned(&cache, data_file_id).await;
     check_file_pinned(&cache, FAKE_FILE_ID.file_id).await;
 }
 
@@ -1377,11 +1472,12 @@ async fn test_2_read_and_unpinned_2_with_local_optimization() {
 
     // Create iceberg snapshot and reflect persistence result to mooncake snapshot.
     create_mooncake_and_iceberg_snapshot_for_test(&mut table, &mut table_notify).await;
-    let local_data_file = get_only_data_filepath(&table).await;
+    let local_data_files_and_index_blocks = get_data_files_and_index_block_files(&table).await;
 
-    let (_, _, _, files_to_delete) =
+    let (_, _, _, mut files_to_delete) =
         create_mooncake_snapshot_for_test(&mut table, &mut table_notify).await;
-    assert_eq!(files_to_delete, vec![local_data_file]);
+    files_to_delete.sort();
+    assert_eq!(files_to_delete, local_data_files_and_index_blocks);
 
     // Import second data file into cache, so the cached entry will be evicted.
     import_fake_cache_entry(&temp_dir, &mut cache).await;
@@ -1395,18 +1491,12 @@ async fn test_2_read_and_unpinned_2_with_local_optimization() {
     let snapshot_read_output_2 = perform_read_request_for_test(&mut table).await;
     let read_state_2 = snapshot_read_output_2.take_as_read_state().await;
 
-    // Check data file has been pinned in mooncake table.
-    let disk_files = get_disk_files_for_snapshot(&table).await;
-    assert_eq!(disk_files.len(), 1);
-    let (file, disk_file_entry) = disk_files.iter().next().unwrap();
-    assert!(disk_file_entry.cache_handle.is_none());
-    assert!(is_remote_file(file, &temp_dir));
-
-    let index_block_file_ids = get_index_block_file_ids(&table).await;
-    assert_eq!(index_block_file_ids.len(), 1);
+    // Check data file has been recorded in mooncake table.
+    let data_file_id = get_only_remote_data_file_id(&table, &temp_dir).await;
+    let _ = get_only_index_block_file_id(&table).await;
 
     // Check cache state.
-    check_file_not_pinned(&cache, file.file_id()).await;
+    check_file_not_pinned(&cache, data_file_id).await;
     check_file_pinned(&cache, FAKE_FILE_ID.file_id).await;
 
     // Drop all read states and check reference count; cache only manages fake file here.
@@ -1417,7 +1507,7 @@ async fn test_2_read_and_unpinned_2_with_local_optimization() {
     )
     .await;
     assert!(files_to_delete.is_empty());
-    check_file_not_pinned(&cache, file.file_id()).await;
+    check_file_not_pinned(&cache, data_file_id).await;
     check_file_pinned(&cache, FAKE_FILE_ID.file_id).await;
 }
 
@@ -1451,15 +1541,11 @@ async fn test_2_read_over_1_without_local_optimization() {
 
     drop(read_state);
 
-    // Check data file has been pinned in mooncake table.
-    let disk_files = get_disk_files_for_snapshot(&table).await;
-    assert_eq!(disk_files.len(), 1);
-    let (file, disk_file_entry) = disk_files.iter().next().unwrap();
-    assert!(disk_file_entry.cache_handle.is_none());
-    assert!(is_remote_file(file, &temp_dir));
+    // Check data file has been recorded in mooncake table.
+    let data_file_id = get_only_remote_data_file_id(&table, &temp_dir).await;
 
     // Check cache state.
-    check_file_not_pinned(&cache, file.file_id()).await;
+    check_file_not_pinned(&cache, data_file_id).await;
     check_file_pinned(&cache, FAKE_FILE_ID.file_id).await;
 }
 
@@ -1480,11 +1566,11 @@ async fn test_2_read_over_1_with_local_optimization() {
 
     // Create iceberg snapshot and reflect persistence result to mooncake snapshot.
     create_mooncake_and_iceberg_snapshot_for_test(&mut table, &mut table_notify).await;
-    let local_data_file = get_only_data_filepath(&table).await;
+    let local_data_files_and_index_blocks = get_data_files_and_index_block_files(&table).await;
 
     let (_, _, _, files_to_delete) =
         create_mooncake_snapshot_for_test(&mut table, &mut table_notify).await;
-    assert_eq!(files_to_delete, vec![local_data_file]);
+    assert_eq!(files_to_delete, local_data_files_and_index_blocks);
 
     // Import second data file into cache, so the cached entry will be evicted.
     import_fake_cache_entry(&temp_dir, &mut cache).await;
@@ -1496,7 +1582,7 @@ async fn test_2_read_over_1_with_local_optimization() {
 
     drop(read_state);
 
-    // Check data file has been pinned in mooncake table.
+    // Check data file has been recorded in mooncake table.
     let disk_files = get_disk_files_for_snapshot(&table).await;
     assert_eq!(disk_files.len(), 1);
     let (file, disk_file_entry) = disk_files.iter().next().unwrap();
@@ -1561,13 +1647,11 @@ async fn prepare_test_disk_files_for_compaction(
 ///
 /// Test scenario: remote, local, in use + use + use over & pinned => (old) remote, local, in use, (new) no remote, local, no use
 #[tokio::test]
-#[rstest]
-#[case(true)]
-#[case(false)]
-async fn test_3_compact_3_5(#[case] optimize_local_filesystem: bool) {
+async fn test_3_compact_3_5_without_local_filesystem_optimization() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let mut cache =
-        create_object_storage_cache_with_one_file_size(&temp_dir, optimize_local_filesystem);
+    let mut cache = create_object_storage_cache_with_one_file_size(
+        &temp_dir, /*optimize_local_filesystem=*/ false,
+    );
 
     let (mut table, mut table_notify) =
         prepare_test_disk_files_for_compaction(&temp_dir, cache.clone()).await;
@@ -1604,13 +1688,9 @@ async fn test_3_compact_3_5(#[case] optimize_local_filesystem: bool) {
     evicted_files_to_delete.sort();
     assert_eq!(evicted_files_to_delete, old_compacted_index_block_files);
 
-    // Check data file has been pinned in mooncake table.
-    let disk_files = get_disk_files_for_snapshot(&table).await;
-    assert_eq!(disk_files.len(), 1);
-    let (new_compacted_file, disk_file_entry) = disk_files.iter().next().unwrap();
-    assert!(disk_file_entry.cache_handle.is_some());
-    assert!(is_local_file(new_compacted_file, &temp_dir));
-    let new_compacted_data_file_size = disk_file_entry.file_size;
+    // Check data file has been recorded in mooncake table.
+    let (new_compacted_data_file_size, new_compacted_data_file_id) =
+        get_new_compacted_local_file_size_and_id(&table, &temp_dir).await;
     let new_compacted_index_block_size = get_index_block_files_size(&table).await;
     let new_compacted_index_block_file_ids = get_index_block_file_ids(&table).await;
     assert_eq!(new_compacted_index_block_file_ids.len(), 1);
@@ -1623,7 +1703,7 @@ async fn test_3_compact_3_5(#[case] optimize_local_filesystem: bool) {
     assert_eq!(
         cache
             .get_non_evictable_entry_ref_count(&get_unique_table_file_id(
-                new_compacted_file.file_id()
+                new_compacted_data_file_id
             ))
             .await,
         1,
@@ -1647,11 +1727,11 @@ async fn test_3_compact_3_5(#[case] optimize_local_filesystem: bool) {
     )
     .await;
     actual_files_to_delete.sort();
-    let mut expected_files_to_delete = old_compacted_data_files
+    let expected_files_to_delete = old_compacted_data_files
         .iter()
         .map(|f| f.file_path().clone())
+        .sorted()
         .collect::<Vec<_>>();
-    expected_files_to_delete.sort();
     assert_eq!(actual_files_to_delete, expected_files_to_delete);
 
     // Check cache status.
@@ -1665,7 +1745,125 @@ async fn test_3_compact_3_5(#[case] optimize_local_filesystem: bool) {
     assert_eq!(
         cache
             .get_non_evictable_entry_ref_count(&get_unique_table_file_id(
-                new_compacted_file.file_id()
+                new_compacted_data_file_id
+            ))
+            .await,
+        1
+    );
+    assert_eq!(
+        cache
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(
+                new_compacted_index_block_file_ids[0]
+            ))
+            .await,
+        1,
+    );
+}
+
+/// State transfer is the same as [`test_3_compact_3_5_without_local_filesystem_optimization`].
+/// Test scenario: remote, local, in use + use + use over & pinned => (old) remote, local, in use, (new) no remote, local, no use
+#[tokio::test]
+async fn test_3_compact_3_5_with_local_filesystem_optimization() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut cache = create_object_storage_cache_with_one_file_size(
+        &temp_dir, /*optimize_local_filesystem=*/ true,
+    );
+
+    let (mut table, mut table_notify) =
+        prepare_test_disk_files_for_compaction(&temp_dir, cache.clone()).await;
+    let (_, _, _, files_to_delete) =
+        create_mooncake_snapshot_for_test(&mut table, &mut table_notify).await;
+    assert!(files_to_delete.is_empty());
+
+    // Get local data files and index blocks.
+    let local_index_blocks = get_index_block_filepaths(&table).await;
+
+    // Get old compacted files before compaction.
+    let disk_files = get_disk_files_for_snapshot(&table).await;
+    assert_eq!(disk_files.len(), 2);
+    let old_compacted_data_files = disk_files.keys().cloned().collect::<Vec<_>>();
+    let old_compacted_index_block_file_ids = get_index_block_file_ids(&table).await;
+    assert_eq!(old_compacted_index_block_file_ids.len(), 2);
+
+    // Read and increment reference count.
+    let snapshot_read_output = perform_read_request_for_test(&mut table).await;
+    let read_state = snapshot_read_output.take_as_read_state().await;
+
+    // Create iceberg snapshot and reflect persistence result to mooncake snapshot.
+    create_mooncake_and_iceberg_snapshot_for_test(&mut table, &mut table_notify).await;
+    let (_, _, data_compaction_payload, mut files_to_delete) =
+        create_mooncake_snapshot_for_test(&mut table, &mut table_notify).await;
+    files_to_delete.sort();
+    assert_eq!(files_to_delete, local_index_blocks);
+    assert!(data_compaction_payload.is_some());
+
+    // Perform data compaction: use pinned local cache file and unreference.
+    let evicted_files_to_delete = perform_data_compaction_for_test(
+        &mut table,
+        &mut table_notify,
+        data_compaction_payload.unwrap(),
+    )
+    .await;
+    assert!(evicted_files_to_delete.is_empty());
+
+    // Check data file has been recorded in mooncake table.
+    let (new_compacted_data_file_size, new_compacted_data_file_id) =
+        get_new_compacted_local_file_size_and_id(&table, &temp_dir).await;
+    let new_compacted_index_block_size = get_index_block_files_size(&table).await;
+    let new_compacted_index_block_file_ids = get_index_block_file_ids(&table).await;
+    assert_eq!(new_compacted_index_block_file_ids.len(), 1);
+
+    // Check cache state.
+    assert_pending_eviction_entries_size(&mut cache, /*expected_count=*/ 2).await; // data files
+    assert_evictable_cache_size(&mut cache, /*expected_count=*/ 0).await;
+    // Two old compacted data files, one new compacted data file, and one new compacted index block
+    assert_non_evictable_cache_size(&mut cache, /*expected_count=*/ 4).await;
+    assert_eq!(
+        cache
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(
+                new_compacted_data_file_id
+            ))
+            .await,
+        1,
+    );
+    for cur_old_compacted_data_file in old_compacted_data_files.iter() {
+        assert_eq!(
+            cache
+                .get_non_evictable_entry_ref_count(&get_unique_table_file_id(
+                    cur_old_compacted_data_file.file_id()
+                ))
+                .await,
+            1,
+        );
+    }
+
+    // Drop all read states and check reference count and evicted files to delete.
+    let mut actual_files_to_delete = drop_read_states_and_create_mooncake_snapshot(
+        vec![read_state],
+        &mut table,
+        &mut table_notify,
+    )
+    .await;
+    actual_files_to_delete.sort();
+    let expected_files_to_delete = old_compacted_data_files
+        .iter()
+        .map(|f| f.file_path().clone())
+        .sorted()
+        .collect::<Vec<_>>();
+    assert_eq!(actual_files_to_delete, expected_files_to_delete);
+
+    // Check cache status.
+    assert_eq!(
+        cache.cache.read().await.cur_bytes,
+        (new_compacted_data_file_size as u64) + new_compacted_index_block_size,
+    );
+    assert_pending_eviction_entries_size(&mut cache, /*expected_count=*/ 0).await;
+    assert_evictable_cache_size(&mut cache, /*expected_count=*/ 0).await;
+    assert_non_evictable_cache_size(&mut cache, /*expected_count=*/ 2).await; // compacted data file and compacted index block
+    assert_eq!(
+        cache
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(
+                new_compacted_data_file_id
             ))
             .await,
         1
@@ -1682,13 +1880,11 @@ async fn test_3_compact_3_5(#[case] optimize_local_filesystem: bool) {
 
 /// Test scenario: remote, local, in use + use + use over & unpinned => (old) remote, no local, not used, (new) no remote, local, no use
 #[tokio::test]
-#[rstest]
-#[case(true)]
-#[case(false)]
-async fn test_3_compact_1_5(#[case] optimize_local_filesystem: bool) {
+async fn test_3_compact_1_5_without_local_filesystem_optimization() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let mut cache =
-        create_object_storage_cache_with_one_file_size(&temp_dir, optimize_local_filesystem);
+    let mut cache = create_object_storage_cache_with_one_file_size(
+        &temp_dir, /*optimize_local_filesystem=*/ false,
+    );
 
     let (mut table, mut table_notify) =
         prepare_test_disk_files_for_compaction(&temp_dir, cache.clone()).await;
@@ -1741,13 +1937,100 @@ async fn test_3_compact_1_5(#[case] optimize_local_filesystem: bool) {
     files_to_delete.sort();
     assert_eq!(files_to_delete, old_compacted_data_files);
 
-    // Check data file has been pinned in mooncake table.
+    // Check data file has been recorded in mooncake table.
+    let (new_compacted_data_file_size, new_compacted_data_file_id) =
+        get_new_compacted_local_file_size_and_id(&table, &temp_dir).await;
+    let new_compacted_file_index_size = get_index_block_files_size(&table).await;
+    let new_compacted_index_block_file_ids = get_index_block_file_ids(&table).await;
+
+    // Check cache state.
+    assert_eq!(
+        cache.cache.read().await.cur_bytes,
+        (new_compacted_data_file_size as u64) + new_compacted_file_index_size,
+    );
+    assert_pending_eviction_entries_size(&mut cache, /*expected_count=*/ 0).await;
+    assert_evictable_cache_size(&mut cache, /*expected_count=*/ 0).await;
+    assert_non_evictable_cache_size(&mut cache, /*expected_count=*/ 2).await; // data file and index block file
+    assert_eq!(
+        cache
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(
+                new_compacted_data_file_id
+            ))
+            .await,
+        1,
+    );
+    assert_eq!(
+        cache
+            .get_non_evictable_entry_ref_count(&get_unique_table_file_id(
+                new_compacted_index_block_file_ids[0]
+            ))
+            .await,
+        1,
+    );
+}
+
+/// State transfer is the same as [`test_3_compact_1_5_with_local_filesystem_optimization`].
+/// Test scenario: remote, local, in use + use + use over & unpinned => (old) remote, no local, not used, (new) no remote, local, no use
+#[tokio::test]
+async fn test_3_compact_1_5_with_local_filesystem_optimization() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut cache = create_object_storage_cache_with_one_file_size(
+        &temp_dir, /*optimize_local_filesystem=*/ true,
+    );
+
+    let (mut table, mut table_notify) =
+        prepare_test_disk_files_for_compaction(&temp_dir, cache.clone()).await;
+    let (_, _, _, files_to_delete) =
+        create_mooncake_snapshot_for_test(&mut table, &mut table_notify).await;
+    assert!(files_to_delete.is_empty());
+
+    // Get old compacted files before compaction.
     let disk_files = get_disk_files_for_snapshot(&table).await;
-    assert_eq!(disk_files.len(), 1);
-    let (new_compacted_file, disk_file_entry) = disk_files.iter().next().unwrap();
-    assert!(disk_file_entry.cache_handle.is_some());
-    assert!(is_local_file(new_compacted_file, &temp_dir));
-    let new_compacted_data_file_size = disk_file_entry.file_size;
+    assert_eq!(disk_files.len(), 2);
+    let old_compacted_data_files = disk_files
+        .keys()
+        .map(|f| f.file_path().clone())
+        .sorted()
+        .collect::<Vec<_>>();
+
+    let old_compacted_index_block_files = get_index_block_filepaths(&table).await;
+    let old_compacted_index_block_file_ids = get_index_block_file_ids(&table).await;
+    assert_eq!(old_compacted_index_block_file_ids.len(), 2);
+
+    // Read and increment reference count.
+    let snapshot_read_output = perform_read_request_for_test(&mut table).await;
+    let read_state = snapshot_read_output.take_as_read_state().await;
+
+    // Create iceberg snapshot and reflect persistence result to mooncake snapshot.
+    create_mooncake_and_iceberg_snapshot_for_test(&mut table, &mut table_notify).await;
+    let (_, _, data_compaction_payload, mut files_to_delete) =
+        create_mooncake_snapshot_for_test(&mut table, &mut table_notify).await;
+    files_to_delete.sort();
+    assert_eq!(files_to_delete, old_compacted_index_block_files);
+    assert!(data_compaction_payload.is_some());
+
+    // Perform data compaction: use pinned local cache file and unreference.
+    let evicted_files_to_delete = perform_data_compaction_for_test(
+        &mut table,
+        &mut table_notify,
+        data_compaction_payload.unwrap(),
+    )
+    .await;
+    assert!(evicted_files_to_delete.is_empty());
+
+    // Drop read state, so old data files are unreferenced any more.
+    let mut files_to_delete = drop_read_states_and_create_mooncake_snapshot(
+        vec![read_state],
+        &mut table,
+        &mut table_notify,
+    )
+    .await;
+    files_to_delete.sort();
+    assert_eq!(files_to_delete, old_compacted_data_files);
+
+    // Check data file has been recorded in mooncake table.
+    let (new_compacted_data_file_size, new_compacted_data_file_id) =
+        get_new_compacted_local_file_size_and_id(&table, &temp_dir).await;
     let new_compacted_file_index_size = get_index_block_files_size(&table).await;
     let new_compacted_index_block_file_ids = get_index_block_file_ids(&table).await;
     assert_eq!(new_compacted_index_block_file_ids.len(), 1);
@@ -1763,7 +2046,7 @@ async fn test_3_compact_1_5(#[case] optimize_local_filesystem: bool) {
     assert_eq!(
         cache
             .get_non_evictable_entry_ref_count(&get_unique_table_file_id(
-                new_compacted_file.file_id()
+                new_compacted_data_file_id
             ))
             .await,
         1,
@@ -1818,13 +2101,9 @@ async fn test_1_compact_1_5_without_local_optimization() {
     // It contains one fake file, and two downloaded local file and their file indices.
     assert_eq!(evicted_files_to_delete.len(), 5);
 
-    // Check data file has been pinned in mooncake table.
-    let disk_files = get_disk_files_for_snapshot(&table).await;
-    assert_eq!(disk_files.len(), 1);
-    let (new_compacted_file, disk_file_entry) = disk_files.iter().next().unwrap();
-    assert!(disk_file_entry.cache_handle.is_some());
-    assert!(is_local_file(new_compacted_file, &temp_dir));
-    let new_compacted_data_file_size = disk_file_entry.file_size;
+    // Check data file has been recorded in mooncake table.
+    let (new_compacted_data_file_size, new_compacted_data_file_id) =
+        get_new_compacted_local_file_size_and_id(&table, &temp_dir).await;
     let file_indices = get_index_block_filepaths(&table).await;
     assert_eq!(file_indices.len(), 1);
     let new_compacted_index_block_size = get_index_block_files_size(&table).await;
@@ -1842,7 +2121,7 @@ async fn test_1_compact_1_5_without_local_optimization() {
     assert_eq!(
         cache
             .get_non_evictable_entry_ref_count(&get_unique_table_file_id(
-                new_compacted_file.file_id()
+                new_compacted_data_file_id
             ))
             .await,
         1,
@@ -1872,16 +2151,15 @@ async fn test_1_compact_1_5_with_local_optimization() {
         create_mooncake_snapshot_for_test(&mut table, &mut table_notify).await;
     assert!(files_to_delete.is_empty());
 
-    // Get old compacted files before compaction.
-    let local_data_files =
-        get_disk_files_for_snapshot_and_assert(&table, /*expected_file_num=*/ 2).await;
+    // Get old compacted data files and index blocks before compaction.
+    let local_data_files_and_index_blocks = get_data_files_and_index_block_files(&table).await;
 
     // Create iceberg snapshot and reflect persistence result to mooncake snapshot.
     create_mooncake_and_iceberg_snapshot_for_test(&mut table, &mut table_notify).await;
     let (_, _, data_compaction_payload, mut files_to_delete) =
         create_mooncake_snapshot_for_test(&mut table, &mut table_notify).await;
     files_to_delete.sort();
-    assert_eq!(files_to_delete, local_data_files);
+    assert_eq!(files_to_delete, local_data_files_and_index_blocks);
     assert!(data_compaction_payload.is_some());
 
     // Import second data file into cache, so the cached entry will be evicted.
@@ -1896,16 +2174,12 @@ async fn test_1_compact_1_5_with_local_optimization() {
         data_compaction_payload.unwrap(),
     )
     .await;
-    // It contains one fake file, and two file indices.
-    assert_eq!(evicted_files_to_delete.len(), 3);
+    // It contains one fake file.
+    assert_eq!(evicted_files_to_delete.len(), 1);
 
-    // Check data file has been pinned in mooncake table.
-    let disk_files = get_disk_files_for_snapshot(&table).await;
-    assert_eq!(disk_files.len(), 1);
-    let (new_compacted_file, disk_file_entry) = disk_files.iter().next().unwrap();
-    assert!(disk_file_entry.cache_handle.is_some());
-    assert!(is_local_file(new_compacted_file, &temp_dir));
-    let new_compacted_data_file_size = disk_file_entry.file_size;
+    // Check data file has been recorded in mooncake table.
+    let (new_compacted_data_file_size, new_compacted_data_file_id) =
+        get_new_compacted_local_file_size_and_id(&table, &temp_dir).await;
     let file_indices = get_index_block_filepaths(&table).await;
     assert_eq!(file_indices.len(), 1);
     let new_compacted_index_block_size = get_index_block_files_size(&table).await;
@@ -1923,7 +2197,7 @@ async fn test_1_compact_1_5_with_local_optimization() {
     assert_eq!(
         cache
             .get_non_evictable_entry_ref_count(&get_unique_table_file_id(
-                new_compacted_file.file_id()
+                new_compacted_data_file_id
             ))
             .await,
         1,

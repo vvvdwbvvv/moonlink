@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use itertools::Itertools;
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::Receiver;
@@ -12,15 +13,15 @@ use crate::storage::cache::object_storage::base_cache::{CacheEntry, FileMetadata
 use crate::storage::compaction::compaction_config::DataCompactionConfig;
 use crate::storage::iceberg::test_utils::*;
 use crate::storage::index::persisted_bucket_hash_map::GlobalIndex;
-use crate::storage::io_utils;
 use crate::storage::mooncake_table::{
     DataCompactionPayload, DataCompactionResult, DiskFileEntry, FileIndiceMergePayload,
-    FileIndiceMergeResult, IcebergSnapshotPayload, IcebergSnapshotResult, SnapshotOption,
+    FileIndiceMergeResult, IcebergSnapshotPayload, IcebergSnapshotResult, Snapshot, SnapshotOption,
     TableConfig as MooncakeTableConfig,
 };
 use crate::storage::storage_utils::{
     FileId, MooncakeDataFileRef, ProcessedDeletionRecord, TableId, TableUniqueFileId,
 };
+use crate::storage::{io_utils, PuffinBlobRef};
 use crate::table_notify::TableNotify;
 use crate::{
     IcebergTableConfig, MooncakeTable, NonEvictableHandle, ObjectStorageCache,
@@ -308,22 +309,140 @@ pub(crate) async fn get_disk_files_for_snapshot_and_assert(
 ) -> Vec<String> {
     let guard = table.snapshot.read().await;
     assert_eq!(guard.current_snapshot.disk_files.len(), expected_file_num);
-    let mut data_files = guard
+    let data_files = guard
         .current_snapshot
         .disk_files
         .keys()
         .map(|f| f.file_path().to_string())
+        .sorted()
         .collect::<Vec<_>>();
-    data_files.sort();
     data_files
 }
 
-/// Test util to get the only data file filepath for the given mooncake table.
-pub(crate) async fn get_only_data_filepath(table: &MooncakeTable) -> String {
+/// Test util to get all index block file ids for the table, and assert there's only one file.
+///
+/// TODO(hjiang): Add assertion whether it's remote or local.
+pub(super) async fn get_only_index_block_file_id(table: &MooncakeTable) -> FileId {
+    let mut file_ids = vec![];
+
+    let guard = table.snapshot.read().await;
+    for cur_file_index in guard.current_snapshot.indices.file_indices.iter() {
+        for cur_index_block in cur_file_index.index_blocks.iter() {
+            assert!(cur_index_block.cache_handle.is_some());
+            file_ids.push(cur_index_block.index_file.file_id());
+        }
+    }
+
+    assert_eq!(file_ids.len(), 1);
+    file_ids[0]
+}
+
+/// Test util to get all index block file ids for the table, and assert there's only one file.
+pub(super) async fn get_only_index_block_filepath(table: &MooncakeTable) -> String {
+    let mut index_block_filepaths = vec![];
+
+    let guard = table.snapshot.read().await;
+    for cur_file_index in guard.current_snapshot.indices.file_indices.iter() {
+        for cur_index_block in cur_file_index.index_blocks.iter() {
+            assert!(cur_index_block.cache_handle.is_some());
+            index_block_filepaths.push(cur_index_block.index_file.file_path().to_string());
+        }
+    }
+
+    assert_eq!(index_block_filepaths.len(), 1);
+    index_block_filepaths[0].clone()
+}
+
+/// Test util to get the only puffin blob ref for the given mooncake snapshot.
+pub(super) fn get_only_puffin_blob_ref_from_snapshot(snapshot: &Snapshot) -> PuffinBlobRef {
+    let disk_files = snapshot.disk_files.clone();
+    assert_eq!(disk_files.len(), 1);
+    disk_files
+        .iter()
+        .next()
+        .unwrap()
+        .1
+        .puffin_deletion_blob
+        .as_ref()
+        .unwrap()
+        .clone()
+}
+
+/// Test util to get the only puffin blob ref for the given mooncake table.
+pub(super) async fn get_only_puffin_blob_ref_from_table(table: &MooncakeTable) -> PuffinBlobRef {
     let guard = table.snapshot.read().await;
     let disk_files = guard.current_snapshot.disk_files.clone();
     assert_eq!(disk_files.len(), 1);
-    disk_files.iter().next().unwrap().0.file_path().to_string()
+    disk_files
+        .iter()
+        .next()
+        .unwrap()
+        .1
+        .puffin_deletion_blob
+        .as_ref()
+        .unwrap()
+        .clone()
+}
+
+/// Test util to get data files and index block filepaths for the given mooncake table, filepaths returned in alphabetical order.
+pub(super) async fn get_data_files_and_index_block_files(table: &MooncakeTable) -> Vec<String> {
+    let mut files = vec![];
+
+    let guard = table.snapshot.read().await;
+
+    // Check and get data files.
+    let disk_files = guard.current_snapshot.disk_files.clone();
+    for (cur_file, _) in disk_files.iter() {
+        files.push(cur_file.file_path().to_string());
+    }
+
+    // Check and get index block files.
+    for cur_file_index in guard.current_snapshot.indices.file_indices.iter() {
+        for cur_index_block in cur_file_index.index_blocks.iter() {
+            files.push(cur_index_block.index_file.file_path().to_string());
+        }
+    }
+
+    files.sort();
+    files
+}
+
+///Test util function to assert there's only one data file in table snapshot, and it indicates remote file.
+pub(super) async fn get_only_remote_data_file_id(
+    table: &MooncakeTable,
+    temp_dir: &TempDir,
+) -> FileId {
+    let guard = table.snapshot.read().await;
+    let disk_files = &guard.current_snapshot.disk_files;
+    assert_eq!(disk_files.len(), 1);
+    let data_file = disk_files.iter().next().unwrap().0;
+    assert!(is_remote_file(data_file, temp_dir));
+    data_file.file_id()
+}
+
+/// Test util function to assert there's only one data file in table snapshot, and it indicates local file.
+pub(super) async fn get_only_local_data_file_id(
+    table: &MooncakeTable,
+    temp_dir: &TempDir,
+) -> FileId {
+    let guard = table.snapshot.read().await;
+    let disk_files = &guard.current_snapshot.disk_files;
+    assert_eq!(disk_files.len(), 1);
+    let (data_file, disk_file_entry) = disk_files.iter().next().unwrap();
+    assert!(disk_file_entry.cache_handle.is_some());
+
+    assert_eq!(
+        data_file.file_path(),
+        &disk_file_entry
+            .cache_handle
+            .as_ref()
+            .unwrap()
+            .cache_entry
+            .cache_filepath
+    );
+    assert!(is_local_file(data_file, temp_dir));
+
+    data_file.file_id()
 }
 
 /// Test util function to get committed and uncommitted deletion logs states.
@@ -340,7 +459,7 @@ pub(crate) async fn get_deletion_logs_for_snapshot(
     )
 }
 
-/// Test util function to get all index block filepaths from the given mooncake table.
+/// Test util function to get all index block filepaths from the given mooncake table, returned in alphabetic order.
 pub(super) async fn get_index_block_filepaths(table: &MooncakeTable) -> Vec<String> {
     let guard = table.snapshot.read().await;
     let mut index_block_files = vec![];
@@ -349,6 +468,8 @@ pub(super) async fn get_index_block_filepaths(table: &MooncakeTable) -> Vec<Stri
             index_block_files.push(cur_index_block.index_file.file_path().clone());
         }
     }
+
+    index_block_files.sort();
     index_block_files
 }
 
@@ -374,6 +495,21 @@ pub(super) async fn get_index_block_file_ids(table: &MooncakeTable) -> Vec<FileI
         }
     }
     index_block_files
+}
+
+/// Test util to get new compacted data file size and file id for the given mooncake table.
+/// Assert the file is of local filepath, and there's only one new compacted data file.
+pub(super) async fn get_new_compacted_local_file_size_and_id(
+    table: &MooncakeTable,
+    temp_dir: &TempDir,
+) -> (usize, FileId) {
+    let disk_files = get_disk_files_for_snapshot(table).await;
+    assert_eq!(disk_files.len(), 1);
+    let (new_compacted_file, disk_file_entry) = disk_files.iter().next().unwrap();
+    assert!(disk_file_entry.cache_handle.is_some());
+    assert!(is_local_file(new_compacted_file, temp_dir));
+    let new_compacted_data_file_size = disk_file_entry.file_size;
+    (new_compacted_data_file_size, new_compacted_file.file_id())
 }
 
 /// ===================================
