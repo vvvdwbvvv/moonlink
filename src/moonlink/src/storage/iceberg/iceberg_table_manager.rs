@@ -50,7 +50,7 @@ const MOONCAKE_TABLE_FLUSH_LSN: &str = "mooncake-table-flush-lsn";
 /// TODO(hjiang): Consider using `Option<>` to represent uninitialized, which is more rust-idiometic.
 const UNINITIALIZED_BATCH_DELETION_VECTOR_MAX_ROW: usize = 0;
 
-#[derive(Clone, Debug, TypedBuilder)]
+#[derive(Clone, Debug, PartialEq, TypedBuilder)]
 pub struct IcebergTableConfig {
     /// Table warehouse location.
     #[builder(default = "/tmp/moonlink_iceberg".to_string())]
@@ -61,6 +61,12 @@ pub struct IcebergTableConfig {
     /// Iceberg table name.
     #[builder(default = "table".to_string())]
     pub table_name: String,
+}
+
+impl Default for IcebergTableConfig {
+    fn default() -> Self {
+        Self::builder().build()
+    }
 }
 
 #[derive(Clone, Debug)]
