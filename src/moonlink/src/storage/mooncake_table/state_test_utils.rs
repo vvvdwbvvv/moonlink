@@ -692,6 +692,7 @@ async fn sync_data_compaction(receiver: &mut Receiver<TableEvent>) -> DataCompac
 /// ===================================
 /// Composite util functions
 /// ===================================
+///
 // Test util function, which creates mooncake snapshot for testing.
 pub(crate) async fn create_mooncake_snapshot_for_test(
     table: &mut MooncakeTable,
