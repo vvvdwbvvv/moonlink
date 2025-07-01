@@ -148,7 +148,7 @@ pub(crate) fn create_test_table_metadata_with_config(
 ) -> Arc<MooncakeTableMetadata> {
     Arc::new(MooncakeTableMetadata {
         name: "test_table".to_string(),
-        id: 0,
+        table_id: 0,
         schema: create_test_arrow_schema(),
         config: mooncake_table_config,
         path: std::path::PathBuf::from(local_table_directory),
@@ -218,7 +218,7 @@ pub(crate) async fn create_table_and_iceberg_manager_with_data_compaction_config
     let mut table = MooncakeTable::new(
         schema.as_ref().clone(),
         "test_table".to_string(),
-        /*version=*/ 1,
+        /*table_id=*/ 1,
         path,
         identity_property,
         iceberg_table_config.clone(),

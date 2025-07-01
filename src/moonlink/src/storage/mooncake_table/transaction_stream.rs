@@ -304,7 +304,7 @@ impl SnapshotTableState {
 
                         // Import data files into cache.
                         let file_id = TableUniqueFileId {
-                            table_id: TableId(self.mooncake_table_metadata.id),
+                            table_id: TableId(self.mooncake_table_metadata.table_id),
                             file_id: file.file_id(),
                         };
                         let (cache_handle, cur_evicted_files) = self

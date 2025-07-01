@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests {
     use arrow_array::Int64Array;
+    use moonlink_metadata_store::{base_metadata_store::MetadataStoreTrait, PgMetadataStore};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -16,6 +17,8 @@ mod tests {
 
     const SRC_URI: &str = "postgresql://postgres:postgres@postgres:5432/postgres";
     const DST_URI: &str = "postgresql://postgres:postgres@postgres:5432/postgres";
+    const CREATE_TABLE_SCHEMA_SQL: &str =
+        include_str!("../../moonlink_metadata_store/src/postgres/sql/create_tables.sql");
 
     type DatabaseId = u64;
     type TableId = u64;
@@ -129,6 +132,10 @@ mod tests {
             ))
             .await
             .unwrap();
+        client
+            .simple_query("DROP TABLE IF EXISTS mooncake.tables")
+            .await
+            .unwrap();
         backend
             .create_table(
                 DATABASE_ID,
@@ -157,11 +164,16 @@ mod tests {
             )
             .await
             .unwrap();
+        client
+            .simple_query("DROP TABLE IF EXISTS mooncake.tables;")
+            .await
+            .unwrap();
+        client.simple_query(CREATE_TABLE_SCHEMA_SQL).await.unwrap();
 
         backend
             .create_table(
                 DATABASE_ID,
-                /*table_id*=*/ TABLE_ID,
+                TABLE_ID,
                 DST_URI.to_string(),
                 /*table_name=*/ "public.test".to_string(),
                 uri.to_string(),
@@ -423,16 +435,34 @@ mod tests {
                 .unwrap(),
         );
 
-        assert_eq!(
-            ids.len(),
-            1_000_000,
-            "expected exactly 1 000 000 rows visible in snapshot"
-        );
+        assert_eq!(ids.len(), 1_000_000);
         assert!(ids.contains(&1), "row id 1 missing");
         assert!(ids.contains(&1_000_000), "row id 1_000_000 missing");
-        assert!(
-            ids.len() == 1_000_000,
-            "expected exactly 1_000_000 rows visible in snapshot"
+        assert_eq!(ids.len(), 1_000_000);
+    }
+
+    /// Testing scenario: perform table creation and drop operations, and check metadata store table states.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn test_metadata_store() {
+        let (guard, _) = TestGuard::new("metadata_store").await;
+        // Till now, table [`metadata_store`] has been created at both row storage and column storage database.
+        let backend = &guard.backend;
+        let metadata_store = PgMetadataStore::new(DST_URI).await.unwrap();
+
+        // Check metadata storage after table creation.
+        let moonlink_table_config = metadata_store
+            .load_table_config(TABLE_ID as u32)
+            .await
+            .unwrap();
+        assert_eq!(
+            moonlink_table_config.iceberg_table_config.table_name,
+            format!("{}.{}", DATABASE_ID, TABLE_ID)
         );
+
+        // Drop table and check metadata storage.
+        backend.drop_table(DATABASE_ID, TABLE_ID).await;
+        let res = metadata_store.load_table_config(TABLE_ID as u32).await;
+        assert!(res.is_err());
     }
 }

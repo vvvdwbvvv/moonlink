@@ -1,13 +1,17 @@
-pub mod columnstore_table_id;
 mod error;
 mod logging;
+pub mod mooncake_table_id;
 
-use columnstore_table_id::ColumnstoreTableId;
 pub use error::{Error, Result};
+use mooncake_table_id::MooncakeTableId;
 pub use moonlink::ReadState;
 use moonlink::{ObjectStorageCache, ObjectStorageCacheConfig};
 use moonlink_connectors::ReplicationManager;
+use moonlink_metadata_store::base_metadata_store::MetadataStoreTrait;
+use moonlink_metadata_store::PgMetadataStore;
 use more_asserts as ma;
+use std::collections::hash_map::Entry as HashMapEntry;
+use std::collections::HashMap;
 use std::hash::Hash;
 use std::io::ErrorKind;
 use std::sync::Arc;
@@ -52,7 +56,11 @@ pub struct MoonlinkBackend<
     T: Eq + Hash + Clone + std::fmt::Display,
 > {
     // Could be either relative or absolute path.
-    replication_manager: RwLock<ReplicationManager<ColumnstoreTableId<D, T>>>,
+    replication_manager: RwLock<ReplicationManager<MooncakeTableId<D, T>>>,
+    // Maps from metadata store connection string to metadata store client.
+    //
+    // TODO(hjiang): Store trait instead of concrete metadata store client.
+    metadata_store_clients: RwLock<HashMap<D, PgMetadataStore>>,
 }
 
 /// Util function to get filesystem size for cache directory
@@ -101,6 +109,7 @@ where
                 temp_files_dir.to_str().unwrap().to_string(),
                 create_default_object_storage_cache(cache_files_dir),
             )),
+            metadata_store_clients: RwLock::new(HashMap::new()),
         }
     }
 
@@ -108,11 +117,11 @@ where
     pub async fn create_snapshot(&self, database_id: D, table_id: T, lsn: u64) -> Result<()> {
         let mut rx = {
             let mut manager = self.replication_manager.write().await;
-            let columnstore_table_id = ColumnstoreTableId {
+            let mooncake_table_id = MooncakeTableId {
                 database_id,
                 table_id,
             };
-            let writer = manager.get_table_event_manager(&columnstore_table_id);
+            let writer = manager.get_table_event_manager(&mooncake_table_id);
             writer.initiate_snapshot(lsn).await
         };
         rx.recv().await.unwrap()?;
@@ -121,34 +130,68 @@ where
 
     /// # Arguments
     ///
-    /// * src_uri: connection string for source database.
-    /// * dst_uri: connection string for
+    /// * src_uri: connection string for source database (row storage database).
     pub async fn create_table(
         &self,
         database_id: D,
         table_id: T,
-        _dst_uri: String,
+        metadata_store_uri: String,
         src_table_name: String,
         src_uri: String,
     ) -> Result<()> {
-        let mut manager = self.replication_manager.write().await;
-        let columnstore_table_id = ColumnstoreTableId {
-            database_id,
+        let mooncake_table_id = MooncakeTableId {
+            database_id: database_id.clone(),
             table_id,
         };
-        manager
-            .add_table(&src_uri, columnstore_table_id, &src_table_name)
-            .await?;
+        let table_id = mooncake_table_id.get_table_id_value();
+
+        // Add mooncake table to replication, and create corresponding mooncake table.
+        let moonlink_table_config = {
+            let mut manager = self.replication_manager.write().await;
+            manager
+                .add_table(&src_uri, mooncake_table_id, table_id, &src_table_name)
+                .await?
+        };
+
+        // Create metadata store entry.
+        {
+            let mut guard = self.metadata_store_clients.write().await;
+            let cur_metadata_store_client = match guard.entry(database_id.clone()) {
+                HashMapEntry::Occupied(entry) => entry.into_mut(),
+                HashMapEntry::Vacant(entry) => {
+                    let new_metadata_store = PgMetadataStore::new(&metadata_store_uri).await?;
+                    entry.insert(new_metadata_store)
+                }
+            };
+            cur_metadata_store_client
+                .store_table_config(table_id, &src_table_name, moonlink_table_config)
+                .await?;
+        }
+
         Ok(())
     }
 
     pub async fn drop_table(&self, database_id: D, table_id: T) {
-        let mut manager = self.replication_manager.write().await;
-        let columnstore_table_id = ColumnstoreTableId {
-            database_id,
+        let mooncake_table_id = MooncakeTableId {
+            database_id: database_id.clone(),
             table_id,
         };
-        manager.drop_table(columnstore_table_id).await.unwrap();
+        let table_id = mooncake_table_id.get_table_id_value();
+
+        let table_exists = {
+            let mut manager = self.replication_manager.write().await;
+
+            manager.drop_table(mooncake_table_id).await.unwrap()
+        };
+        if !table_exists {
+            return;
+        }
+
+        let metadata_store = {
+            let mut guard = self.metadata_store_clients.write().await;
+            guard.remove(&database_id).unwrap()
+        };
+        metadata_store.delete_table_config(table_id).await.unwrap()
     }
 
     pub async fn scan_table(
@@ -159,11 +202,11 @@ where
     ) -> Result<Arc<ReadState>> {
         let read_state = {
             let manager = self.replication_manager.read().await;
-            let columnstore_table_id = ColumnstoreTableId {
+            let mooncake_table_id = MooncakeTableId {
                 database_id,
                 table_id,
             };
-            let table_reader = manager.get_table_reader(&columnstore_table_id);
+            let table_reader = manager.get_table_reader(&mooncake_table_id);
             table_reader.try_read(lsn).await?
         };
 
