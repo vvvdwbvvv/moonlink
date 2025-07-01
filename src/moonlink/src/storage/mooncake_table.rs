@@ -399,6 +399,13 @@ impl SnapshotOption {
 /// And periodically disk slices will be merged and compacted.
 /// Single thread is used to write to the table.
 ///
+/// LSN is used for visiblity control of mooncake table.
+/// Currently it has following rules:
+/// For read at lsn X, any record committed at lsn <= X is visible.
+/// For commit at lsn X, any record whose lsn < X is committed.
+///
+/// COMMIT_LSN_xact_1 <= DELETE_LSN_xact_2 < COMMIT_LSN_xact_2
+///
 pub struct MooncakeTable {
     /// Current metadata of the table.
     ///
@@ -663,6 +670,14 @@ impl MooncakeTable {
     pub fn commit(&mut self, lsn: u64) {
         self.next_snapshot_task.new_commit_lsn = lsn;
         self.next_snapshot_task.new_commit_point = Some(self.mem_slice.get_commit_check_point());
+        assert!(
+            self.next_snapshot_task.new_deletions.is_empty()
+                || self.next_snapshot_task.new_deletions.last().unwrap().lsn >= transaction_stream::LSN_START_FOR_STREAMING_XACT
+                || self.next_snapshot_task.new_deletions.last().unwrap().lsn < lsn,
+            "We expect commit LSN to be strictly greater than the last deletion LSN, but got commit LSN {} and last deletion LSN {}",
+            lsn,
+            self.next_snapshot_task.new_deletions.last().unwrap().lsn,
+        );
     }
 
     /// Shutdown the current table, which unpins all referenced data files in the global data file.

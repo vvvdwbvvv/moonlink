@@ -157,7 +157,7 @@ impl SnapshotTableState {
         let mut aggregated_deletion_logs = HashMap::new();
         for cur_deletion_log in self.committed_deletion_log.iter() {
             ma::assert_le!(cur_deletion_log.lsn, self.current_snapshot.snapshot_version);
-            if cur_deletion_log.lsn > flush_lsn {
+            if cur_deletion_log.lsn >= flush_lsn {
                 continue;
             }
             if let RecordLocation::DiskFile(file_id, row_idx) = &cur_deletion_log.pos {
@@ -196,7 +196,7 @@ impl SnapshotTableState {
         let old_committed_deletion_logs = std::mem::take(&mut self.committed_deletion_log);
         for cur_deletion_log in old_committed_deletion_logs.into_iter() {
             ma::assert_le!(cur_deletion_log.lsn, self.current_snapshot.snapshot_version);
-            if cur_deletion_log.lsn > flush_point_lsn {
+            if cur_deletion_log.lsn >= flush_point_lsn {
                 new_committed_deletion_log.push(cur_deletion_log);
                 continue;
             }
@@ -1340,7 +1340,8 @@ impl SnapshotTableState {
         match loc {
             RecordLocation::MemoryBatch(_, _) => true,
             RecordLocation::DiskFile(file_id, _) => {
-                file_id_to_lsn.get(file_id).is_none() || file_id_to_lsn.get(file_id).unwrap() < &lsn
+                file_id_to_lsn.get(file_id).is_none()
+                    || file_id_to_lsn.get(file_id).unwrap() <= &lsn
             }
         }
     }
@@ -1413,7 +1414,7 @@ impl SnapshotTableState {
 
         for mut entry in take(&mut self.uncommitted_deletion_log) {
             let deletion = entry.take().unwrap();
-            if deletion.lsn <= task.new_commit_lsn {
+            if deletion.lsn < task.new_commit_lsn {
                 self.commit_deletion(deletion);
             } else {
                 still_uncommitted.push(Some(deletion));
@@ -1429,7 +1430,7 @@ impl SnapshotTableState {
         new_commit_lsn: u64,
     ) {
         for deletion in deletions.into_iter() {
-            if deletion.lsn <= new_commit_lsn {
+            if deletion.lsn < new_commit_lsn {
                 self.commit_deletion(deletion);
             } else {
                 self.uncommitted_deletion_log.push(Some(deletion));
