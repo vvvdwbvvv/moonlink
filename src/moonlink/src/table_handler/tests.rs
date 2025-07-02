@@ -13,6 +13,7 @@ use crate::storage::mooncake_table::TableMetadata as MooncakeTableMetadata;
 use crate::storage::MockTableManager;
 use crate::storage::MooncakeTable;
 use crate::storage::TableManager;
+use crate::table_handler::is_iceberg_snapshot_satisfy_force_snapshot;
 use crate::ObjectStorageCache;
 
 use std::sync::Arc;
@@ -1096,6 +1097,61 @@ async fn test_flush_lsn_consistency_across_snapshots() {
     env.shutdown().await;
 }
 
+#[tokio::test]
+async fn test_initial_copy_basic() {
+    let mut env = TestEnvironment::default().await;
+    // Get a direct sender so we can emit raw TableEvents.
+    let sender = env.handler.get_event_sender();
+
+    // Start initial copy workflow.
+    sender
+        .send(TableEvent::StartInitialCopy)
+        .await
+        .expect("send start initial copy");
+
+    // Simulate the copy process delivering an existing row.
+    // This row gets appended directly to main mem_slice.
+    sender
+        .send(TableEvent::Append {
+            row: create_row(1, "Alice", 30),
+            xact_id: None,
+            is_copied: true,
+        })
+        .await
+        .expect("send copied row");
+
+    // A new row arrives while copy is running.
+    env.append_row(2, "Bob", 40, None).await;
+    env.commit(10).await; // Buffered until copy finishes
+
+    // During initial copy: commit LSN stays 0 (no actual commits applied)
+    // Only replication LSN advances to track CDC stream progress
+    env.set_replication_lsn(10);
+
+    env.set_snapshot_lsn(0);
+    // During initial copy, should see empty table (no commits applied yet)
+    env.verify_snapshot(0, &[]).await; // Should see empty table during initial copy
+
+    // Finish the copy which applies buffered changes.
+    sender
+        .send(TableEvent::FinishInitialCopy)
+        .await
+        .expect("send finish initial copy");
+
+    // After FinishInitialCopy, we need to commit and flush to create a snapshot
+    // This makes the buffered data and copied data visible together
+    env.commit(10).await;
+    env.flush_table(10).await;
+
+    // Now set the LSNs and verify both Alice (copied) and Bob (buffered) are visible
+    env.set_table_commit_lsn(10);
+    env.set_replication_lsn(10);
+
+    env.verify_snapshot(10, &[1, 2]).await;
+
+    env.shutdown().await;
+}
+
 /// ---- Mock unit test ----
 #[tokio::test]
 async fn test_iceberg_snapshot_failure_mock_test() {
@@ -1213,57 +1269,80 @@ async fn test_iceberg_drop_table_failure_mock_test() {
     assert!(res.is_err());
 }
 
-#[tokio::test]
-async fn test_initial_copy_basic() {
-    let mut env = TestEnvironment::default().await;
-    // Get a direct sender so we can emit raw TableEvents.
-    let sender = env.handler.get_event_sender();
+/// ---- Util functions unit test ----
+///
+/// Invariants:
+/// - replication lsn >= table consistent view lsn, if assigned
+/// - replication lsn >= iceberg snapshot lsn, if assigned
+#[test]
+fn test_is_iceberg_snapshot_satisfy_force_snapshot() {
+    // Case-1: iceberg snapshot already satisfies requested lsn.
+    {
+        let requested_lsn = 0;
+        let iceberg_snapshot_lsn = Some(1);
+        let replication_lsn = 1;
+        let table_consistent_view_lsn = Some(1);
+        assert!(is_iceberg_snapshot_satisfy_force_snapshot(
+            requested_lsn,
+            iceberg_snapshot_lsn,
+            replication_lsn,
+            table_consistent_view_lsn
+        ));
+    }
 
-    // Start initial copy workflow.
-    sender
-        .send(TableEvent::StartInitialCopy)
-        .await
-        .expect("send start initial copy");
+    // Case-2: iceberg snapshot doesn't satisfied requested, and table not consistent.
+    {
+        let requested_lsn = 2;
+        let iceberg_snapshot_lsn = Some(1);
+        let replication_lsn = 1;
+        let table_consistent_view_lsn = None;
+        assert!(!is_iceberg_snapshot_satisfy_force_snapshot(
+            requested_lsn,
+            iceberg_snapshot_lsn,
+            replication_lsn,
+            table_consistent_view_lsn
+        ));
+    }
 
-    // Simulate the copy process delivering an existing row.
-    // This row gets appended directly to main mem_slice.
-    sender
-        .send(TableEvent::Append {
-            row: create_row(1, "Alice", 30),
-            xact_id: None,
-            is_copied: true,
-        })
-        .await
-        .expect("send copied row");
+    // Case-3: iceberg snapshot doesn't satisfied requested, table at consistent state, and replication satisifies requested.
+    {
+        let requested_lsn = 2;
+        let iceberg_snapshot_lsn = Some(1);
+        let replication_lsn = 2;
+        let table_consistent_view_lsn = Some(1);
+        assert!(is_iceberg_snapshot_satisfy_force_snapshot(
+            requested_lsn,
+            iceberg_snapshot_lsn,
+            replication_lsn,
+            table_consistent_view_lsn
+        ));
+    }
 
-    // A new row arrives while copy is running.
-    env.append_row(2, "Bob", 40, None).await;
-    env.commit(10).await; // Buffered until copy finishes
+    // Case-4: iceberg snapshot doesn't satisfied requested, table at consistent state, and replication doesn't satisify requested.
+    {
+        let requested_lsn = 3;
+        let iceberg_snapshot_lsn = Some(1);
+        let replication_lsn = 2;
+        let table_consistent_view_lsn = Some(1);
+        assert!(!is_iceberg_snapshot_satisfy_force_snapshot(
+            requested_lsn,
+            iceberg_snapshot_lsn,
+            replication_lsn,
+            table_consistent_view_lsn
+        ));
+    }
 
-    // During initial copy: commit LSN stays 0 (no actual commits applied)
-    // Only replication LSN advances to track CDC stream progress
-    env.set_replication_lsn(10);
-
-    env.set_snapshot_lsn(0);
-    // During initial copy, should see empty table (no commits applied yet)
-    env.verify_snapshot(0, &[]).await; // Should see empty table during initial copy
-
-    // Finish the copy which applies buffered changes.
-    sender
-        .send(TableEvent::FinishInitialCopy)
-        .await
-        .expect("send finish initial copy");
-
-    // After FinishInitialCopy, we need to commit and flush to create a snapshot
-    // This makes the buffered data and copied data visible together
-    env.commit(10).await;
-    env.flush_table(10).await;
-
-    // Now set the LSNs and verify both Alice (copied) and Bob (buffered) are visible
-    env.set_table_commit_lsn(10);
-    env.set_replication_lsn(10);
-
-    env.verify_snapshot(10, &[1, 2]).await;
-
-    env.shutdown().await;
+    // Case-5: iceberg snapshot doesn't satisfied requested, and iceberg / mooncake LSN doesn't match.
+    {
+        let requested_lsn = 2;
+        let iceberg_snapshot_lsn = Some(1);
+        let replication_lsn = 1;
+        let table_consistent_view_lsn = Some(2);
+        assert!(!is_iceberg_snapshot_satisfy_force_snapshot(
+            requested_lsn,
+            iceberg_snapshot_lsn,
+            replication_lsn,
+            table_consistent_view_lsn
+        ));
+    }
 }

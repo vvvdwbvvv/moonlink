@@ -3,7 +3,6 @@ use crate::storage::mooncake_table::INITIAL_COPY_XACT_ID;
 use crate::storage::{io_utils, MooncakeTable};
 use crate::table_notify::TableEvent;
 use crate::{Error, Result};
-use more_asserts as ma;
 use std::collections::BTreeMap;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::sync::{oneshot, watch};
@@ -31,7 +30,11 @@ pub struct EventSyncSender {
 
 impl TableHandler {
     /// Create a new TableHandler for the given schema and table name
-    pub async fn new(mut table: MooncakeTable, event_sync_sender: EventSyncSender) -> Self {
+    pub async fn new(
+        mut table: MooncakeTable,
+        event_sync_sender: EventSyncSender,
+        replication_lsn_rx: watch::Receiver<u64>,
+    ) -> Self {
         // Create channel for events
         let (event_sender, event_receiver) = mpsc::channel(100);
 
@@ -41,7 +44,8 @@ impl TableHandler {
         // Spawn the task with the oneshot receiver
         let event_handle = Some(tokio::spawn(
             async move {
-                Self::event_loop(event_sync_sender, event_receiver, table).await;
+                Self::event_loop(event_sync_sender, event_receiver, replication_lsn_rx, table)
+                    .await;
             }
             .instrument(info_span!("table_event_loop")),
         ));
@@ -63,6 +67,7 @@ impl TableHandler {
     async fn event_loop(
         event_sync_sender: EventSyncSender,
         mut event_receiver: Receiver<TableEvent>,
+        replication_lsn_rx: watch::Receiver<u64>,
         mut table: MooncakeTable,
     ) {
         let mut periodic_snapshot_interval = time::interval(Duration::from_millis(500));
@@ -82,9 +87,6 @@ impl TableHandler {
         // Whether there's an ongoing background maintenance operation, for example, index merge, data compaction, etc.
         // To simplify state management, we have at most one ongoing maintainance operation at the same time.
         let mut maintainance_ongoing = false;
-
-        // Whether current table receives any update events.
-        let mut table_updated = false;
 
         // Whether requested to drop table.
         let mut drop_table_requested = false;
@@ -184,10 +186,6 @@ impl TableHandler {
                         | TableEvent::ReadRequest { .. }
                         | TableEvent::EvictedDataFilesToDelete { .. } => table_consistent_view_lsn,
                         _ => None,
-                    };
-                    table_updated = match event {
-                        TableEvent::ForceSnapshot { .. } => table_updated,
-                        _ => true,
                     };
 
                     match event {
@@ -301,17 +299,14 @@ impl TableHandler {
                         // ==============================
                         //
                         TableEvent::ForceSnapshot { lsn, tx } => {
-                            // A workaround to avoid create snapshot call gets stuck, when there's no write operations to the table.
-                            if !table_updated {
+                            // Fast-path: if iceberg snapshot requirement is already satisfied, notify directly.
+                            let last_iceberg_snapshot_lsn = table.get_iceberg_snapshot_lsn();
+                            let replication_lsn = *replication_lsn_rx.borrow();
+                            if is_iceberg_snapshot_satisfy_force_snapshot(lsn, last_iceberg_snapshot_lsn, replication_lsn, table_consistent_view_lsn) {
                                 tx.send(Ok(())).await.unwrap();
                                 continue;
                             }
 
-                            // Fast-path: if iceberg snapshot requirement is already satisfied, notify directly.
-                            let last_iceberg_snapshot_lsn = table.get_iceberg_snapshot_lsn();
-                            if last_iceberg_snapshot_lsn.is_some() && lsn <= last_iceberg_snapshot_lsn.unwrap() {
-                                tx.send(Ok(())).await.unwrap();
-                            }
                             // Iceberg snapshot LSN requirement is not met, record the required LSN, so later commit will pick up.
                             else {
                                 force_snapshot_lsns.entry(lsn).or_default().push(tx);
@@ -396,13 +391,8 @@ impl TableHandler {
                                     iceberg_snapshot_result_consumed = false;
 
                                     // Notify all waiters with LSN satisfied.
-                                    let new_map = force_snapshot_lsns.split_off(&(iceberg_flush_lsn + 1));
-                                    for (requested_lsn, tx) in force_snapshot_lsns.iter() {
-                                        ma::assert_le!(*requested_lsn, iceberg_flush_lsn);
-                                        for cur_tx in tx {
-                                            cur_tx.send(Ok(())).await.unwrap();
-                                        }
-                                    }
+                                    let replication_lsn = *replication_lsn_rx.borrow();
+                                    let new_map = update_force_iceberg_snapshot_requests(force_snapshot_lsns, iceberg_flush_lsn, replication_lsn, table_consistent_view_lsn).await;
                                     force_snapshot_lsns = new_map;
                                 }
                                 Err(e) => {
@@ -455,18 +445,16 @@ impl TableHandler {
                     // Check whether a flush and force snapshot is needed.
                     if !force_snapshot_lsns.is_empty() {
                         if let Some(commit_lsn) = table_consistent_view_lsn {
-                            if *force_snapshot_lsns.iter().next().as_ref().unwrap().0 <= commit_lsn {
-                                table.flush(/*lsn=*/ commit_lsn).await.unwrap();
-                                reset_iceberg_state_at_mooncake_snapshot(&mut iceberg_snapshot_result_consumed, &mut iceberg_snapshot_ongoing);
-                                table.create_snapshot(SnapshotOption {
-                                    force_create: true,
-                                    skip_iceberg_snapshot: iceberg_snapshot_ongoing,
-                                    skip_file_indices_merge: maintainance_ongoing,
-                                    skip_data_file_compaction: maintainance_ongoing,
-                                });
-                                mooncake_snapshot_ongoing = true;
-                                continue;
-                            }
+                            table.flush(commit_lsn).await.unwrap();
+                            reset_iceberg_state_at_mooncake_snapshot(&mut iceberg_snapshot_result_consumed, &mut iceberg_snapshot_ongoing);
+                            table.create_snapshot(SnapshotOption {
+                                force_create: true,
+                                skip_iceberg_snapshot: iceberg_snapshot_ongoing,
+                                skip_file_indices_merge: maintainance_ongoing,
+                                skip_data_file_compaction: maintainance_ongoing,
+                            });
+                            mooncake_snapshot_ongoing = true;
+                            continue;
                         }
                     }
 
@@ -490,6 +478,62 @@ impl TableHandler {
             }
         }
     }
+}
+
+/// Decide whether current iceberg snapshot could serve the force iceberg snapshot request.
+pub(crate) fn is_iceberg_snapshot_satisfy_force_snapshot(
+    requested_lsn: u64,
+    iceberg_snapshot_lsn: Option<u64>,
+    replication_lsn: u64,
+    table_consistent_view_lsn: Option<u64>,
+) -> bool {
+    // Case-1: there're no activities in the current table, but replication LSN already covers requested LSN.
+    if iceberg_snapshot_lsn.is_none() && table_consistent_view_lsn.is_none() {
+        return replication_lsn >= requested_lsn;
+    }
+
+    // Case-2: iceberg snapshot LSN already satisfies.
+    if let Some(iceberg_snapshot_lsn) = iceberg_snapshot_lsn {
+        if iceberg_snapshot_lsn >= requested_lsn {
+            return true;
+        }
+    }
+
+    // Case-3: table's at a consistent state, which has been fully persisted into iceberg;
+    // meanwhile, replication LSN has covered the requested LSN.
+    if iceberg_snapshot_lsn == table_consistent_view_lsn && replication_lsn >= requested_lsn {
+        return true;
+    }
+
+    false
+}
+
+/// Update requested iceberg snapshot LSNs.
+async fn update_force_iceberg_snapshot_requests(
+    force_snapshot_lsns: BTreeMap<u64, Vec<Sender<Result<()>>>>,
+    iceberg_snapshot_lsn: u64,
+    replication_lsn: u64,
+    table_consistent_view_lsn: Option<u64>,
+) -> BTreeMap<u64, Vec<Sender<Result<()>>>> {
+    let mut updated_requests = BTreeMap::new();
+
+    // TODO(hjiang): Could be optimized, since as long as we found the first requested LSN which doesn't satisfy, we could directly place all left requests to updated lsns.
+    for (requested_lsn, senders) in force_snapshot_lsns.into_iter() {
+        if is_iceberg_snapshot_satisfy_force_snapshot(
+            requested_lsn,
+            Some(iceberg_snapshot_lsn),
+            replication_lsn,
+            table_consistent_view_lsn,
+        ) {
+            for sender in senders {
+                sender.send(Ok(())).await.unwrap();
+            }
+        } else {
+            updated_requests.insert(requested_lsn, senders);
+        }
+    }
+
+    updated_requests
 }
 
 #[cfg(test)]

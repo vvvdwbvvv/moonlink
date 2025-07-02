@@ -95,7 +95,7 @@ impl TestEnvironment {
         let snapshot_lsn_tx = mooncake_table.get_snapshot_watch_sender().clone();
         let read_state_manager = Some(Arc::new(ReadStateManager::new(
             &mooncake_table,
-            replication_rx,
+            replication_rx.clone(),
             last_commit_rx,
         )));
 
@@ -109,7 +109,8 @@ impl TestEnvironment {
             drop_table_completion_rx,
             flush_lsn_rx,
         };
-        let handler = TableHandler::new(mooncake_table, event_sync_sender).await;
+        let handler =
+            TableHandler::new(mooncake_table, event_sync_sender, replication_rx.clone()).await;
         let table_event_manager =
             TableEventManager::new(handler.get_event_sender(), table_event_sync_receiver);
         let event_sender = handler.get_event_sender();
