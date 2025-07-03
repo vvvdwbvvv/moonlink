@@ -3,7 +3,6 @@ use crate::storage::mooncake_table::INITIAL_COPY_XACT_ID;
 use crate::storage::{io_utils, MooncakeTable};
 use crate::table_notify::TableEvent;
 use crate::{Error, Result};
-use more_asserts as ma;
 use std::collections::BTreeMap;
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::sync::{oneshot, watch};
@@ -79,9 +78,16 @@ impl TableHandler {
         // To avoid duplicate records, we compare iceberg initial flush LSN with new coming messages' LSN.
         // - For streaming events, we keep a buffer as usual, and decide whether to keep or discard the buffer at stream commit;
         // - For non-streaming events, they start with a [`Begin`] message containing the final LSN of the current transaction, which we could leverage to decide keep or not.
-        let initial_persistence_lsn = table.get_iceberg_snapshot_lsn().unwrap_or(0);
-        // Whether the current non-streaming transaction changes will be kept.
-        let mut current_non_streaming_txn_kept = true;
+        let initial_persistence_lsn = table.get_iceberg_snapshot_lsn();
+
+        // Whether to discard current table event.
+        let to_discard = |lsn: u64| -> bool {
+            if initial_persistence_lsn.is_none() {
+                return false;
+            }
+            let initial_persistence_lsn = initial_persistence_lsn.unwrap();
+            lsn <= initial_persistence_lsn
+        };
 
         // Requested minimum LSN for a force snapshot request.
         let mut force_snapshot_lsns: BTreeMap<u64, Vec<Sender<Result<()>>>> = BTreeMap::new();
@@ -204,11 +210,8 @@ impl TableHandler {
                         // Replication events
                         // ==============================
                         //
-                        TableEvent::Begin { lsn } => {
-                            current_non_streaming_txn_kept = lsn > initial_persistence_lsn;
-                        }
-                        TableEvent::Append { is_copied, row, xact_id } => {
-                            if !current_non_streaming_txn_kept {
+                        TableEvent::Append { is_copied, row, lsn, xact_id } => {
+                            if to_discard(lsn) {
                                 continue;
                             }
                             if is_copied || (!table.is_in_initial_copy() && xact_id.is_none()) {
@@ -237,7 +240,7 @@ impl TableHandler {
                             }
                         }
                         TableEvent::Delete { row, lsn, xact_id } => {
-                            if !current_non_streaming_txn_kept {
+                            if to_discard(lsn) {
                                 continue;
                             }
                             if !table.is_in_initial_copy() && xact_id.is_none() {
@@ -268,7 +271,7 @@ impl TableHandler {
                             // Handle streaming write situation.
                             else if let Some(xid) = xact_id {
                                 // Discard streaming write buffer, if content already persisted.
-                                if lsn <= initial_persistence_lsn {
+                                if to_discard(lsn) {
                                     table.abort_in_stream_batch(xid);
                                     continue;
                                 }
@@ -280,16 +283,13 @@ impl TableHandler {
                                 }
                             }
                             // Handle non-streaming write situation.
-                            else if current_non_streaming_txn_kept {
+                            else if !to_discard(lsn) {
                                 table.commit(lsn);
                                 if table.should_flush() || force_snapshot {
                                     if let Err(e) = table.flush(lsn).await {
                                         warn!(error = %e, "flush failed in commit");
                                     }
                                 }
-                            } else {
-                                // Reset discard state.
-                                current_non_streaming_txn_kept = true;
                             }
 
                             if force_snapshot {
@@ -307,8 +307,7 @@ impl TableHandler {
                             table.abort_in_stream_batch(xact_id);
                         }
                         TableEvent::Flush { lsn } => {
-                            if !current_non_streaming_txn_kept {
-                                ma::assert_le!(lsn, initial_persistence_lsn);
+                            if to_discard(lsn) {
                                 continue;
                             }
                             if table.is_in_initial_copy() {
