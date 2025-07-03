@@ -61,13 +61,13 @@ impl ReadStateManager {
 
         let snapshot_clean = Self::snapshot_is_clean(snapshot_lsn, commit_lsn);
         match requested {
-            Some(bound) => cached_lsn == snapshot_lsn && cached_lsn <= bound && snapshot_clean,
+            Some(bound) => cached_lsn == snapshot_lsn && cached_lsn >= bound && snapshot_clean,
             None => cached_lsn == snapshot_lsn && snapshot_clean,
         }
     }
 
     /// Returns a snapshot whose commit LSN is:
-    /// • ≤ `requested_lsn` when `requested_lsn` is supplied, or
+    /// • >= `requested_lsn` when `requested_lsn` is supplied, or
     /// • the latest snapshot when `requested_lsn` is `None`.
     #[tracing::instrument(name = "read_state_try_read", skip_all)]
     pub async fn try_read(&self, requested_lsn: Option<u64>) -> Result<Arc<ReadState>> {
@@ -221,13 +221,13 @@ mod tests {
                 commit: 42,
                 expect: true,
             },
-            // miss: bounded read, cache newer than caller wants
+            // hit: bounded read, cache newer than caller wants
             Case {
                 requested: Some(10),
                 cached: 20,
                 snap: 20,
                 commit: 20,
-                expect: false,
+                expect: true,
             },
             // hit: latest read, snapshot clean
             Case {
@@ -293,13 +293,13 @@ mod tests {
                 commit: 10,
                 expect: false,
             },
-            // hit: valid LSN 0 cache, bounded read within bound
+            // miss: valid LSN 0 cache, bounded read outside of request
             Case {
                 requested: Some(5),
                 cached: 0,
                 snap: 0,
                 commit: 0,
-                expect: true,
+                expect: false,
             },
             // hit: valid LSN 0 cache for latest read, snapshot clean
             Case {
