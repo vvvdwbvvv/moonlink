@@ -128,6 +128,7 @@ pub(super) fn get_iceberg_table_config(temp_dir: &TempDir) -> IcebergTableConfig
         warehouse_uri: temp_dir.path().to_str().unwrap().to_string(),
         namespace: vec!["namespace".to_string()],
         table_name: "test_table".to_string(),
+        ..Default::default()
     }
 }
 
@@ -146,6 +147,7 @@ pub(super) async fn create_mooncake_table_and_notify_for_compaction(
         warehouse_uri,
         namespace: vec!["namespace".to_string()],
         table_name: "test_table".to_string(),
+        ..Default::default()
     };
     let schema = create_test_arrow_schema();
 

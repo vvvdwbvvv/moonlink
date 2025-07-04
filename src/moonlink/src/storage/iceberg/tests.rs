@@ -2,10 +2,13 @@ use crate::row::IdentityProp as RowIdentity;
 use crate::row::MoonlinkRow;
 use crate::row::RowValue;
 use crate::storage::compaction::compaction_config::DataCompactionConfig;
+use crate::storage::filesystem::filesystem_config::FileSystemConfig;
+#[cfg(feature = "storage-gcs")]
+use crate::storage::filesystem::gcs::gcs_test_utils;
+#[cfg(feature = "storage-s3")]
+use crate::storage::filesystem::s3::s3_test_utils;
 use crate::storage::iceberg::iceberg_table_manager::IcebergTableConfig;
 use crate::storage::iceberg::iceberg_table_manager::IcebergTableManager;
-#[cfg(feature = "storage-s3")]
-use crate::storage::iceberg::s3_test_utils;
 use crate::storage::iceberg::table_manager::PersistenceFileParams;
 use crate::storage::iceberg::table_manager::TableManager;
 use crate::storage::iceberg::test_utils::*;
@@ -109,10 +112,32 @@ fn test_row_3() -> MoonlinkRow {
 
 /// Test util function to create iceberg table config.
 fn create_iceberg_table_config(warehouse_uri: String) -> IcebergTableConfig {
+    let catalog_config = if warehouse_uri.starts_with("s3://") {
+        #[cfg(feature = "storage-s3")]
+        {
+            s3_test_utils::create_s3_filesystem_config(&warehouse_uri)
+        }
+        #[cfg(not(feature = "storage-s3"))]
+        {
+            panic!("S3 support not enabled. Enable `storage-s3` feature.");
+        }
+    } else if warehouse_uri.starts_with("gs://") {
+        #[cfg(feature = "storage-gcs")]
+        {
+            gcs_test_utils::create_gcs_filesystem_config(&warehouse_uri)
+        }
+        #[cfg(not(feature = "storage-gcs"))]
+        {
+            panic!("GCS support not enabled. Enable `storage-gcs` feature.");
+        }
+    } else {
+        FileSystemConfig::FileSystem
+    };
+
     IcebergTableConfig {
         warehouse_uri,
-        namespace: vec!["namespace".to_string()],
-        table_name: "test_table".to_string(),
+        catalog_config,
+        ..Default::default()
     }
 }
 
@@ -512,8 +537,7 @@ async fn test_sync_snapshots() {
         create_test_table_metadata(tmp_dir.path().to_str().unwrap().to_string());
     let iceberg_table_config = IcebergTableConfig {
         warehouse_uri: tmp_dir.path().to_str().unwrap().to_string(),
-        namespace: vec!["namespace".to_string()],
-        table_name: "test_table".to_string(),
+        ..Default::default()
     };
     test_store_and_load_snapshot_impl(
         mooncake_table_metadata.clone(),
@@ -531,8 +555,7 @@ async fn test_drop_table() {
         create_test_table_metadata(tmp_dir.path().to_str().unwrap().to_string());
     let config = IcebergTableConfig {
         warehouse_uri: tmp_dir.path().to_str().unwrap().to_string(),
-        namespace: vec!["namespace".to_string()],
-        table_name: "test_table".to_string(),
+        ..Default::default()
     };
     let mut iceberg_table_manager = IcebergTableManager::new(
         mooncake_table_metadata.clone(),
@@ -656,8 +679,7 @@ async fn test_index_merge_and_create_snapshot() {
 
     let config = IcebergTableConfig {
         warehouse_uri: tmp_dir.path().to_str().unwrap().to_string(),
-        namespace: vec!["namespace".to_string()],
-        table_name: "test_table".to_string(),
+        ..Default::default()
     };
 
     let iceberg_table_manager = IcebergTableManager::new(
@@ -1269,7 +1291,6 @@ async fn mooncake_table_snapshot_persist_impl(warehouse_uri: String) {
         "Expected arrow data is {:?}, actual data is {:?}",
         expected_arrow_batch, loaded_arrow_batch
     );
-
     let deleted_rows = deletion_vector.batch_deletion_vector.collect_deleted_rows();
     assert!(
         deleted_rows.is_empty(),
@@ -1490,19 +1511,6 @@ async fn test_filesystem_sync_snapshots() {
     let temp_dir = tempfile::tempdir().unwrap();
     let path = temp_dir.path().to_str().unwrap().to_string();
     mooncake_table_snapshot_persist_impl(path).await
-}
-
-#[tokio::test]
-#[cfg(feature = "storage-s3")]
-async fn test_object_storage_sync_snapshots() {
-    let (bucket_name, warehouse_uri) = s3_test_utils::get_test_minio_bucket_and_warehouse();
-    s3_test_utils::object_store_test_utils::create_test_s3_bucket(bucket_name.clone())
-        .await
-        .unwrap();
-    mooncake_table_snapshot_persist_impl(warehouse_uri).await;
-    s3_test_utils::object_store_test_utils::delete_test_s3_bucket(bucket_name.clone())
-        .await
-        .unwrap();
 }
 
 #[tokio::test]
