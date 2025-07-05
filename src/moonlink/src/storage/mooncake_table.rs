@@ -44,6 +44,7 @@ use arrow_schema::Schema;
 use delete_vector::BatchDeletionVector;
 pub(crate) use disk_slice::DiskSliceWriter;
 use mem_slice::MemSlice;
+use more_asserts as ma;
 pub(crate) use snapshot::{PuffinDeletionBlobAtRead, SnapshotTableState};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -60,7 +61,9 @@ use transaction_stream::{
 };
 
 /// Special transaction id used when buffering CDC events during initial table copy.
-pub(crate) const INITIAL_COPY_XACT_ID: u32 = u32::MAX;
+pub(crate) const INITIAL_COPY_CDC_XACT_ID: u32 = u32::MAX;
+/// Special transaction id used for initial copy append operation.
+pub(crate) const INITIAL_COPY_XACT_ID: u32 = u32::MAX - 1;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct IcebergPersistenceConfig {
@@ -781,7 +784,6 @@ impl MooncakeTable {
 
         let next_file_id = self.next_file_id;
         self.next_file_id += 1;
-        // Flush data files into iceberb table.
         let disk_slice = Self::flush_mem_slice(
             &mut self.mem_slice,
             &self.metadata,
@@ -901,28 +903,46 @@ impl MooncakeTable {
     /// In this case of a streaming transaction, we simply use the already provided `xact_id` to identify the transaction. In the case of non-streaming, we use `INITIAL_COPY_XACT_ID` to identify the transaction.
     /// All commits are buffered and deferred until initial copy finishes.
     pub fn start_initial_copy(&mut self) {
+        assert!(!self.in_initial_copy);
+        assert!(self.initial_copy_buffered_commits.is_empty());
         self.in_initial_copy = true;
-        self.initial_copy_buffered_commits.clear();
     }
 
     /// Exit initial copy mode and commit all buffered changes.
     pub async fn finish_initial_copy(&mut self) -> Result<()> {
-        if !self.in_initial_copy {
-            return Ok(());
-        }
-        // First: commit the copied rows that were added directly to main mem_slice
-        // Use LSN 0 to ensure copied data comes before any CDC events
-        self.commit(0);
-        self.flush(0).await?;
+        assert!(self.in_initial_copy);
+        self.in_initial_copy = false;
 
-        let commits = self
+        // First: commit the initial copied rows that were added directly to streaming write buffer
+        // Use LSN 0 to ensure copied data comes before any CDC events
+        if self
+            .transaction_stream_states
+            .contains_key(&INITIAL_COPY_XACT_ID)
+        {
+            let initial_copy_stream_commit = self
+                .prepare_transaction_stream_commit(
+                    /*xact_id*/ INITIAL_COPY_XACT_ID,
+                    /*lsn=*/ 0,
+                )
+                .await
+                .unwrap();
+            self.commit_transaction_stream(initial_copy_stream_commit)
+                .await
+                .unwrap();
+        }
+
+        let buffered_commits = self
             .initial_copy_buffered_commits
             .drain(..)
             .collect::<Vec<_>>();
 
-        self.in_initial_copy = false;
         // Second: apply all buffered streaming transaction commits
-        for commit in commits {
+        //
+        // Used to check flush LSN doesn't regress.
+        let mut prev_flush_lsn = 0;
+        for commit in buffered_commits {
+            ma::assert_lt!(prev_flush_lsn, commit.get_commit_lsn());
+            prev_flush_lsn = commit.get_commit_lsn();
             self.commit_transaction_stream(commit).await?;
         }
 
