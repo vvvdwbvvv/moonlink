@@ -5,7 +5,7 @@ use moonlink::{MoonlinkTableConfig, ObjectStorageCache, ReadStateManager, TableE
 use std::collections::HashMap;
 use std::hash::Hash;
 use tokio::task::JoinHandle;
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// Manage replication sources keyed by their connection URI.
 ///
@@ -102,7 +102,7 @@ impl<T: Clone + Eq + Hash + std::fmt::Display> ReplicationManager<T> {
         let (table_uri, src_table_id) = match self.table_info.get(&mooncake_table_id) {
             Some(info) => info.clone(),
             None => {
-                warn!("attempted to drop table that is not tracked by moonlink - table may already be dropped");
+                debug!("attempted to drop table that is not tracked by moonlink - table may already be dropped");
                 return Ok(false);
             }
         };
