@@ -235,10 +235,11 @@ impl SnapshotTableState {
     }
 
     /// Update disk files in the current snapshot from local data files to remote ones, meanwile unpin write-through cache file from object storage cache.
+    /// Provide [`persisted_data_files`] could come from imported new files, or maintainance jobs like compaction.
     /// Returned updated data file ids, and cache evicted files to delete.
     async fn update_data_files_to_persisted(
         &mut self,
-        task: &SnapshotTask,
+        persisted_data_files: Vec<MooncakeDataFileRef>,
     ) -> (
         HashSet<FileId>, /*updated data file id*/
         Vec<String>,     /*evicted files to delete*/
@@ -248,12 +249,12 @@ impl SnapshotTableState {
         // Aggregate evicted files to delete.
         let mut evicted_files_to_delete = vec![];
 
-        if task.iceberg_persisted_records.import_result.is_empty() {
+        if persisted_data_files.is_empty() {
             return (updated_file_ids, evicted_files_to_delete);
         }
 
         // Update disk file from local write through cache to iceberg persisted remote path.
-        let persisted_data_files = &task.iceberg_persisted_records.import_result.new_data_files;
+        // TODO(hjiang): We should be able to save some copies here.
         for cur_data_file in persisted_data_files.iter() {
             // Removing entry with [`cur_data_file`] and insert with the same key might be confusing, but here we're only using file id as key, but not filepath.
             // So the real operation is: remove the entry with <old filepath> and insert with <new filepath>.
@@ -367,6 +368,8 @@ impl SnapshotTableState {
     /// also import local write through cache to globally managed object storage cache, so they could be pinned and evicted when necessary.
     ///
     /// Return evicted data files to delete when unreference existing disk file entries.
+    ///
+    /// TODO(hjiang): Update current snapshot for index merge results.
     async fn update_current_snapshot_with_iceberg_snapshot(
         &mut self,
         task: &SnapshotTask,
@@ -374,23 +377,24 @@ impl SnapshotTableState {
         // Aggregate evicted files to delete.
         let mut evicted_files_to_delete = vec![];
 
-        // Step-1: Handle imported new data files.
-        let (updated_file_ids, cur_evicted_files) = self.update_data_files_to_persisted(task).await;
-        evicted_files_to_delete.extend(cur_evicted_files);
+        // Get persisted data files and file indices.
+        // TODO(hjiang): Revisit whether we need separate fields in snapshot task.
+        let persisted_data_files = task.iceberg_persisted_records.get_persisted_data_files();
+        let persisted_file_indices = task.iceberg_persisted_records.get_persisted_file_indices();
 
-        // Step-2: Handle imported file indices.
-        let cur_evicted_files = self
-            .update_file_indices_to_persisted(
-                task.iceberg_persisted_records
-                    .import_result
-                    .new_file_indices
-                    .clone(),
-                updated_file_ids,
-            )
+        // Step-1: Handle persisted data files.
+        let (updated_file_ids, cur_evicted_files) = self
+            .update_data_files_to_persisted(persisted_data_files)
             .await;
         evicted_files_to_delete.extend(cur_evicted_files);
 
-        // Step-3: Handle imported deletion vector.
+        // Step-2: Handle persisted file indices.
+        let cur_evicted_files = self
+            .update_file_indices_to_persisted(persisted_file_indices, updated_file_ids)
+            .await;
+        evicted_files_to_delete.extend(cur_evicted_files);
+
+        // Step-3: Handle persisted deletion vector.
         let cur_evicted_files = self
             .update_deletion_vector_to_persisted(
                 task.iceberg_persisted_records
