@@ -40,12 +40,16 @@ use crate::storage::cache::object_storage::test_utils::*;
 /// - Referenced, to delete + use over & unreferenced => no entry
 ///
 /// For more details, please refer to https://docs.google.com/document/d/1LDWLWhgFP5-da8P50t-uZIO6a4lK2Na5P70ibNOWu-g/edit?usp=sharing
-use crate::storage::mooncake_table::state_test_utils::*;
+use crate::storage::mooncake_table::cache_test_utils::*;
+use crate::storage::mooncake_table::table_accessor_test_utils::*;
+use crate::storage::mooncake_table::table_operation_test_utils::*;
+use crate::storage::mooncake_table::test_utils_commons::*;
 use crate::table_notify::TableEvent;
 use crate::{
     IcebergTableManager, MooncakeTable, ObjectStorageCache, ObjectStorageCacheConfig, TableManager,
 };
 
+use crate::storage::mooncake_table::table_creation_test_utils::*;
 /// ========================
 /// Test util function for read
 /// ========================
@@ -117,7 +121,7 @@ async fn test_1_persist_2_without_local_optimization(#[case] use_batch_write: bo
     let (mut table, mut table_notify) =
         prepare_test_deletion_vector_for_read(&temp_dir, cache.clone(), use_batch_write).await;
     create_mooncake_and_persist_for_test(&mut table, &mut table_notify).await;
-    let (_, _, _, files_to_delete) =
+    let (_, _, _, _, files_to_delete) =
         create_mooncake_snapshot_for_test(&mut table, &mut table_notify).await;
     assert!(files_to_delete.is_empty());
 
@@ -152,7 +156,7 @@ async fn test_1_persist_2_with_local_optimization(#[case] use_batch_write: bool)
     create_mooncake_and_persist_for_test(&mut table, &mut table_notify).await;
     let local_data_files_and_index_blocks = get_data_files_and_index_block_files(&table).await;
 
-    let (_, _, _, mut files_to_delete) =
+    let (_, _, _, _, mut files_to_delete) =
         create_mooncake_snapshot_for_test(&mut table, &mut table_notify).await;
     files_to_delete.sort();
     assert_eq!(files_to_delete, local_data_files_and_index_blocks);
@@ -192,7 +196,7 @@ async fn test_1_recover_2_without_local_optimization(#[case] use_batch_write: bo
     )
     .await;
     create_mooncake_and_persist_for_test(&mut table, &mut table_notify).await;
-    let (_, _, _, files_to_delete) =
+    let (_, _, _, _, files_to_delete) =
         create_mooncake_snapshot_for_test(&mut table, &mut table_notify).await;
     assert!(files_to_delete.is_empty());
 
@@ -248,7 +252,7 @@ async fn test_1_recover_2_with_local_optimization(#[case] use_batch_write: bool)
     create_mooncake_and_persist_for_test(&mut table, &mut table_notify).await;
     let local_data_files_and_index_blocks = get_data_files_and_index_block_files(&table).await;
 
-    let (_, _, _, mut files_to_delete) =
+    let (_, _, _, _, mut files_to_delete) =
         create_mooncake_snapshot_for_test(&mut table, &mut table_notify).await;
     files_to_delete.sort();
     assert_eq!(files_to_delete, local_data_files_and_index_blocks);
@@ -296,7 +300,7 @@ async fn test_2_read_without_local_optimization(#[case] use_batch_write: bool) {
     let (mut table, mut table_notify) =
         prepare_test_deletion_vector_for_read(&temp_dir, cache.clone(), use_batch_write).await;
     create_mooncake_and_persist_for_test(&mut table, &mut table_notify).await;
-    let (_, _, _, files_to_delete) =
+    let (_, _, _, _, files_to_delete) =
         create_mooncake_snapshot_for_test(&mut table, &mut table_notify).await;
     assert!(files_to_delete.is_empty());
 
@@ -354,7 +358,7 @@ async fn test_2_read_with_local_optimization(#[case] use_batch_write: bool) {
     create_mooncake_and_persist_for_test(&mut table, &mut table_notify).await;
     let local_data_files_and_index_blocks = get_data_files_and_index_block_files(&table).await;
 
-    let (_, _, _, mut files_to_delete) =
+    let (_, _, _, _, mut files_to_delete) =
         create_mooncake_snapshot_for_test(&mut table, &mut table_notify).await;
     files_to_delete.sort();
     assert_eq!(files_to_delete, local_data_files_and_index_blocks);
@@ -457,7 +461,7 @@ async fn test_2_compact_without_local_optimization() {
     let (mut table, mut table_notify) =
         prepare_test_disk_files_with_deletion_vector_for_compaction(&temp_dir, cache.clone()).await;
     create_mooncake_and_persist_for_test(&mut table, &mut table_notify).await;
-    let (_, _, data_compaction_payload, files_to_delete) =
+    let (_, _, _, data_compaction_payload, files_to_delete) =
         create_mooncake_snapshot_for_test(&mut table, &mut table_notify).await;
     assert!(files_to_delete.is_empty());
 
@@ -544,7 +548,7 @@ async fn test_2_compact_with_local_optimization() {
     create_mooncake_and_persist_for_test(&mut table, &mut table_notify).await;
     let local_data_files_and_index_blocks = get_data_files_and_index_block_files(&table).await;
 
-    let (_, _, data_compaction_payload, mut files_to_delete) =
+    let (_, _, _, data_compaction_payload, mut files_to_delete) =
         create_mooncake_snapshot_for_test(&mut table, &mut table_notify).await;
     files_to_delete.sort();
     assert_eq!(files_to_delete, local_data_files_and_index_blocks);

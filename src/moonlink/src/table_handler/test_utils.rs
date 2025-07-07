@@ -1,40 +1,20 @@
 use crate::row::{IdentityProp, MoonlinkRow, RowValue};
-use crate::storage::mooncake_table::{DiskFileEntry, TableMetadata as MooncakeTableMetadata};
+use crate::storage::mooncake_table::table_creation_test_utils::create_test_arrow_schema;
+use crate::storage::mooncake_table::TableMetadata as MooncakeTableMetadata;
 use crate::storage::IcebergTableConfig;
-use crate::storage::{load_blob_from_puffin_file, DeletionVector};
 use crate::storage::{verify_files_and_deletions, MooncakeTable};
 use crate::table_handler::{EventSyncSender, TableEvent, TableHandler}; // Ensure this path is correct
 use crate::union_read::{decode_read_state_for_testing, ReadStateManager};
 use crate::{EventSyncReceiver, IcebergTableManager, MooncakeTableConfig, TableEventManager};
 use crate::{ObjectStorageCache, Result};
 
-use arrow::datatypes::{DataType, Field, Schema};
 use arrow_array::RecordBatch;
 use iceberg::io::FileIOBuilder;
 use iceberg::io::FileRead;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::{tempdir, TempDir};
 use tokio::sync::{mpsc, oneshot, watch};
-
-/// Creates a default schema for testing.
-pub fn default_schema() -> Schema {
-    Schema::new(vec![
-        Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([(
-            "PARQUET:field_id".to_string(),
-            "1".to_string(),
-        )])),
-        Field::new("name", DataType::Utf8, true).with_metadata(HashMap::from([(
-            "PARQUET:field_id".to_string(),
-            "2".to_string(),
-        )])),
-        Field::new("age", DataType::Int32, false).with_metadata(HashMap::from([(
-            "PARQUET:field_id".to_string(),
-            "3".to_string(),
-        )])),
-    ])
-}
 
 /// Creates a `MoonlinkRow` for testing purposes.
 pub fn create_row(id: i32, name: &str, age: i32) -> MoonlinkRow {
@@ -138,7 +118,7 @@ impl TestEnvironment {
         let iceberg_table_config =
             get_iceberg_manager_config(table_name.to_string(), path.to_str().unwrap().to_string());
         let mooncake_table = MooncakeTable::new(
-            default_schema(),
+            (*create_test_arrow_schema()).clone(),
             table_name.to_string(),
             1,
             path,
@@ -162,7 +142,7 @@ impl TestEnvironment {
         let mooncake_table_metadata = Arc::new(MooncakeTableMetadata {
             name: table_name.to_string(),
             table_id: 0,
-            schema: Arc::new(default_schema()),
+            schema: create_test_arrow_schema(),
             config: mooncake_table_config.clone(),
             path: self.temp_dir.path().to_path_buf(),
             identity: IdentityProp::Keys(vec![0]),
@@ -335,31 +315,4 @@ pub(crate) async fn load_arrow_batch(filepath: &str) -> RecordBatch {
         .transpose()
         .unwrap()
         .expect("Should have one batch")
-}
-
-/// Test util function to check consistency for snapshot batch deletion vector and deletion puffin blob.
-pub(crate) async fn check_deletion_vector_consistency(disk_file_entry: &DiskFileEntry) {
-    if disk_file_entry.puffin_deletion_blob.is_none() {
-        assert!(disk_file_entry
-            .batch_deletion_vector
-            .collect_deleted_rows()
-            .is_empty());
-        return;
-    }
-
-    let local_fileio = FileIOBuilder::new_fs_io().build().unwrap();
-    let blob = load_blob_from_puffin_file(
-        local_fileio,
-        disk_file_entry
-            .puffin_deletion_blob
-            .as_ref()
-            .unwrap()
-            .puffin_file_cache_handle
-            .get_cache_filepath(),
-    )
-    .await
-    .unwrap();
-    let iceberg_deletion_vector = DeletionVector::deserialize(blob).unwrap();
-    let batch_deletion_vector = iceberg_deletion_vector.take_as_batch_delete_vector();
-    assert_eq!(batch_deletion_vector, disk_file_entry.batch_deletion_vector);
 }

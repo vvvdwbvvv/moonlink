@@ -1,7 +1,8 @@
 use super::test_utils::*;
 use super::*;
 use crate::storage::iceberg::table_manager::MockTableManager;
-use crate::storage::mooncake_table::state_test_utils::*;
+use crate::storage::mooncake_table::table_creation_test_utils::*;
+use crate::storage::mooncake_table::table_operation_test_utils::*;
 use crate::storage::mooncake_table::Snapshot as MooncakeSnapshot;
 use iceberg::{Error as IcebergError, ErrorKind};
 use rstest::*;
@@ -18,7 +19,9 @@ fn shared_cases(#[case] identity: IdentityProp) {}
 
 #[apply(shared_cases)]
 #[tokio::test]
-async fn test_append_commit_snapshot(#[case] identity: IdentityProp) -> Result<()> {
+async fn test_append_commit_create_mooncake_snapshot_for_test(
+    #[case] identity: IdentityProp,
+) -> Result<()> {
     let context = TestContext::new("append_commit");
     let mut table = test_table(&context, "append_table", identity).await;
     let (event_completion_tx, mut event_completion_rx) = mpsc::channel(100);
@@ -26,7 +29,7 @@ async fn test_append_commit_snapshot(#[case] identity: IdentityProp) -> Result<(
 
     append_rows(&mut table, vec![test_row(1, "A", 20), test_row(2, "B", 21)])?;
     table.commit(1);
-    snapshot(&mut table, &mut event_completion_rx).await;
+    create_mooncake_snapshot_for_test(&mut table, &mut event_completion_rx).await;
     let mut snapshot = table.snapshot.write().await;
     let SnapshotReadOutput {
         data_file_paths, ..
@@ -44,7 +47,13 @@ async fn test_flush_basic(#[case] identity: IdentityProp) -> Result<()> {
     table.register_table_notify(event_completion_tx).await;
 
     let rows = vec![test_row(1, "Alice", 30), test_row(2, "Bob", 25)];
-    append_commit_flush_snapshot(&mut table, &mut event_completion_rx, rows, 1).await?;
+    append_commit_flush_create_mooncake_snapshot_for_test(
+        &mut table,
+        &mut event_completion_rx,
+        rows,
+        1,
+    )
+    .await?;
     let mut snapshot = table.snapshot.write().await;
     let SnapshotReadOutput {
         data_file_paths, ..
@@ -66,15 +75,21 @@ async fn test_delete_and_append(#[case] identity: IdentityProp) -> Result<()> {
         test_row(2, "Row 2", 32),
         test_row(3, "Row 3", 33),
     ];
-    append_commit_flush_snapshot(&mut table, &mut event_completion_rx, initial_rows, 1).await?;
+    append_commit_flush_create_mooncake_snapshot_for_test(
+        &mut table,
+        &mut event_completion_rx,
+        initial_rows,
+        1,
+    )
+    .await?;
 
     table.delete(test_row(2, "Row 2", 32), 1).await;
     table.commit(2);
-    snapshot(&mut table, &mut event_completion_rx).await;
+    create_mooncake_snapshot_for_test(&mut table, &mut event_completion_rx).await;
 
     append_rows(&mut table, vec![test_row(4, "Row 4", 34)])?;
     table.commit(3);
-    snapshot(&mut table, &mut event_completion_rx).await;
+    create_mooncake_snapshot_for_test(&mut table, &mut event_completion_rx).await;
 
     let mut snapshot = table.snapshot.write().await;
     let SnapshotReadOutput {
@@ -105,12 +120,12 @@ async fn test_deletion_before_flush(#[case] identity: IdentityProp) -> Result<()
 
     append_rows(&mut table, batch_rows(1, 4))?;
     table.commit(1);
-    snapshot(&mut table, &mut event_completion_rx).await;
+    create_mooncake_snapshot_for_test(&mut table, &mut event_completion_rx).await;
 
     table.delete(test_row(2, "Row 2", 32), 1).await;
     table.delete(test_row(4, "Row 4", 34), 1).await;
     table.commit(2);
-    snapshot(&mut table, &mut event_completion_rx).await;
+    create_mooncake_snapshot_for_test(&mut table, &mut event_completion_rx).await;
 
     let mut snapshot = table.snapshot.write().await;
     let SnapshotReadOutput {
@@ -127,12 +142,18 @@ async fn test_deletion_after_flush(#[case] identity: IdentityProp) -> Result<()>
     let mut table = test_table(&context, "table", identity).await;
     let (event_completion_tx, mut event_completion_rx) = mpsc::channel(100);
     table.register_table_notify(event_completion_tx).await;
-    append_commit_flush_snapshot(&mut table, &mut event_completion_rx, batch_rows(1, 4), 1).await?;
+    append_commit_flush_create_mooncake_snapshot_for_test(
+        &mut table,
+        &mut event_completion_rx,
+        batch_rows(1, 4),
+        1,
+    )
+    .await?;
 
     table.delete(test_row(2, "Row 2", 32), 2).await;
     table.delete(test_row(4, "Row 4", 34), 2).await;
     table.commit(3);
-    snapshot(&mut table, &mut event_completion_rx).await;
+    create_mooncake_snapshot_for_test(&mut table, &mut event_completion_rx).await;
 
     let mut snapshot = table.snapshot.write().await;
     let SnapshotReadOutput {
@@ -228,12 +249,12 @@ async fn test_update_rows(#[case] identity: IdentityProp) -> Result<()> {
 
 #[tokio::test]
 async fn test_snapshot_initialization() -> Result<()> {
-    let schema = test_schema();
+    let schema = create_test_arrow_schema();
     let identity = IdentityProp::Keys(vec![0]);
     let metadata = Arc::new(TableMetadata {
         name: "test_table".to_string(),
         table_id: 1,
-        schema: Arc::new(schema),
+        schema,
         config: MooncakeTableConfig::default(), // No temp files generated.
         path: PathBuf::new(),
         identity,
@@ -278,12 +299,12 @@ async fn test_full_row_with_duplication_and_identical() -> Result<()> {
         ],
     )?;
     table.commit(1);
-    snapshot(&mut table, &mut event_completion_rx).await;
+    create_mooncake_snapshot_for_test(&mut table, &mut event_completion_rx).await;
 
     // Delete one duplicate before flush (row1)
     table.delete(row1.clone(), 1).await;
     table.commit(2);
-    snapshot(&mut table, &mut event_completion_rx).await;
+    create_mooncake_snapshot_for_test(&mut table, &mut event_completion_rx).await;
 
     // Verify that row1 is deleted, but row2 (same id) remains
     {
@@ -307,12 +328,12 @@ async fn test_full_row_with_duplication_and_identical() -> Result<()> {
 
     // Flush the table
     table.flush(3).await?;
-    snapshot(&mut table, &mut event_completion_rx).await;
+    create_mooncake_snapshot_for_test(&mut table, &mut event_completion_rx).await;
 
     // Delete one duplicate during flush (row3)
     table.delete(row3.clone(), 3).await;
     table.commit(4);
-    snapshot(&mut table, &mut event_completion_rx).await;
+    create_mooncake_snapshot_for_test(&mut table, &mut event_completion_rx).await;
 
     // Verify that row3 is deleted, but row4 (same id) remains
     {
@@ -337,7 +358,7 @@ async fn test_full_row_with_duplication_and_identical() -> Result<()> {
     // Delete one duplicate after flush (row5)
     table.delete(row5.clone(), 4).await;
     table.commit(5);
-    snapshot(&mut table, &mut event_completion_rx).await;
+    create_mooncake_snapshot_for_test(&mut table, &mut event_completion_rx).await;
 
     {
         let mut table_snapshot = table.snapshot.write().await;
@@ -423,7 +444,7 @@ async fn test_table_recovery() {
 
     // Recovery from iceberg snapshot and check mooncake table recovery.
     let recovered_table = MooncakeTable::new(
-        test_schema(),
+        (*create_test_arrow_schema()).clone(),
         table_name.to_string(),
         /*table_id=*/ 1,
         context.path(),
@@ -444,7 +465,7 @@ async fn test_snapshot_load_failure() {
     let table_metadata = Arc::new(TableMetadata {
         name: "test_table".to_string(),
         table_id: 1,
-        schema: Arc::new(test_schema()),
+        schema: create_test_arrow_schema(),
         config: MooncakeTableConfig::default(), // No temp files generated.
         path: PathBuf::from(temp_dir.path()),
         identity: IdentityProp::Keys(vec![0]),
@@ -477,7 +498,7 @@ async fn test_snapshot_store_failure() {
     let table_metadata = Arc::new(TableMetadata {
         name: "test_table".to_string(),
         table_id: 1,
-        schema: Arc::new(test_schema()),
+        schema: create_test_arrow_schema(),
         config: MooncakeTableConfig::default(), // No temp files generated.
         path: PathBuf::from(temp_dir.path()),
         identity: IdentityProp::Keys(vec![0]),
@@ -525,7 +546,7 @@ async fn test_snapshot_store_failure() {
     table.flush(/*lsn=*/ 100).await.unwrap();
 
     let (_, iceberg_snapshot_payload, _, _, evicted_data_files_cache) =
-        snapshot(&mut table, &mut event_completion_rx).await;
+        create_mooncake_snapshot_for_test(&mut table, &mut event_completion_rx).await;
     for cur_file in evicted_data_files_cache.into_iter() {
         tokio::fs::remove_file(&cur_file).await.unwrap();
     }
