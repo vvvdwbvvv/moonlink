@@ -4,6 +4,7 @@ use futures::TryStreamExt;
 use opendal::layers::RetryLayer;
 use opendal::services;
 use opendal::Operator;
+use tokio::io::AsyncWriteExt;
 /// FileSystemAccessor built upon opendal.
 use tokio::sync::OnceCell;
 
@@ -187,10 +188,14 @@ impl BaseFileSystemAccess for FileSystemAccessor {
         }
     }
 
-    async fn read_object(&self, object: &str) -> Result<String> {
+    async fn read_object(&self, object: &str) -> Result<Vec<u8>> {
         let sanitized_object = self.sanitize_path(object);
         let content = self.get_operator().await?.read(sanitized_object).await?;
-        Ok(String::from_utf8(content.to_vec())?)
+        Ok(content.to_vec())
+    }
+    async fn read_object_as_string(&self, object: &str) -> Result<String> {
+        let bytes = self.read_object(object).await?;
+        Ok(String::from_utf8(bytes)?)
     }
 
     async fn write_object(&self, object: &str, content: Vec<u8>) -> Result<()> {
@@ -215,6 +220,14 @@ impl BaseFileSystemAccess for FileSystemAccessor {
         self.write_object(sanitized_dst, content).await?;
         Ok(())
     }
+
+    async fn copy_from_remote_to_local(&self, src: &str, dst: &str) -> Result<()> {
+        let content = self.read_object(src).await?;
+        let mut dst_file = tokio::fs::File::create(dst).await?;
+        dst_file.write_all(&content).await?;
+        dst_file.flush().await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -229,7 +242,6 @@ mod tests {
         let filesystem_accessor = FileSystemAccessor::new(FileSystemConfig::FileSystem {
             root_directory: root_directory.clone(),
         });
-        const CONTENT: &str = "helloworld";
 
         // Prepare src file.
         let src_filepath = format!("{}/src", &root_directory);
@@ -244,9 +256,37 @@ mod tests {
 
         // Validate destination file content.
         let actual_content = filesystem_accessor
-            .read_object(&dst_filepath)
+            .read_object_as_string(&dst_filepath)
             .await
             .unwrap();
-        assert_eq!(actual_content, CONTENT);
+        assert_eq!(actual_content, TEST_CONTEST);
+    }
+
+    #[tokio::test]
+    async fn test_copy_from_remote_to_local() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root_directory = temp_dir.path().to_str().unwrap().to_string();
+        let filesystem_config = FileSystemConfig::FileSystem {
+            root_directory: root_directory.clone(),
+        };
+        let filesystem_accessor = FileSystemAccessor::new(filesystem_config.clone());
+
+        // Prepare src file.
+        let src_filepath = format!("{}/src", &root_directory);
+        create_remote_file(&src_filepath, filesystem_config.clone()).await;
+
+        // Copy from src to dst.
+        let dst_filepath = format!("{}/dst", &root_directory);
+        filesystem_accessor
+            .copy_from_remote_to_local(&src_filepath, &dst_filepath)
+            .await
+            .unwrap();
+
+        // Validate destination file content.
+        let actual_content = filesystem_accessor
+            .read_object_as_string(&dst_filepath)
+            .await
+            .unwrap();
+        assert_eq!(actual_content, TEST_CONTEST);
     }
 }
