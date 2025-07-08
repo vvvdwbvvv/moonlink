@@ -2,6 +2,7 @@ use super::puffin_writer_proxy::append_puffin_metadata_and_rewrite;
 use crate::storage::filesystem::accessor::base_filesystem_accessor::BaseFileSystemAccess;
 use crate::storage::filesystem::accessor::filesystem_accessor::FileSystemAccessor;
 use crate::storage::filesystem::filesystem_config::FileSystemConfig;
+use crate::storage::filesystem::utils::path_utils::get_root_path;
 use crate::storage::iceberg::moonlink_catalog::PuffinWrite;
 use crate::storage::iceberg::puffin_writer_proxy::{
     get_puffin_metadata_and_close, PuffinBlobMetadataProxy,
@@ -76,7 +77,7 @@ impl FileCatalog {
     /// Create a file catalog, which gets initialized lazily.
     pub fn new(config: FileSystemConfig) -> IcebergResult<Self> {
         let file_io = utils::create_file_io(&config)?;
-        let warehouse_location = Self::get_warehouse_location_from_filesystem_config(&config);
+        let warehouse_location = get_root_path(&config);
         Ok(Self {
             filesystem_accessor: Arc::new(FileSystemAccessor::new(config)),
             file_io,
@@ -102,20 +103,6 @@ impl FileCatalog {
             puffin_blobs_to_remove: HashSet::new(),
             data_files_to_remove: HashSet::new(),
         })
-    }
-
-    /// Get warehouse uri from filesystem config.
-    fn get_warehouse_location_from_filesystem_config(
-        filesystem_config: &FileSystemConfig,
-    ) -> String {
-        match &filesystem_config {
-            #[cfg(feature = "storage-fs")]
-            FileSystemConfig::FileSystem { root_directory } => root_directory.to_string(),
-            #[cfg(feature = "storage-gcs")]
-            FileSystemConfig::Gcs { bucket, .. } => format!("gs://{}", bucket),
-            #[cfg(feature = "storage-s3")]
-            FileSystemConfig::S3 { bucket, .. } => format!("s3://{}", bucket),
-        }
     }
 
     /// Get warehouse uri.
@@ -351,7 +338,7 @@ impl Catalog for FileCatalog {
         self.filesystem_accessor
             .write_object(
                 &FileCatalog::get_namespace_indicator_name(namespace_ident),
-                /*content=*/ "",
+                /*content=*/ vec![],
             )
             .await
             .map_err(|e| {
@@ -474,7 +461,10 @@ impl Catalog for FileCatalog {
         let version_hint_filepath =
             format!("{}/{}/metadata/version-hint.text", directory, creation.name);
         self.filesystem_accessor
-            .write_object(&version_hint_filepath, /*content=*/ "0")
+            .write_object(
+                &version_hint_filepath,
+                /*content=*/ "0".as_bytes().to_vec(),
+            )
             .await
             .map_err(|e| {
                 IcebergError::new(
@@ -491,9 +481,9 @@ impl Catalog for FileCatalog {
         );
 
         let table_metadata = TableMetadataBuilder::from_table_creation(creation)?.build()?;
-        let metadata_json = serde_json::to_string(&table_metadata.metadata)?;
+        let metadata_json = serde_json::to_vec(&table_metadata.metadata)?;
         self.filesystem_accessor
-            .write_object(&metadata_filepath, /*content=*/ &metadata_json)
+            .write_object(&metadata_filepath, /*content=*/ metadata_json)
             .await
             .map_err(|e| {
                 IcebergError::new(
@@ -592,9 +582,9 @@ impl Catalog for FileCatalog {
             commit.identifier().name()
         );
         let new_metadata_filepath = format!("{}/v{}.metadata.json", metadata_directory, version,);
-        let metadata_json = serde_json::to_string(&metadata)?;
+        let metadata_json = serde_json::to_vec(&metadata)?;
         self.filesystem_accessor
-            .write_object(&new_metadata_filepath, &metadata_json)
+            .write_object(&new_metadata_filepath, metadata_json)
             .await
             .map_err(|e| {
                 IcebergError::new(
@@ -618,7 +608,7 @@ impl Catalog for FileCatalog {
         // Write version hint file.
         let version_hint_path = format!("{}/version-hint.text", metadata_directory);
         self.filesystem_accessor
-            .write_object(&version_hint_path, &format!("{version}"))
+            .write_object(&version_hint_path, format!("{version}").as_bytes().to_vec())
             .await
             .map_err(|e| {
                 IcebergError::new(
