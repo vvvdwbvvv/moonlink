@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use crate::storage::cache::object_storage::base_cache::CacheTrait;
+use crate::storage::filesystem::accessor::base_filesystem_accessor::BaseFileSystemAccess;
 use crate::storage::iceberg::puffin_utils;
 use crate::storage::iceberg::utils::to_iceberg_error;
 use crate::storage::index::persisted_bucket_hash_map::IndexBlock as MooncakeIndexBlock;
@@ -103,6 +104,7 @@ impl FileIndex {
         &mut self,
         data_file_to_id: &HashMap<String, FileId>,
         mut object_storage_cache: ObjectStorageCache,
+        filesystem_accessor: &dyn BaseFileSystemAccess,
         table_id: TableId,
         next_file_id: &mut u64,
     ) -> IcebergResult<MooncakeFileIndex> {
@@ -119,7 +121,11 @@ impl FileIndex {
                 file_id: FileId(cur_file_id),
             };
             let (cache_handle, cur_evicted_files) = object_storage_cache
-                .get_cache_entry(table_unique_file_id, &cur_index_block.filepath)
+                .get_cache_entry(
+                    table_unique_file_id,
+                    &cur_index_block.filepath,
+                    filesystem_accessor,
+                )
                 .await
                 .map_err(|e| {
                     IcebergError::new(
@@ -268,6 +274,7 @@ impl FileIndexBlob {
 mod tests {
     use super::*;
 
+    use crate::storage::filesystem::accessor::filesystem_accessor::FileSystemAccessor;
     use crate::storage::index::persisted_bucket_hash_map::IndexBlock as MooncakeIndexBlock;
     use crate::storage::index::FileIndex as MooncakeFileIndex;
     use crate::storage::storage_utils::create_data_file;
@@ -279,6 +286,7 @@ mod tests {
         // Test object storage cache.
         let temp_dir = tempfile::tempdir().unwrap();
         let object_storage_cache = ObjectStorageCache::default_for_test(&temp_dir);
+        let filesystem_accessor = FileSystemAccessor::default_for_test(&temp_dir);
 
         // Fill in meaningless random bytes, mainly to verify the correctness of serde.
         let temp_local_index_file = temp_dir.path().join("local-index.bin");
@@ -347,6 +355,7 @@ mod tests {
             .as_mooncake_file_index(
                 &data_file_to_id,
                 object_storage_cache.clone(),
+                filesystem_accessor.as_ref(),
                 table_id,
                 &mut next_file_id,
             )
