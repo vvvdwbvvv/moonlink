@@ -61,7 +61,7 @@ where
 
     for cur_metadata_store_uri in metadata_store_uris.into_iter() {
         let metadata_store_accessor =
-            metadata_store_utils::create_metadata_store_accessor(cur_metadata_store_uri.clone())?;
+            metadata_store_utils::create_metadata_store_accessor(cur_metadata_store_uri)?;
 
         // Step-1: check schema existence, skip if not.
         if !metadata_store_accessor.schema_exists().await? {
@@ -85,13 +85,12 @@ where
 
         // Perform recovery on all managed tables.
         for cur_metadata_entry in table_metadata_entries.into_iter() {
+            unique_uris.insert(cur_metadata_entry.src_table_uri.clone());
             recover_table(database_id, cur_metadata_entry, replication_manager).await?;
         }
 
         // Place into metadata store clients map.
         recovered_metadata_stores.insert(D::from(database_id), metadata_store_accessor);
-
-        unique_uris.insert(cur_metadata_store_uri);
     }
 
     for uri in unique_uris.into_iter() {
