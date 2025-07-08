@@ -4,16 +4,16 @@ use futures::TryStreamExt;
 use opendal::layers::RetryLayer;
 use opendal::services;
 use opendal::Operator;
-/// FileSystemOperator built upon opendal.
+/// FileSystemAccessor built upon opendal.
 use tokio::sync::OnceCell;
 
-use crate::storage::filesystem::accessor::base_filesystem_accessor::BaseObjectStorageAccess;
+use crate::storage::filesystem::accessor::base_filesystem_accessor::BaseFileSystemAccess;
 use crate::storage::filesystem::accessor::configs::*;
 use crate::storage::filesystem::filesystem_config::FileSystemConfig;
 use crate::Result;
 
 #[derive(Debug)]
-pub(crate) struct FileSystemOperator {
+pub struct FileSystemAccessor {
     /// Root directory for the operator.
     root_directory: String,
     /// Operator to manager all IO operations.
@@ -22,8 +22,9 @@ pub(crate) struct FileSystemOperator {
     config: FileSystemConfig,
 }
 
-impl FileSystemOperator {
-    pub(crate) fn new(config: FileSystemConfig, root_location: String) -> Self {
+impl FileSystemAccessor {
+    // TODO(hjiang): No need for [`root_location`], should bake in filesystem config.
+    pub fn new(config: FileSystemConfig, root_location: String) -> Self {
         Self {
             root_directory: root_location,
             operator: OnceCell::new(),
@@ -32,7 +33,7 @@ impl FileSystemOperator {
     }
 
     /// Get IO operator from the catalog.
-    pub(crate) async fn get_operator(&self) -> Result<&Operator> {
+    async fn get_operator(&self) -> Result<&Operator> {
         let retry_layer = RetryLayer::new()
             .with_max_times(MAX_RETRY_COUNT)
             .with_jitter()
@@ -94,7 +95,7 @@ impl FileSystemOperator {
 }
 
 #[async_trait]
-impl BaseObjectStorageAccess for FileSystemOperator {
+impl BaseFileSystemAccess for FileSystemAccessor {
     /// ===============================
     /// Directory operations
     /// ===============================
@@ -184,6 +185,7 @@ impl BaseObjectStorageAccess for FileSystemOperator {
         Ok(String::from_utf8(content.to_vec())?)
     }
 
+    // TODO(hjiang): Could avoid copy.
     async fn write_object(&self, object_filepath: &str, content: &str) -> Result<()> {
         let data = content.as_bytes().to_vec();
         let operator = self.get_operator().await?;
@@ -191,10 +193,48 @@ impl BaseObjectStorageAccess for FileSystemOperator {
         Ok(())
     }
 
-    /// Delete the given object.
     async fn delete_object(&self, object_filepath: &str) -> Result<()> {
         let operator = self.get_operator().await?;
         operator.delete(object_filepath).await?;
         Ok(())
+    }
+
+    async fn copy_from_local_to_remote(&self, src: &str, dst: &str) -> Result<()> {
+        let content = tokio::fs::read_to_string(src).await?;
+        self.write_object(dst, &content).await?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::filesystem::accessor::test_utils::*;
+
+    #[tokio::test]
+    async fn test_copy_from_local_to_remote() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root_directory = temp_dir.path().to_str().unwrap().to_string();
+        let filesystem_accessor =
+            FileSystemAccessor::new(FileSystemConfig::FileSystem, root_directory.clone());
+        const CONTENT: &str = "helloworld";
+
+        // Prepare src file.
+        let src_filepath = format!("{}/src", &root_directory);
+        create_local_file(&src_filepath).await;
+
+        // Copy from src to dst.
+        let dst_filepath = format!("{}/dst", &root_directory);
+        filesystem_accessor
+            .copy_from_local_to_remote(&src_filepath, &dst_filepath)
+            .await
+            .unwrap();
+
+        // Validate destination file content.
+        let actual_content = filesystem_accessor
+            .read_object(&dst_filepath)
+            .await
+            .unwrap();
+        assert_eq!(actual_content, CONTENT);
     }
 }
