@@ -45,7 +45,6 @@ use arrow_schema::Schema;
 use delete_vector::BatchDeletionVector;
 pub(crate) use disk_slice::DiskSliceWriter;
 use mem_slice::MemSlice;
-use more_asserts as ma;
 pub(crate) use snapshot::{PuffinDeletionBlobAtRead, SnapshotTableState};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -57,12 +56,8 @@ use tokio::sync::mpsc::Sender;
 use tokio::sync::{watch, RwLock};
 use tracing::info_span;
 use tracing::Instrument;
-use transaction_stream::{
-    TransactionStreamCommit, TransactionStreamOutput, TransactionStreamState,
-};
+use transaction_stream::{TransactionStreamOutput, TransactionStreamState};
 
-/// Special transaction id used when buffering CDC events during initial table copy.
-pub(crate) const INITIAL_COPY_CDC_XACT_ID: u32 = u32::MAX;
 /// Special transaction id used for initial copy append operation.
 pub(crate) const INITIAL_COPY_XACT_ID: u32 = u32::MAX - 1;
 
@@ -496,8 +491,9 @@ pub struct MooncakeTable {
     /// will be buffered into a streaming transaction and committed once copy
     /// finishes.
     in_initial_copy: bool,
-    /// Commits while in copy mode. Applied when finalizing the initial copy.
-    initial_copy_buffered_commits: Vec<TransactionStreamCommit>,
+
+    // Buffered events during initial copy.
+    pub(crate) initial_copy_buffered_events: Vec<TableEvent>,
 }
 
 impl MooncakeTable {
@@ -570,7 +566,7 @@ impl MooncakeTable {
             last_iceberg_snapshot_lsn,
             table_notify: None,
             in_initial_copy: false,
-            initial_copy_buffered_commits: Vec::new(),
+            initial_copy_buffered_events: Vec::new(),
         })
     }
 
@@ -953,7 +949,7 @@ impl MooncakeTable {
     /// All commits are buffered and deferred until initial copy finishes.
     pub fn start_initial_copy(&mut self) {
         assert!(!self.in_initial_copy);
-        assert!(self.initial_copy_buffered_commits.is_empty());
+        assert!(self.initial_copy_buffered_events.is_empty());
         self.in_initial_copy = true;
     }
 
@@ -968,43 +964,15 @@ impl MooncakeTable {
             .transaction_stream_states
             .contains_key(&INITIAL_COPY_XACT_ID)
         {
-            let initial_copy_stream_commit = self
-                .prepare_transaction_stream_commit(
-                    /*xact_id*/ INITIAL_COPY_XACT_ID,
-                    /*lsn=*/ 0,
-                )
-                .await
-                .unwrap();
-            self.commit_transaction_stream(initial_copy_stream_commit)
+            self.commit_transaction_stream(INITIAL_COPY_XACT_ID, 0)
                 .await
                 .unwrap();
         }
-
-        let buffered_commits = self
-            .initial_copy_buffered_commits
-            .drain(..)
-            .collect::<Vec<_>>();
-
-        // Second: apply all buffered streaming transaction commits
-        //
-        // Used to check flush LSN doesn't regress.
-        let mut prev_flush_lsn = 0;
-        for commit in buffered_commits {
-            ma::assert_lt!(prev_flush_lsn, commit.get_commit_lsn());
-            prev_flush_lsn = commit.get_commit_lsn();
-            self.commit_transaction_stream(commit).await?;
-        }
-
         Ok(())
     }
 
     pub fn is_in_initial_copy(&self) -> bool {
         self.in_initial_copy
-    }
-
-    /// Buffer a commit seen during initial copy.
-    pub fn buffer_initial_copy_commit(&mut self, commit: TransactionStreamCommit) {
-        self.initial_copy_buffered_commits.push(commit);
     }
 
     /// Persist an iceberg snapshot.
