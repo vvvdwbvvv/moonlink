@@ -6,7 +6,9 @@ use opendal::services;
 use opendal::Operator;
 #[cfg(test)]
 use tempfile::TempDir;
+use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::mpsc;
 /// FileSystemAccessor built upon opendal.
 use tokio::sync::OnceCell;
 
@@ -16,6 +18,11 @@ use crate::storage::filesystem::accessor::metadata::ObjectMetadata;
 use crate::storage::filesystem::filesystem_config::FileSystemConfig;
 use crate::storage::filesystem::utils::path_utils::get_root_path;
 use crate::Result;
+
+/// IO block size for parallel read and write.
+const IO_BLOCK_SIZE: usize = 2 * 1024 * 1024;
+/// Max number of ongoing parallel sub IO operations for one single upload and download operation.
+const MAX_SUB_IO_OPERATION: usize = 8;
 
 #[derive(Debug)]
 pub struct FileSystemAccessor {
@@ -227,10 +234,39 @@ impl BaseFileSystemAccess for FileSystemAccessor {
 
     async fn copy_from_local_to_remote(&self, src: &str, dst: &str) -> Result<ObjectMetadata> {
         let sanitized_dst = self.sanitize_path(dst);
-        let content = tokio::fs::read(src).await?;
-        let size = content.len();
-        self.write_object(sanitized_dst, content).await?;
-        Ok(ObjectMetadata { size: size as u64 })
+        let operator = self.get_operator().await?;
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(MAX_SUB_IO_OPERATION);
+
+        // Spawn reader task in blocks and place into queue.
+        let src_path = src.to_string();
+        let reader_task_handle = tokio::spawn(async move {
+            let mut file = tokio::fs::File::open(&src_path).await?;
+            // TODO(hjiang): No need to initialize buffer, likely require `unsafe`.
+            let mut buffer = vec![0u8; IO_BLOCK_SIZE];
+            loop {
+                let n = file.read(&mut buffer).await?;
+                if n == 0 {
+                    break;
+                }
+                tx.send(buffer[..n].to_vec()).await.unwrap();
+            }
+            Ok::<(), std::io::Error>(())
+        });
+
+        // Write main task.
+        let mut writer = operator.writer(sanitized_dst).await?;
+        let mut total_size = 0u64;
+        while let Some(cur_chunk) = rx.recv().await {
+            let cur_byte_len = cur_chunk.len();
+            writer.write(cur_chunk).await?;
+            total_size += cur_byte_len as u64;
+        }
+        writer.close().await?;
+
+        // Wait for reader task to finish.
+        reader_task_handle.await??;
+
+        Ok(ObjectMetadata { size: total_size })
     }
 
     async fn copy_from_remote_to_local(&self, src: &str, dst: &str) -> Result<ObjectMetadata> {
@@ -247,6 +283,7 @@ impl BaseFileSystemAccess for FileSystemAccessor {
 mod tests {
     use super::*;
     use crate::storage::filesystem::accessor::test_utils::*;
+    use rstest::rstest;
 
     #[tokio::test]
     async fn test_copy_from_local_to_remote() {
@@ -276,7 +313,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_copy_from_remote_to_local() {
+    #[rstest]
+    #[case(10)]
+    #[case(18 * 1024 * 1024)]
+    async fn test_copy_from_remote_to_local(#[case] file_size: usize) {
         let temp_dir = tempfile::tempdir().unwrap();
         let root_directory = temp_dir.path().to_str().unwrap().to_string();
         let filesystem_config = FileSystemConfig::FileSystem {
@@ -286,7 +326,8 @@ mod tests {
 
         // Prepare src file.
         let src_filepath = format!("{}/src", &root_directory);
-        create_remote_file(&src_filepath, filesystem_config.clone()).await;
+        let expected_content =
+            create_remote_file(&src_filepath, filesystem_config.clone(), file_size).await;
 
         // Copy from src to dst.
         let dst_filepath = format!("{}/dst", &root_directory);
@@ -300,6 +341,6 @@ mod tests {
             .read_object_as_string(&dst_filepath)
             .await
             .unwrap();
-        assert_eq!(actual_content, TEST_CONTEST);
+        assert_eq!(actual_content, expected_content);
     }
 }
