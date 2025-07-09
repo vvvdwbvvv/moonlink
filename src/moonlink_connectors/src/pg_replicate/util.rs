@@ -23,7 +23,7 @@ fn numeric_precision_scale(modifier: i32) -> Option<(u8, i8)> {
     // Derived from: [https://github.com/postgres/postgres/blob/4fbb46f61271f4b7f46ecad3de608fc2f4d7d80f/src/backend/utils/adt/numeric.c#L929v]
     let precision = ((typmod >> 16) & 0xffff) as u8;
     // Derived from: [https://github.com/postgres/postgres/blob/4fbb46f61271f4b7f46ecad3de608fc2f4d7d80f/src/backend/utils/adt/numeric.c#L944]
-    let raw_scale = (typmod & 0x7fff);
+    let raw_scale = (typmod & 0x7ff);
     let scale = ((raw_scale ^ 1024) - 1024) as i8;
     Some((precision, scale))
 }
@@ -242,7 +242,8 @@ fn convert_array_cell(cell: ArrayCell) -> Vec<RowValue> {
             .map(|v| {
                 v.map(|n| match n {
                     PgNumeric::Value(bigdecimal) => {
-                        RowValue::Decimal(bigdecimal.to_i128().unwrap())
+                        let (int_val, _) = bigdecimal.into_bigint_and_exponent();
+                        RowValue::Decimal(int_val.to_i128().unwrap())
                     }
                     _ => RowValue::Null,
                 })
@@ -364,16 +365,8 @@ impl From<PostgresTableRow> for MoonlinkRow {
                 Cell::Numeric(value) => {
                     match value {
                         PgNumeric::Value(bigdecimal) => {
-                            let (int_val, scale) = bigdecimal.as_bigint_and_exponent();
-                            let multiplier = 10_i128.pow(scale as u32);
-                            if let Some(scaled_integer) =
-                                int_val.to_i128().and_then(|v| v.checked_mul(multiplier))
-                            {
-                                values.push(RowValue::Decimal(scaled_integer));
-                            } else {
-                                values.push(RowValue::Null); // handle overflow safely
-                                warn!("Decimal value too large to fit in i128; storing as NULL");
-                            }
+                            let (int_val, _) = bigdecimal.into_bigint_and_exponent();
+                            values.push(RowValue::Decimal(int_val.to_i128().unwrap()));
                         }
                         _ => {
                             // DevNote:
