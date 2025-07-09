@@ -298,8 +298,14 @@ impl BaseFileSystemAccess for FileSystemAccessor {
         let src_path = src.to_string();
         let reader_task_handle = tokio::spawn(async move {
             let mut file = tokio::fs::File::open(&src_path).await?;
-            // TODO(hjiang): No need to initialize buffer, likely require `unsafe`.
-            let mut buffer = vec![0u8; IO_BLOCK_SIZE];
+            #[allow(clippy::uninit_vec)]
+            let mut buffer: Vec<u8> = {
+                let mut buf = Vec::with_capacity(IO_BLOCK_SIZE);
+                unsafe {
+                    buf.set_len(IO_BLOCK_SIZE);
+                }
+                buf
+            };
             loop {
                 let n = file.read(&mut buffer).await?;
                 if n == 0 {
