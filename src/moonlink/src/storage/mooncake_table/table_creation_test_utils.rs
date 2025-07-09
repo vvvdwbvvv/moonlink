@@ -2,8 +2,13 @@
 use crate::row::IdentityProp as RowIdentity;
 use crate::storage::compaction::compaction_config::DataCompactionConfig;
 use crate::storage::filesystem::accessor::base_filesystem_accessor::BaseFileSystemAccess;
+#[cfg(feature = "storage-gcs")]
+use crate::storage::filesystem::gcs::gcs_test_utils;
+#[cfg(feature = "storage-s3")]
+use crate::storage::filesystem::s3::s3_test_utils;
 use crate::storage::iceberg::iceberg_table_manager::IcebergTableConfig;
 use crate::storage::iceberg::iceberg_table_manager::IcebergTableManager;
+use crate::storage::index::index_merge_config::FileIndexMergeConfig;
 use crate::storage::mooncake_table::test_utils_commons::*;
 use crate::storage::mooncake_table::IcebergPersistenceConfig;
 use crate::storage::mooncake_table::{MooncakeTableConfig, TableMetadata as MooncakeTableMetadata};
@@ -21,7 +26,7 @@ use tempfile::TempDir;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::Receiver;
 
-/// Test util function to get iceberg table config.
+/// Test util function to get iceberg table config for local filesystem.
 pub(crate) fn get_iceberg_table_config(temp_dir: &TempDir) -> IcebergTableConfig {
     let root_directory = temp_dir.path().to_str().unwrap().to_string();
     IcebergTableConfig {
@@ -29,6 +34,39 @@ pub(crate) fn get_iceberg_table_config(temp_dir: &TempDir) -> IcebergTableConfig
         namespace: vec![ICEBERG_TEST_NAMESPACE.to_string()],
         table_name: ICEBERG_TEST_TABLE.to_string(),
         filesystem_config: FileSystemConfig::FileSystem { root_directory },
+    }
+}
+
+/// Test util function to create iceberg table config.
+pub(crate) fn create_iceberg_table_config(warehouse_uri: String) -> IcebergTableConfig {
+    let filesystem_config = if warehouse_uri.starts_with("s3://") {
+        #[cfg(feature = "storage-s3")]
+        {
+            s3_test_utils::create_s3_filesystem_config(&warehouse_uri)
+        }
+        #[cfg(not(feature = "storage-s3"))]
+        {
+            panic!("S3 support not enabled. Enable `storage-s3` feature.");
+        }
+    } else if warehouse_uri.starts_with("gs://") {
+        #[cfg(feature = "storage-gcs")]
+        {
+            gcs_test_utils::create_gcs_filesystem_config(&warehouse_uri)
+        }
+        #[cfg(not(feature = "storage-gcs"))]
+        {
+            panic!("GCS support not enabled. Enable `storage-gcs` feature.");
+        }
+    } else {
+        FileSystemConfig::FileSystem {
+            root_directory: warehouse_uri.clone(),
+        }
+    };
+
+    IcebergTableConfig {
+        warehouse_uri,
+        filesystem_config,
+        ..Default::default()
     }
 }
 
@@ -82,6 +120,19 @@ pub(crate) fn create_test_table_metadata_with_config(
     })
 }
 
+/// Test util function to create mooncake table metadata with index merge enable whenever there're two index blocks.
+pub(crate) fn create_test_table_metadata_with_index_merge(
+    local_table_directory: String,
+) -> Arc<MooncakeTableMetadata> {
+    let file_index_config = FileIndexMergeConfig {
+        file_indices_to_merge: 2,
+        index_block_final_size: u64::MAX,
+    };
+    let mut config = MooncakeTableConfig::new(local_table_directory.clone());
+    config.file_index_config = file_index_config;
+    create_test_table_metadata_with_config(local_table_directory, config)
+}
+
 /// Util function to create mooncake table and iceberg table manager; object storage cache will be created internally.
 ///
 /// Iceberg snapshot will be created whenever `create_snapshot` is called.
@@ -94,43 +145,6 @@ pub(crate) async fn create_table_and_iceberg_manager(
         default_data_compaction_config,
     )
     .await
-}
-
-/// Util function to create mooncake table and iceberg table manager.
-pub(crate) async fn create_table_and_iceberg_manager_with_config(
-    temp_dir: &TempDir,
-    mooncake_table_metadata: Arc<MooncakeTableMetadata>,
-    iceberg_table_config: IcebergTableConfig,
-) -> (MooncakeTable, IcebergTableManager, Receiver<TableEvent>) {
-    let path = temp_dir.path().to_path_buf();
-    let object_storage_cache = ObjectStorageCache::default_for_test(temp_dir);
-
-    let mut table = MooncakeTable::new(
-        mooncake_table_metadata.schema.as_ref().clone(),
-        ICEBERG_TEST_TABLE.to_string(),
-        /*table_id=*/ 1,
-        path,
-        mooncake_table_metadata.identity.clone(),
-        iceberg_table_config.clone(),
-        mooncake_table_metadata.as_ref().config.clone(),
-        object_storage_cache.clone(),
-        create_test_filesystem_accessor(&iceberg_table_config),
-    )
-    .await
-    .unwrap();
-
-    let iceberg_table_manager = IcebergTableManager::new(
-        mooncake_table_metadata.clone(),
-        object_storage_cache.clone(),
-        create_test_filesystem_accessor(&iceberg_table_config),
-        iceberg_table_config.clone(),
-    )
-    .unwrap();
-
-    let (notify_tx, notify_rx) = mpsc::channel(100);
-    table.register_table_notify(notify_tx).await;
-
-    (table, iceberg_table_manager, notify_rx)
 }
 
 /// Similar to [`create_table_and_iceberg_manager`], but it takes data compaction config.
@@ -218,6 +232,32 @@ pub(crate) async fn create_mooncake_table_and_notify_for_compaction(
         identity_property,
         iceberg_table_config.clone(),
         mooncake_table_config,
+        object_storage_cache,
+        create_test_filesystem_accessor(&iceberg_table_config),
+    )
+    .await
+    .unwrap();
+
+    let (notify_tx, notify_rx) = mpsc::channel(100);
+    table.register_table_notify(notify_tx).await;
+
+    (table, notify_rx)
+}
+
+/// Test util function to create mooncake table and table notify.
+pub(crate) async fn create_mooncake_table_and_notify(
+    mooncake_table_metadata: Arc<MooncakeTableMetadata>,
+    iceberg_table_config: IcebergTableConfig,
+    object_storage_cache: ObjectStorageCache,
+) -> (MooncakeTable, Receiver<TableEvent>) {
+    let mut table = MooncakeTable::new(
+        create_test_arrow_schema().as_ref().clone(),
+        ICEBERG_TEST_TABLE.to_string(),
+        /*version=*/ TEST_TABLE_ID.0,
+        mooncake_table_metadata.path.clone(),
+        mooncake_table_metadata.identity.clone(),
+        iceberg_table_config.clone(),
+        mooncake_table_metadata.config.clone(),
         object_storage_cache,
         create_test_filesystem_accessor(&iceberg_table_config),
     )
