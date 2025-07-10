@@ -13,9 +13,15 @@ pub enum FileSystemConfig {
     },
     #[cfg(feature = "storage-gcs")]
     Gcs {
+        /// GCS project.
         project: String,
+        /// GCS bucket.
         bucket: String,
-        endpoint: String,
+        /// If authentication required and credential unassigned, fallback to well-known location by default.
+        cred_path: Option<String>,
+        /// Used for fake GCS server.
+        endpoint: Option<String>,
+        /// Used for fake GCS server.
         disable_auth: bool,
     },
 }

@@ -13,37 +13,22 @@ use tokio_retry2::Retry;
 
 /// Fake GCS related constants.
 ///
-#[allow(dead_code)]
 pub(crate) static GCS_TEST_BUCKET_PREFIX: &str = "test-gcs-warehouse-";
-#[allow(dead_code)]
 pub(crate) static GCS_TEST_WAREHOUSE_URI_PREFIX: &str = "gs://test-gcs-warehouse-";
-#[allow(dead_code)]
 pub(crate) static GCS_TEST_ENDPOINT: &str = "http://gcs.local:4443";
-#[allow(dead_code)]
 pub(crate) static GCS_TEST_PROJECT: &str = "fake-project";
 
-#[allow(dead_code)]
 pub(crate) fn create_gcs_filesystem_config(warehouse_uri: &str) -> FileSystemConfig {
     let bucket = get_bucket_from_warehouse_uri(warehouse_uri);
     FileSystemConfig::Gcs {
         bucket: bucket.to_string(),
-        endpoint: GCS_TEST_ENDPOINT.to_string(),
+        endpoint: Some(GCS_TEST_ENDPOINT.to_string()),
         disable_auth: true,
         project: GCS_TEST_PROJECT.to_string(),
+        cred_path: None,
     }
 }
 
-/// Get GCS bucket name from the warehouse uri.
-#[allow(dead_code)]
-pub(crate) fn get_test_gcs_bucket(warehouse_uri: &str) -> String {
-    let random_string = warehouse_uri
-        .strip_prefix(GCS_TEST_WAREHOUSE_URI_PREFIX)
-        .unwrap()
-        .to_string();
-    format!("{}{}", GCS_TEST_BUCKET_PREFIX, random_string)
-}
-
-#[allow(dead_code)]
 pub(crate) fn get_test_gcs_bucket_and_warehouse() -> (String /*bucket*/, String /*warehouse_uri*/) {
     get_bucket_and_warehouse(GCS_TEST_BUCKET_PREFIX, GCS_TEST_WAREHOUSE_URI_PREFIX)
 }
@@ -118,7 +103,6 @@ async fn delete_gcs_bucket_impl(bucket: Arc<String>) -> IcebergResult<()> {
     Ok(())
 }
 
-#[allow(dead_code)]
 pub(crate) async fn create_test_gcs_bucket(bucket: String) -> IcebergResult<()> {
     let retry_strategy = ExponentialBackoff::from_millis(TEST_RETRY_INIT_MILLISEC)
         .map(jitter)
@@ -139,7 +123,6 @@ pub(crate) async fn create_test_gcs_bucket(bucket: String) -> IcebergResult<()> 
     Ok(())
 }
 
-#[allow(dead_code)]
 pub(crate) async fn delete_test_gcs_bucket(bucket: String) {
     let retry_strategy = ExponentialBackoff::from_millis(TEST_RETRY_INIT_MILLISEC)
         .map(jitter)
