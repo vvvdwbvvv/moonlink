@@ -1,5 +1,5 @@
 use crate::error::Result;
-use moonlink::{IcebergTableConfig, MoonlinkTableConfig};
+use moonlink::{IcebergTableConfig, MooncakeTableConfig, MoonlinkTableConfig};
 /// This module contains util functions related to moonlink config.
 use serde::{Deserialize, Serialize};
 
@@ -55,7 +55,7 @@ pub(crate) fn deserialze_moonlink_table_config(
             table_name: parsed.iceberg_table_config.table_name,
             ..Default::default()
         },
-        ..Default::default()
+        mooncake_table_config: MooncakeTableConfig::default(),
     };
 
     Ok(moonlink_table_config)

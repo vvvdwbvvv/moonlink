@@ -119,14 +119,15 @@ impl FileSystemAccessor {
                         region,
                         bucket,
                         endpoint,
-                        ..
                     } => {
-                        let builder = services::S3::default()
+                        let mut builder = services::S3::default()
                             .bucket(bucket)
                             .region(region)
-                            .endpoint(endpoint)
                             .access_key_id(access_key_id)
                             .secret_access_key(secret_access_key);
+                        if let Some(endpoint) = endpoint {
+                            builder = builder.endpoint(endpoint);
+                        }
                         let op = Operator::new(builder)?.layer(retry_layer).finish();
                         Ok(op)
                     }
