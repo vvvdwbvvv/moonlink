@@ -25,6 +25,7 @@ pub struct Sink {
     streaming_transactions_state: HashMap<u32, TransactionState>,
     transaction_state: TransactionState,
     replication_state: Arc<ReplicationState>,
+    relation_cache: HashMap<SrcTableId, postgres_replication::protocol::RelationBody>,
 }
 
 impl Sink {
@@ -38,6 +39,7 @@ impl Sink {
                 touched_tables: HashSet::new(),
             },
             replication_state,
+            relation_cache: HashMap::new(),
         }
     }
 }
@@ -55,50 +57,6 @@ impl Sink {
     pub fn drop_table(&mut self, src_table_id: SrcTableId) {
         self.event_senders.remove(&src_table_id).unwrap();
         self.commit_lsn_txs.remove(&src_table_id).unwrap();
-    }
-
-    pub async fn start_table_copy(
-        &mut self,
-        table_id: SrcTableId,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let sender = self
-            .event_senders
-            .get(&table_id)
-            .cloned()
-            .ok_or_else(|| format!("No event sender found for table_id: {:?}", table_id))?;
-
-        sender.send(TableEvent::StartInitialCopy).await.map_err(
-            |e| -> Box<dyn std::error::Error + Send + Sync> {
-                Box::new(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))
-            },
-        )?;
-
-        Ok(())
-    }
-
-    pub async fn finish_table_copy(
-        &mut self,
-        table_id: SrcTableId,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let sender = self
-            .event_senders
-            .get(&table_id)
-            .cloned()
-            .ok_or_else(|| format!("No event sender found for table_id: {:?}", table_id))?;
-
-        sender.send(TableEvent::FinishInitialCopy).await.map_err(
-            |e| -> Box<dyn std::error::Error + Send + Sync> {
-                Box::new(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))
-            },
-        )?;
-
-        Ok(())
     }
 
     /// Get final lsn for the current transaction.
@@ -260,6 +218,36 @@ impl Sink {
                     relation_name = relation_body.name().unwrap_or("unknown"),
                     "Relation"
                 );
+                let src_table_id = relation_body.rel_id();
+                let cache_entry = self.relation_cache.get_mut(&src_table_id);
+                if let Some(cache_entry) = cache_entry {
+                    if cache_entry.columns().len() != relation_body.columns().len() {
+                        let event_sender = self.event_senders.get(&src_table_id);
+                        if let Some(event_sender) = event_sender {
+                            assert!(cache_entry.columns().len() > relation_body.columns().len());
+                            let columns_to_drop = cache_entry
+                                .columns()
+                                .iter()
+                                .filter_map(|old_column| {
+                                    if !relation_body.columns().iter().any(|new_column| {
+                                        old_column.name().unwrap().to_string()
+                                            == new_column.name().unwrap().to_string()
+                                    }) {
+                                        Some(old_column.name().unwrap().to_string())
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect::<Vec<String>>();
+                            if let Err(e) = event_sender
+                                .send(TableEvent::AlterTable { columns_to_drop })
+                                .await
+                            {
+                                warn!(error = ?e, "failed to send alter table event");
+                            }
+                        }
+                    }
+                }
             }
             CdcEvent::Type(type_body) => {
                 debug!(
