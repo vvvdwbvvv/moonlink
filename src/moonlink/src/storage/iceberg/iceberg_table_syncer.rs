@@ -10,11 +10,6 @@ use crate::storage::iceberg::io_utils as iceberg_io_utils;
 use crate::storage::iceberg::puffin_utils;
 use crate::storage::iceberg::puffin_utils::PuffinBlobRef;
 use crate::storage::iceberg::table_manager::{PersistenceFileParams, PersistenceResult};
-use crate::storage::iceberg::table_property::{
-    TABLE_COMMIT_RETRY_FACTOR, TABLE_COMMIT_RETRY_MAX_MS_DEFAULT,
-    TABLE_COMMIT_RETRY_MIN_MS_DEFAULT, TABLE_COMMIT_RETRY_NUM_DEFAULT,
-};
-use crate::storage::iceberg::utils;
 use crate::storage::index::FileIndex as MooncakeFileIndex;
 use crate::storage::mooncake_table::delete_vector::BatchDeletionVector;
 use crate::storage::mooncake_table::take_data_files_to_remove;
@@ -31,10 +26,8 @@ use crate::storage::{io_utils, storage_utils};
 use std::collections::{HashMap, HashSet};
 use std::vec;
 
-use backon::{ExponentialBuilder, Retryable};
 use iceberg::puffin::CompressionCodec;
 use iceberg::spec::DataFile;
-use iceberg::table::Table as IcebergTable;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
 use iceberg::{Error as IcebergError, Result as IcebergResult};
 
@@ -129,10 +122,22 @@ impl IcebergTableManager {
                 self.filesystem_accessor.as_ref(),
             )
             .await
-            .map_err(utils::to_iceberg_error)?;
-        io_utils::delete_local_files(evicted_files_to_delete)
+            .map_err(|e| {
+                IcebergError::new(
+                    iceberg::ErrorKind::Unexpected,
+                    format!("Failed to get cache entry for {puffin_filepath}: {e:?}"),
+                )
+                .with_retryable(true)
+            })?;
+        io_utils::delete_local_files(evicted_files_to_delete.clone())
             .await
-            .map_err(utils::to_iceberg_error)?;
+            .map_err(|e| {
+                IcebergError::new(
+                    iceberg::ErrorKind::Unexpected,
+                    format!("Failed to delete files for {evicted_files_to_delete:?}: {e:?}"),
+                )
+                .with_retryable(true)
+            })?;
 
         let puffin_blob_ref = PuffinBlobRef {
             puffin_file_cache_handle: cache_handle.unwrap(),
@@ -421,37 +426,6 @@ impl IcebergTableManager {
         Ok(remote_file_indices)
     }
 
-    /// Commit transaction with retry.
-    ///
-    /// TODO(hjiang): Add unit test; currently it's hard due to the difficulty to mock opendal or catalog.
-    async fn commit_transaction_with_retry(&self, txn: Transaction) -> IcebergResult<IcebergTable> {
-        let backoff = ExponentialBuilder::default()
-            .with_min_delay(std::time::Duration::from_millis(
-                TABLE_COMMIT_RETRY_MIN_MS_DEFAULT,
-            ))
-            .with_factor(TABLE_COMMIT_RETRY_FACTOR as f32)
-            .with_max_delay(std::time::Duration::from_millis(
-                TABLE_COMMIT_RETRY_MAX_MS_DEFAULT,
-            ))
-            .with_max_times(TABLE_COMMIT_RETRY_NUM_DEFAULT as usize);
-
-        let catalog = &*self.catalog;
-
-        (move || {
-            let txn = txn.clone();
-            async move { txn.commit(catalog).await }
-        })
-        .retry(backoff)
-        .sleep(tokio::time::sleep)
-        .when(|e: &IcebergError| {
-            matches!(
-                e.kind(),
-                iceberg::ErrorKind::Unexpected | iceberg::ErrorKind::CatalogCommitConflicts
-            )
-        })
-        .await
-    }
-
     pub(crate) async fn sync_snapshot_impl(
         &mut self,
         mut snapshot_payload: IcebergSnapshotPayload,
@@ -503,7 +477,7 @@ impl IcebergTableManager {
             snapshot_payload.flush_lsn.to_string(),
         );
         txn = action.apply(txn)?;
-        let updated_iceberg_table = self.commit_transaction_with_retry(txn).await?;
+        let updated_iceberg_table = txn.commit(&*self.catalog).await?;
         self.iceberg_table = Some(updated_iceberg_table);
 
         self.catalog.clear_puffin_metadata();
