@@ -18,7 +18,7 @@ use iceberg::io::FileRead;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::sync::Arc;
 use tempfile::{tempdir, TempDir};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 /// Creates a `MoonlinkRow` for testing purposes.
 pub fn create_row(id: i32, name: &str, age: i32) -> MoonlinkRow {
@@ -48,6 +48,7 @@ pub struct TestEnvironment {
     replication_tx: watch::Sender<u64>,
     last_commit_tx: watch::Sender<u64>,
     snapshot_lsn_tx: watch::Sender<u64>,
+    index_merge_completion_tx: broadcast::Sender<()>,
     pub(crate) table_event_manager: TableEventManager,
     pub(crate) temp_dir: TempDir,
     pub(crate) object_storage_cache: ObjectStorageCache,
@@ -87,13 +88,16 @@ impl TestEnvironment {
 
         let (drop_table_completion_tx, drop_table_completion_rx) = oneshot::channel();
         let (flush_lsn_tx, flush_lsn_rx) = watch::channel(0u64);
+        let (index_merge_completion_tx, _) = broadcast::channel(64usize);
         let event_sync_sender = EventSyncSender {
             drop_table_completion_tx,
             flush_lsn_tx,
+            index_merge_completion_tx: index_merge_completion_tx.clone(),
         };
         let table_event_sync_receiver = EventSyncReceiver {
             drop_table_completion_rx,
             flush_lsn_rx,
+            index_merge_completion_tx: index_merge_completion_tx.clone(),
         };
         let handler =
             TableHandler::new(mooncake_table, event_sync_sender, replication_rx.clone()).await;
@@ -110,6 +114,7 @@ impl TestEnvironment {
             replication_tx,
             last_commit_tx,
             snapshot_lsn_tx,
+            index_merge_completion_tx,
             table_event_manager,
             temp_dir,
             object_storage_cache,
@@ -214,6 +219,24 @@ impl TestEnvironment {
 
     pub async fn stream_abort(&self, xact_id: u32) {
         self.send_event(TableEvent::StreamAbort { xact_id }).await;
+    }
+
+    /// Force an index meger, and block wait its completion.
+    pub async fn force_index_merge_and_sync(&self) {
+        self.send_event(TableEvent::ForceIndexMerge).await;
+        let mut index_merge_completion_rx = self.index_merge_completion_tx.subscribe();
+        index_merge_completion_rx.recv().await.unwrap();
+    }
+
+    pub async fn flush_table_and_sync(&self, lsn: u64) {
+        self.send_event(TableEvent::Flush { lsn }).await;
+        let (tx, mut rx) = mpsc::channel(1);
+        self.send_event(TableEvent::ForceSnapshot {
+            lsn: Some(lsn),
+            tx: Some(tx),
+        })
+        .await;
+        rx.recv().await.unwrap().unwrap();
     }
 
     pub async fn flush_table(&self, lsn: u64) {
