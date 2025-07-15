@@ -81,7 +81,7 @@ pub(crate) async fn perform_index_merge_for_test(
     }));
     let (_, _, _, _, evicted_files_to_delete) = sync_mooncake_snapshot(table, receiver).await;
     // Delete evicted object storage cache entries immediately to make sure later accesses all happen on persisted files.
-    io_utils::delete_local_files(evicted_files_to_delete.clone())
+    io_utils::delete_local_files(&evicted_files_to_delete)
         .await
         .unwrap();
 
@@ -112,7 +112,7 @@ pub(crate) async fn perform_data_compaction_for_test(
     }));
     let (_, _, _, _, evicted_files_to_delete) = sync_mooncake_snapshot(table, receiver).await;
     // Delete evicted object storage cache entries immediately to make sure later accesses all happen on persisted files.
-    io_utils::delete_local_files(evicted_files_to_delete.clone())
+    io_utils::delete_local_files(&evicted_files_to_delete)
         .await
         .unwrap();
 
@@ -221,7 +221,7 @@ pub(crate) async fn create_mooncake_and_persist_for_test(
         create_mooncake_snapshot_for_test(table, receiver).await;
 
     // Delete evicted object storage cache entries immediately to make sure later accesses all happen on persisted files.
-    io_utils::delete_local_files(evicted_data_files_to_delete)
+    io_utils::delete_local_files(&evicted_data_files_to_delete)
         .await
         .unwrap();
 
@@ -241,7 +241,7 @@ async fn sync_mooncake_snapshot_and_create_new_by_iceberg_payload(
     let (_, iceberg_snapshot_payload, _, _, evicted_data_files_to_delete) =
         sync_mooncake_snapshot(table, receiver).await;
     // Delete evicted object storage cache entries immediately to make sure later accesses all happen on persisted files.
-    io_utils::delete_local_files(evicted_data_files_to_delete)
+    io_utils::delete_local_files(&evicted_data_files_to_delete)
         .await
         .unwrap();
 
@@ -307,7 +307,7 @@ pub(crate) async fn create_mooncake_and_persist_for_data_compaction_for_test(
     let (_, iceberg_snapshot_payload, _, _, evicted_data_files_to_delete) =
         sync_mooncake_snapshot(table, receiver).await;
     // Delete evicted object storage cache entries immediately to make sure later accesses all happen on persisted files.
-    io_utils::delete_local_files(evicted_data_files_to_delete)
+    io_utils::delete_local_files(&evicted_data_files_to_delete)
         .await
         .unwrap();
 
@@ -322,7 +322,7 @@ pub(crate) async fn create_mooncake_and_persist_for_data_compaction_for_test(
     let (_, iceberg_snapshot_payload, _, data_compaction_payload, evicted_data_files_to_delete) =
         sync_mooncake_snapshot(table, receiver).await;
     // Delete evicted object storage cache entries immediately to make sure later accesses all happen on persisted files.
-    io_utils::delete_local_files(evicted_data_files_to_delete)
+    io_utils::delete_local_files(&evicted_data_files_to_delete)
         .await
         .unwrap();
 
@@ -372,7 +372,7 @@ pub(crate) async fn create_mooncake_and_iceberg_snapshot_for_index_merge_for_tes
     let (_, iceberg_snapshot_payload, _, _, evicted_data_files_to_delete) =
         sync_mooncake_snapshot(table, receiver).await;
     // Delete evicted object storage cache entries immediately to make sure later accesses all happen on persisted files.
-    io_utils::delete_local_files(evicted_data_files_to_delete)
+    io_utils::delete_local_files(&evicted_data_files_to_delete)
         .await
         .unwrap();
 
@@ -387,7 +387,7 @@ pub(crate) async fn create_mooncake_and_iceberg_snapshot_for_index_merge_for_tes
     let (_, iceberg_snapshot_payload, file_indice_merge_payload, _, evicted_data_files_to_delete) =
         sync_mooncake_snapshot(table, receiver).await;
     // Delete evicted object storage cache entries immediately to make sure later accesses all happen on persisted files.
-    io_utils::delete_local_files(evicted_data_files_to_delete)
+    io_utils::delete_local_files(&evicted_data_files_to_delete)
         .await
         .unwrap();
 
