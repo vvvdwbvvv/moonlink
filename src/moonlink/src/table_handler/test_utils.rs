@@ -49,6 +49,7 @@ pub struct TestEnvironment {
     last_commit_tx: watch::Sender<u64>,
     snapshot_lsn_tx: watch::Sender<u64>,
     index_merge_completion_tx: broadcast::Sender<()>,
+    data_compaction_completion_tx: broadcast::Sender<Result<()>>,
     pub(crate) table_event_manager: TableEventManager,
     pub(crate) temp_dir: TempDir,
     pub(crate) object_storage_cache: ObjectStorageCache,
@@ -89,15 +90,18 @@ impl TestEnvironment {
         let (drop_table_completion_tx, drop_table_completion_rx) = oneshot::channel();
         let (flush_lsn_tx, flush_lsn_rx) = watch::channel(0u64);
         let (index_merge_completion_tx, _) = broadcast::channel(64usize);
+        let (data_compaction_completion_tx, _) = broadcast::channel(64usize);
         let event_sync_sender = EventSyncSender {
             drop_table_completion_tx,
             flush_lsn_tx,
             index_merge_completion_tx: index_merge_completion_tx.clone(),
+            data_compaction_completion_tx: data_compaction_completion_tx.clone(),
         };
         let table_event_sync_receiver = EventSyncReceiver {
             drop_table_completion_rx,
             flush_lsn_rx,
             index_merge_completion_tx: index_merge_completion_tx.clone(),
+            data_compaction_completion_tx: data_compaction_completion_tx.clone(),
         };
         let handler =
             TableHandler::new(mooncake_table, event_sync_sender, replication_rx.clone()).await;
@@ -115,6 +119,7 @@ impl TestEnvironment {
             last_commit_tx,
             snapshot_lsn_tx,
             index_merge_completion_tx,
+            data_compaction_completion_tx,
             table_event_manager,
             temp_dir,
             object_storage_cache,
@@ -221,11 +226,18 @@ impl TestEnvironment {
         self.send_event(TableEvent::StreamAbort { xact_id }).await;
     }
 
-    /// Force an index meger, and block wait its completion.
+    /// Force an index merge operation, and block wait its completion.
     pub async fn force_index_merge_and_sync(&self) {
         self.send_event(TableEvent::ForceIndexMerge).await;
         let mut index_merge_completion_rx = self.index_merge_completion_tx.subscribe();
         index_merge_completion_rx.recv().await.unwrap();
+    }
+
+    /// Force a data compaction operation, and block wait its completion.
+    pub async fn force_data_compaction_and_sync(&self) {
+        self.send_event(TableEvent::ForceDataCompaction).await;
+        let mut data_compaction_completion_rx = self.data_compaction_completion_tx.subscribe();
+        data_compaction_completion_rx.recv().await.unwrap().unwrap();
     }
 
     pub async fn flush_table_and_sync(&self, lsn: u64) {
