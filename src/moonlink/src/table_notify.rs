@@ -60,10 +60,14 @@ pub enum TableEvent {
         lsn: Option<u64>,
         tx: Option<Sender<Result<()>>>,
     },
-    /// Force an index merge operation.
-    ForceIndexMerge,
-    /// Force a data compaction operation.
-    ForceDataCompaction,
+    /// There's at most one outstanding force table maintenance requests.
+    ///
+    /// Force a regular index merge operation.
+    ForceRegularIndexMerge,
+    /// Force a regular data compaction operation.
+    ForceRegularDataCompaction,
+    /// Force a full table maintenance operation.
+    ForceFullMaintenance,
     /// Drop table.
     DropTable,
     /// Alter table,

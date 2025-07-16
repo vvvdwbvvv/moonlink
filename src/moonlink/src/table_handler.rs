@@ -1,6 +1,6 @@
 use crate::event_sync::EventSyncSender;
 use crate::storage::mooncake_table::DataCompactionResult;
-use crate::storage::mooncake_table::MaintainanceOption;
+use crate::storage::mooncake_table::MaintenanceOption;
 use crate::storage::mooncake_table::SnapshotOption;
 use crate::storage::mooncake_table::INITIAL_COPY_XACT_ID;
 use crate::storage::{io_utils, MooncakeTable};
@@ -34,6 +34,16 @@ enum SpecialTableState {
     DropTable,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+enum MaintenanceRequestStatus {
+    /// Force Maintenance request is not requested.
+    Unrequested,
+    /// Force regular Maintenance is requested.
+    ForceRegular,
+    /// Force full Maintenance is requested.
+    ForceFull,
+}
+
 struct TableHandlerState {
     // cached table states
     //
@@ -59,20 +69,20 @@ struct TableHandlerState {
     //
     iceberg_snapshot_result_consumed: bool,
     iceberg_snapshot_ongoing: bool,
-    // Whether there's an ongoing background maintenance operation, for example, index merge, data compaction, etc.
-    // To simplify state management, we have at most one ongoing maintainance operation at the same time.
-    maintainance_ongoing: bool,
+    // Whether there's an ongoing background Maintenance operation, for example, index merge, data compaction, etc.
+    // To simplify state management, we have at most one ongoing Maintenance operation at the same time.
+    maintenance_ongoing: bool,
     // Whether there's an ongoing mooncake snapshot operation.
     mooncake_snapshot_ongoing: bool,
     // Pending force snapshot requests.
     pending_force_snapshot_lsns: BTreeMap<u64, Vec<Option<Sender<Result<()>>>>>,
-    // Whether force index merge has been requested.
-    force_index_merge_requested: bool,
+    // Index merge request status.
+    index_merge_request_status: MaintenanceRequestStatus,
     /// Notify when index merge completes.
     /// TODO(hjiang): Error status propagation.
     index_merge_completion_tx: broadcast::Sender<()>,
-    /// Whether force data compaction has been requested.
-    force_data_compaction_requested: bool,
+    /// Data compaction request status.
+    data_compaction_request_status: MaintenanceRequestStatus,
     /// Notify when data compaction completes.
     data_compaction_completion_tx: broadcast::Sender<Result<()>>,
     // Special table state, for example, initial copy, alter table, drop table, etc.
@@ -89,15 +99,15 @@ impl TableHandlerState {
         Self {
             iceberg_snapshot_result_consumed: true,
             iceberg_snapshot_ongoing: false,
-            maintainance_ongoing: false,
+            maintenance_ongoing: false,
             mooncake_snapshot_ongoing: false,
             initial_persistence_lsn: None,
             table_consistent_view_lsn: None,
             latest_commit_lsn: None,
             pending_force_snapshot_lsns: BTreeMap::new(),
-            force_index_merge_requested: false,
+            index_merge_request_status: MaintenanceRequestStatus::Unrequested,
+            data_compaction_request_status: MaintenanceRequestStatus::Unrequested,
             index_merge_completion_tx,
-            force_data_compaction_requested: false,
             data_compaction_completion_tx,
             special_table_state: SpecialTableState::Normal,
             initial_copy_buffered_events: Vec::new(),
@@ -118,34 +128,33 @@ impl TableHandlerState {
         }
     }
 
-    /// Get index merge operation option.
-    fn get_index_merge_option(&self) -> MaintainanceOption {
-        if self.maintainance_ongoing {
-            return MaintainanceOption::Skip;
-        }
-        if self.force_index_merge_requested {
-            return MaintainanceOption::Force;
-        }
-        MaintainanceOption::BestEffort
-    }
-
     /// Mark index merge completion.
     async fn mark_index_merge_completed(&mut self) {
-        assert!(self.maintainance_ongoing);
-        self.maintainance_ongoing = false;
-        self.force_index_merge_requested = false;
+        assert!(self.maintenance_ongoing);
+        self.maintenance_ongoing = false;
+        self.index_merge_request_status = MaintenanceRequestStatus::Unrequested;
         self.index_merge_completion_tx.send(()).unwrap();
     }
 
-    /// Get data compaction operation option.
-    fn get_data_compaction_option(&self) -> MaintainanceOption {
-        if self.maintainance_ongoing {
-            return MaintainanceOption::Skip;
+    /// Get Maintenance task operation option.
+    fn get_maintenance_task_option(
+        &self,
+        request_status: &MaintenanceRequestStatus,
+    ) -> MaintenanceOption {
+        if self.maintenance_ongoing {
+            return MaintenanceOption::Skip;
         }
-        if self.force_data_compaction_requested {
-            return MaintainanceOption::Force;
+        match request_status {
+            MaintenanceRequestStatus::Unrequested => MaintenanceOption::BestEffort,
+            MaintenanceRequestStatus::ForceRegular => MaintenanceOption::ForceRegular,
+            MaintenanceRequestStatus::ForceFull => MaintenanceOption::ForceFull,
         }
-        MaintainanceOption::BestEffort
+    }
+    fn get_index_merge_maintenance_option(&self) -> MaintenanceOption {
+        self.get_maintenance_task_option(&self.index_merge_request_status)
+    }
+    fn get_data_compaction_maintenance_option(&self) -> MaintenanceOption {
+        self.get_maintenance_task_option(&self.data_compaction_request_status)
     }
 
     /// Mark data compaction completion.
@@ -153,9 +162,9 @@ impl TableHandlerState {
         &mut self,
         data_compaction_result: &Result<DataCompactionResult>,
     ) {
-        assert!(self.maintainance_ongoing);
-        self.maintainance_ongoing = false;
-        self.force_data_compaction_requested = false;
+        assert!(self.maintenance_ongoing);
+        self.maintenance_ongoing = false;
+        self.data_compaction_request_status = MaintenanceRequestStatus::Unrequested;
         match &data_compaction_result {
             Ok(_) => {
                 self.data_compaction_completion_tx.send(Ok(())).unwrap();
@@ -418,14 +427,25 @@ impl TableHandler {
                                 table_handler_state.pending_force_snapshot_lsns.entry(requested_lsn).or_default().push(tx);
                             }
                         }
-                        // Branch to trigger a force index merge request.
-                        TableEvent::ForceIndexMerge => {
+                        // Branch to trigger a force regular index merge request.
+                        TableEvent::ForceRegularIndexMerge => {
                             // TODO(hjiang): Handle cases where there're not enough file indices to merge.
-                            table_handler_state.force_index_merge_requested = true;
+                            assert_eq!(table_handler_state.index_merge_request_status, MaintenanceRequestStatus::Unrequested);
+                            table_handler_state.index_merge_request_status = MaintenanceRequestStatus::ForceRegular;
                         }
-                        // Branch to trigger a force data compaction request.
-                        TableEvent::ForceDataCompaction => {
-                            table_handler_state.force_data_compaction_requested = true;
+                        // Branch to trigger a force regular data compaction request.
+                        TableEvent::ForceRegularDataCompaction => {
+                            // TODO(hjiang): Handle cases where there're not enough files to compact.
+                            assert_eq!(table_handler_state.data_compaction_request_status, MaintenanceRequestStatus::Unrequested);
+                            table_handler_state.data_compaction_request_status = MaintenanceRequestStatus::ForceRegular;
+                        }
+                        // Branch to trigger a force full index merge request.
+                        TableEvent::ForceFullMaintenance => {
+                            // TODO(hjiang): Handle cases where there're not enough file indices to merge.
+                            assert_eq!(table_handler_state.index_merge_request_status, MaintenanceRequestStatus::Unrequested);
+                            assert_eq!(table_handler_state.data_compaction_request_status, MaintenanceRequestStatus::Unrequested);
+                            table_handler_state.index_merge_request_status = MaintenanceRequestStatus::ForceFull;
+                            table_handler_state.data_compaction_request_status = MaintenanceRequestStatus::ForceFull;
                         }
                         // Branch to drop the iceberg table and clear pinned data files from the global object storage cache, only used when the whole table requested to drop.
                         // So we block wait for asynchronous request completion.
@@ -455,8 +475,8 @@ impl TableHandler {
                             assert!(table.create_snapshot(SnapshotOption {
                                 force_create: true,
                                 skip_iceberg_snapshot: true,
-                                index_merge_option: MaintainanceOption::Skip,
-                                data_compaction_option: MaintainanceOption::Skip,
+                                index_merge_option: MaintenanceOption::Skip,
+                                data_compaction_option: MaintenanceOption::Skip,
                             }));
                             table_handler_state.mooncake_snapshot_ongoing = true;
                             table_handler_state.finish_initial_copy();
@@ -485,8 +505,8 @@ impl TableHandler {
                                     assert!(table.create_snapshot(SnapshotOption {
                                         force_create: true,
                                         skip_iceberg_snapshot: table_handler_state.iceberg_snapshot_ongoing,
-                                        index_merge_option: table_handler_state.get_index_merge_option(),
-                                        data_compaction_option: table_handler_state.get_data_compaction_option(),
+                                        index_merge_option: table_handler_state.get_index_merge_maintenance_option(),
+                                        data_compaction_option: table_handler_state.get_data_compaction_maintenance_option(),
                                     }));
                                     table_handler_state.mooncake_snapshot_ongoing = true;
                                     continue;
@@ -496,10 +516,10 @@ impl TableHandler {
                             // Fallback to normal periodic snapshot.
                             table_handler_state.reset_iceberg_state_at_mooncake_snapshot();
                             table_handler_state.mooncake_snapshot_ongoing = table.create_snapshot(SnapshotOption {
-                                force_create: false,
+                                force_create: table_handler_state.index_merge_request_status != MaintenanceRequestStatus::Unrequested || table_handler_state.data_compaction_request_status != MaintenanceRequestStatus::Unrequested,
                                 skip_iceberg_snapshot: table_handler_state.iceberg_snapshot_ongoing,
-                                index_merge_option: table_handler_state.get_index_merge_option(),
-                                data_compaction_option: table_handler_state.get_data_compaction_option(),
+                                index_merge_option: table_handler_state.get_index_merge_maintenance_option(),
+                                data_compaction_option: table_handler_state.get_data_compaction_maintenance_option(),
                             });
                         }
                         TableEvent::MooncakeTableSnapshotResult { lsn, iceberg_snapshot_payload, data_compaction_payload, file_indice_merge_payload, evicted_data_files_to_delete } => {
@@ -529,9 +549,9 @@ impl TableHandler {
                             // Attempt to process data compaction.
                             // Unlike snapshot, we can actually have multiple file index merge operations ongoing concurrently,
                             // to simplify workflow we limit at most one ongoing.
-                            if !table_handler_state.maintainance_ongoing {
+                            if !table_handler_state.maintenance_ongoing {
                                 if let Some(data_compaction_payload) = data_compaction_payload {
-                                    table_handler_state.maintainance_ongoing = true;
+                                    table_handler_state.maintenance_ongoing = true;
                                     table.perform_data_compaction(data_compaction_payload);
                                 }
                             }
@@ -539,9 +559,9 @@ impl TableHandler {
                             // Attempt to process file indices merge.
                             // Unlike snapshot, we can actually have multiple file index merge operations ongoing concurrently,
                             // to simplify workflow we limit at most one ongoing.
-                            if !table_handler_state.maintainance_ongoing {
+                            if !table_handler_state.maintenance_ongoing {
                                 if let Some(file_indice_merge_payload) = file_indice_merge_payload {
-                                    table_handler_state.maintainance_ongoing = true;
+                                    table_handler_state.maintenance_ongoing = true;
                                     table.perform_index_merge(file_indice_merge_payload);
                                 }
                             }
@@ -597,7 +617,7 @@ impl TableHandler {
                                     error!(error = ?err, "failed to perform compaction");
                                 }
                             }
-                            table_handler_state.maintainance_ongoing = false;
+                            table_handler_state.maintenance_ongoing = false;
                         }
                         TableEvent::ReadRequest { cache_handles } => {
                             table.set_read_request_res(cache_handles);
@@ -721,8 +741,10 @@ impl TableHandler {
                     assert!(table.create_snapshot(SnapshotOption {
                         force_create: true,
                         skip_iceberg_snapshot: table_handler_state.iceberg_snapshot_ongoing,
-                        index_merge_option: table_handler_state.get_index_merge_option(),
-                        data_compaction_option: table_handler_state.get_data_compaction_option(),
+                        index_merge_option: table_handler_state
+                            .get_index_merge_maintenance_option(),
+                        data_compaction_option: table_handler_state
+                            .get_data_compaction_maintenance_option(),
                     }));
                     table_handler_state.mooncake_snapshot_ongoing = true;
                 }

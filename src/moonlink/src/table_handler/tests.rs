@@ -3,7 +3,6 @@ use iceberg::{Error as IcebergError, ErrorKind};
 use tempfile::tempdir;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 
 use super::test_utils::*;
 use super::TableEvent;
@@ -1292,68 +1291,6 @@ async fn test_periodical_force_snapshot() {
 }
 
 #[tokio::test]
-async fn test_multiple_index_merge_requested() {
-    let env = Arc::new(TestEnvironment::default().await);
-
-    let env1 = env.clone();
-    let env2 = env.clone();
-
-    let index_merge_handle1: JoinHandle<()> = tokio::spawn(async move {
-        env1.force_index_merge_and_sync().await;
-    });
-    let index_merge_handle2: JoinHandle<()> = tokio::spawn(async move {
-        env2.force_index_merge_and_sync().await;
-    });
-
-    // Append two rows to the table, and flush right afterwards.
-    env.append_row(
-        /*id=*/ 2, /*name=*/ "Bob", /*age=*/ 40, /*lsn=*/ 5,
-        /*xact_id=*/ None,
-    )
-    .await;
-    env.commit(10).await;
-    env.flush_table_and_sync(/*lsn=*/ 10).await;
-
-    env.append_row(
-        /*id=*/ 3, /*name=*/ "Tom", /*age=*/ 50, /*lsn=*/ 15,
-        /*xact_id=*/ None,
-    )
-    .await;
-    env.commit(20).await;
-    env.flush_table_and_sync(/*lsn=*/ 20).await;
-
-    // Synchronize on both index merge operations.
-    index_merge_handle1.await.unwrap();
-    index_merge_handle2.await.unwrap();
-
-    // Append another row to trigger mooncake and iceberg snapshot.
-    // TODO(hjiang): Should consider index merge return only when iceberg snapshot completed.
-    env.append_row(
-        /*id=*/ 4, /*name=*/ "David", /*age=*/ 40, /*lsn=*/ 25,
-        /*xact_id=*/ None,
-    )
-    .await;
-    env.commit(30).await;
-    env.flush_table_and_sync(/*lsn=*/ 30).await;
-
-    // Check mooncake snapshot.
-    env.verify_snapshot(/*target_lsn=*/ 20, /*ids=*/ &[2, 3, 4])
-        .await;
-
-    // Check iceberg snapshot result.
-    let mut iceberg_table_manager =
-        env.create_iceberg_table_manager(MooncakeTableConfig::default());
-    let (next_file_id, snapshot) = iceberg_table_manager
-        .load_snapshot_from_table()
-        .await
-        .unwrap();
-    assert_eq!(next_file_id, 5);
-    assert_eq!(snapshot.data_file_flush_lsn.unwrap(), 30);
-    assert_eq!(snapshot.disk_files.len(), 3); // three data files created by three flushes
-    assert_eq!(snapshot.indices.file_indices.len(), 2); // one merged file index, another unmerged
-}
-
-#[tokio::test]
 async fn test_index_merge_with_sufficient_file_indices() {
     let env = TestEnvironment::default().await;
 
@@ -1405,18 +1342,8 @@ async fn test_index_merge_with_sufficient_file_indices() {
 }
 
 #[tokio::test]
-async fn test_multiple_data_compaction_requested() {
-    let env = Arc::new(TestEnvironment::default().await);
-
-    let env1 = env.clone();
-    let env2 = env.clone();
-
-    let data_compaction_handle1: JoinHandle<()> = tokio::spawn(async move {
-        env1.force_data_compaction_and_sync().await;
-    });
-    let data_compaction_handle2: JoinHandle<()> = tokio::spawn(async move {
-        env2.force_data_compaction_and_sync().await;
-    });
+async fn test_data_compaction_with_sufficient_data_files() {
+    let env = TestEnvironment::default().await;
 
     // Append two rows to the table, and flush right afterwards.
     env.append_row(
@@ -1435,9 +1362,8 @@ async fn test_multiple_data_compaction_requested() {
     env.commit(20).await;
     env.flush_table_and_sync(/*lsn=*/ 20).await;
 
-    // Synchronize on both data compaction operations.
-    data_compaction_handle1.await.unwrap();
-    data_compaction_handle2.await.unwrap();
+    // Force index merge and iceberg snapshot, check result.
+    env.force_data_compaction_and_sync().await;
 
     // Append another row to trigger mooncake and iceberg snapshot.
     // TODO(hjiang): Should consider data compaction return only when iceberg snapshot completed.
@@ -1463,12 +1389,25 @@ async fn test_multiple_data_compaction_requested() {
     assert_eq!(next_file_id, 4);
     assert_eq!(snapshot.data_file_flush_lsn.unwrap(), 30);
     assert_eq!(snapshot.disk_files.len(), 2); // one compacted data file, another uncompacted
-    assert_eq!(snapshot.indices.file_indices.len(), 2); // one merged file index, another unmerged
+    assert_eq!(snapshot.indices.file_indices.len(), 2); // one compacted file index, another uncompacted
 }
 
 #[tokio::test]
-async fn test_data_compaction_with_sufficient_data_files() {
-    let env = TestEnvironment::default().await;
+async fn test_full_maintenance_with_sufficient_data_files() {
+    let temp_dir = tempdir().unwrap();
+    // Setup mooncake config, which won't trigger any data compaction or index merge, if not full table maintaince.
+    let mooncake_table_config = MooncakeTableConfig {
+        data_compaction_config: DataCompactionConfig {
+            data_file_to_compact: u32::MAX,
+            data_file_final_size: u64::MAX,
+        },
+        file_index_config: FileIndexMergeConfig {
+            file_indices_to_merge: u32::MAX,
+            index_block_final_size: u64::MAX,
+        },
+        ..Default::default()
+    };
+    let env = TestEnvironment::new(temp_dir, mooncake_table_config).await;
 
     // Append two rows to the table, and flush right afterwards.
     env.append_row(
@@ -1488,7 +1427,7 @@ async fn test_data_compaction_with_sufficient_data_files() {
     env.flush_table_and_sync(/*lsn=*/ 20).await;
 
     // Force index merge and iceberg snapshot, check result.
-    env.force_data_compaction_and_sync().await;
+    env.force_full_maintenance_and_sync().await;
 
     // Append another row to trigger mooncake and iceberg snapshot.
     // TODO(hjiang): Should consider data compaction return only when iceberg snapshot completed.
