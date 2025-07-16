@@ -16,7 +16,7 @@ use iceberg::io::FileRead;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use std::sync::Arc;
 use tempfile::{tempdir, TempDir};
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{mpsc, watch};
 
 /// Creates a `MoonlinkRow` for testing purposes.
 pub fn create_row(id: i32, name: &str, age: i32) -> MoonlinkRow {
@@ -46,7 +46,6 @@ pub struct TestEnvironment {
     replication_tx: watch::Sender<u64>,
     last_commit_tx: watch::Sender<u64>,
     snapshot_lsn_tx: watch::Sender<u64>,
-    table_maintenance_completion_tx: broadcast::Sender<Result<()>>,
     pub(crate) table_event_manager: TableEventManager,
     pub(crate) temp_dir: TempDir,
     pub(crate) object_storage_cache: ObjectStorageCache,
@@ -83,11 +82,7 @@ impl TestEnvironment {
             replication_rx.clone(),
             last_commit_rx,
         )));
-
         let (table_event_sync_sender, table_event_sync_receiver) = create_table_event_syncer();
-        let table_maintenance_completion_tx = table_event_sync_sender
-            .table_maintenance_completion_tx
-            .clone();
 
         let handler = TableHandler::new(
             mooncake_table,
@@ -108,7 +103,6 @@ impl TestEnvironment {
             replication_tx,
             last_commit_tx,
             snapshot_lsn_tx,
-            table_maintenance_completion_tx,
             table_event_manager,
             temp_dir,
             object_storage_cache,
@@ -216,25 +210,21 @@ impl TestEnvironment {
     }
 
     /// Force an index merge operation, and block wait its completion.
-    pub async fn force_index_merge_and_sync(&self) {
-        self.send_event(TableEvent::ForceRegularIndexMerge).await;
-        let mut index_merge_completion_rx = self.table_maintenance_completion_tx.subscribe();
-        index_merge_completion_rx.recv().await.unwrap().unwrap();
+    pub async fn force_index_merge_and_sync(&mut self) {
+        let mut rx = self.table_event_manager.initiate_index_merge().await;
+        rx.recv().await.unwrap().unwrap();
     }
 
     /// Force a data compaction operation, and block wait its completion.
-    pub async fn force_data_compaction_and_sync(&self) {
-        self.send_event(TableEvent::ForceRegularDataCompaction)
-            .await;
-        let mut data_compaction_completion_rx = self.table_maintenance_completion_tx.subscribe();
-        data_compaction_completion_rx.recv().await.unwrap().unwrap();
+    pub async fn force_data_compaction_and_sync(&mut self) {
+        let mut rx = self.table_event_manager.initiate_data_compaction().await;
+        rx.recv().await.unwrap().unwrap();
     }
 
     /// Force a full table maintenance task operation, and block wait its completion.
-    pub async fn force_full_maintenance_and_sync(&self) {
-        self.send_event(TableEvent::ForceFullMaintenance).await;
-        let mut data_compaction_completion_rx = self.table_maintenance_completion_tx.subscribe();
-        data_compaction_completion_rx.recv().await.unwrap().unwrap();
+    pub async fn force_full_maintenance_and_sync(&mut self) {
+        let mut rx = self.table_event_manager.initiate_full_compaction().await;
+        rx.recv().await.unwrap().unwrap();
     }
 
     pub async fn flush_table_and_sync(&self, lsn: u64) {
