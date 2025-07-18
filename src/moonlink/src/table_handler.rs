@@ -53,6 +53,18 @@ enum MaintenanceRequestStatus {
     ForceFull,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+enum MaintenanceProcessStatus {
+    /// Force maintainence request is not being requested.
+    Unrequested,
+    /// Force maintainence request is being processed.
+    InProcess,
+    /// Maintainence result has been put into snapshot buffer, which will be persisted into iceberg later.
+    ReadyToPersist,
+    /// Maintainence task result is being peristed into iceberg.
+    InPersist,
+}
+
 struct TableHandlerState {
     // cached table states
     //
@@ -67,7 +79,9 @@ struct TableHandlerState {
     // Latest LSN of the table's latest commit.
     latest_commit_lsn: Option<u64>,
 
-    // table management and event handling states
+    // ================================================
+    // Table management and event handling states
+    // ================================================
     //
     // Whether iceberg snapshot result has been consumed by the latest mooncake snapshot, when creating a mooncake snapshot.
     //
@@ -91,10 +105,19 @@ struct TableHandlerState {
     special_table_state: SpecialTableState,
     // Buffered events during blocking operations: initial copy, alter table, drop table, etc.
     initial_copy_buffered_events: Vec<TableEvent>,
+
+    // ================================================
+    // Table maintainence status
+    // ================================================
+    //
+    // Assume there's at most one table maintainence operation ongoing.
+    //
     // Index merge request status.
     index_merge_request_status: MaintenanceRequestStatus,
     /// Data compaction request status.
     data_compaction_request_status: MaintenanceRequestStatus,
+    /// Table maintainance process status.
+    table_maintenance_process_status: MaintenanceProcessStatus,
     /// Notify when data compaction completes.
     table_maintenance_completion_tx: broadcast::Sender<Result<()>>,
 }
@@ -120,6 +143,7 @@ impl TableHandlerState {
             maintenance_ongoing: false,
             index_merge_request_status: MaintenanceRequestStatus::Unrequested,
             data_compaction_request_status: MaintenanceRequestStatus::Unrequested,
+            table_maintenance_process_status: MaintenanceProcessStatus::Unrequested,
             table_maintenance_completion_tx,
             // Initial copy fields.
             initial_copy_buffered_events: Vec::new(),
@@ -145,7 +169,7 @@ impl TableHandlerState {
         assert!(self.maintenance_ongoing);
         self.maintenance_ongoing = false;
         self.index_merge_request_status = MaintenanceRequestStatus::Unrequested;
-        self.table_maintenance_completion_tx.send(Ok(())).unwrap();
+        self.table_maintenance_process_status = MaintenanceProcessStatus::ReadyToPersist;
     }
 
     /// Get Maintenance task operation option.
@@ -179,9 +203,10 @@ impl TableHandlerState {
         self.data_compaction_request_status = MaintenanceRequestStatus::Unrequested;
         match &data_compaction_result {
             Ok(_) => {
-                self.table_maintenance_completion_tx.send(Ok(())).unwrap();
+                self.table_maintenance_process_status = MaintenanceProcessStatus::ReadyToPersist;
             }
             Err(err) => {
+                self.table_maintenance_process_status = MaintenanceProcessStatus::Unrequested;
                 self.table_maintenance_completion_tx
                     .send(Err(err.clone()))
                     .unwrap();
@@ -215,11 +240,46 @@ impl TableHandlerState {
         self.largest_force_snapshot_lsn.is_some()
     }
 
+    /// Return mooncake snapshot option.
+    ///
+    /// # Arguments
+    ///
+    /// * request_force: request to force create a mooncake / iceberg snapshot.
+    fn get_mooncake_snapshot_option(&self, request_force: bool) -> SnapshotOption {
+        let mut force_create = request_force;
+        if self.table_maintenance_process_status == MaintenanceProcessStatus::ReadyToPersist {
+            force_create = true;
+        }
+        if self.index_merge_request_status != MaintenanceRequestStatus::Unrequested
+            && self.table_maintenance_process_status == MaintenanceProcessStatus::Unrequested
+        {
+            force_create = true;
+        }
+        if self.data_compaction_request_status != MaintenanceRequestStatus::Unrequested
+            && self.table_maintenance_process_status == MaintenanceProcessStatus::Unrequested
+        {
+            force_create = true;
+        }
+        SnapshotOption {
+            force_create,
+            skip_iceberg_snapshot: self.iceberg_snapshot_ongoing,
+            index_merge_option: self.get_index_merge_maintenance_option(),
+            data_compaction_option: self.get_data_compaction_maintenance_option(),
+        }
+    }
+
     /// Return whether should force to create a mooncake and iceberg snapshot, based on the new coming commit LSN.
-    fn should_force_snapshot_impl(&self, commit_lsn: u64) -> bool {
+    fn should_force_snapshot_by_commit_lsn(&self, commit_lsn: u64) -> bool {
+        // Case-1: there're completed but not persisted table maintainence changes.
+        if self.table_maintenance_process_status == MaintenanceProcessStatus::ReadyToPersist {
+            return true;
+        }
+
+        // Case-2: there're pending force snapshot requests.
         if let Some(largest_requested_lsn) = self.largest_force_snapshot_lsn {
             return largest_requested_lsn <= commit_lsn && !self.mooncake_snapshot_ongoing;
         }
+
         false
     }
 
@@ -254,6 +314,61 @@ impl TableHandlerState {
 
     fn mark_drop_table(&mut self) {
         self.special_table_state = SpecialTableState::DropTable;
+    }
+
+    /// Get the largest LSN where all updates have been persisted into iceberg.
+    /// The difference between "persisted table LSN" and "iceberg snapshot LSN" is, suppose we have two tables, table A has persisted all changes to iceberg with flush LSN-1;
+    /// if there're no further updates to the table A, meanwhile there're updates to table B with LSN-2, flush LSN-1 actually represents a consistent view of LSN-2.
+    ///
+    /// In the above situation, LSN-1 is "iceberg snapshot LSN", while LSN-2 is "persisted table LSN".
+    pub(crate) fn get_persisted_table_lsn(
+        &self,
+        iceberg_snapshot_lsn: Option<u64>,
+        replication_lsn: u64,
+    ) -> u64 {
+        // Case-1: there're no activities in the current table, but replication LSN already covers requested LSN.
+        if iceberg_snapshot_lsn.is_none() && self.table_consistent_view_lsn.is_none() {
+            return replication_lsn;
+        }
+
+        // Case-2: if there're no updates since last iceberg snapshot, replication LSN indicates persisted table LSN.
+        if iceberg_snapshot_lsn == self.table_consistent_view_lsn {
+            // Notice: replication LSN comes from replication events, so if all events have been processed (i.e., a clean recovery case), replication LSN is 0.
+            return std::cmp::max(replication_lsn, iceberg_snapshot_lsn.unwrap());
+        }
+
+        // Case-3: iceberg snapshot LSN indicates the persisted table LSN.
+        // No guarantee an iceberg snapshot has been persisted here.
+        iceberg_snapshot_lsn.unwrap_or(0)
+    }
+
+    /// Update requested iceberg snapshot LSNs, if applicable.
+    fn update_force_iceberg_snapshot_requests(
+        &mut self,
+        iceberg_snapshot_lsn: u64,
+        replication_lsn: u64,
+    ) {
+        if !self.has_pending_force_snapshot_request() {
+            return;
+        }
+
+        let persisted_table_lsn =
+            self.get_persisted_table_lsn(Some(iceberg_snapshot_lsn), replication_lsn);
+        self.notify_persisted_table_lsn(persisted_table_lsn);
+        let largest_force_snapshot_lsn = self.largest_force_snapshot_lsn.unwrap();
+        if persisted_table_lsn >= largest_force_snapshot_lsn {
+            self.largest_force_snapshot_lsn = None;
+        }
+    }
+
+    /// Notify the persisted table LSN.
+    fn notify_persisted_table_lsn(&mut self, persisted_table_lsn: u64) {
+        if let Err(e) = self
+            .force_snapshot_completion_tx
+            .send(Some(Ok(persisted_table_lsn)))
+        {
+            error!(error = ?e, "failed to notify force snapshot, because receiver end has closed channel");
+        }
     }
 }
 
@@ -513,12 +628,7 @@ impl TableHandler {
                                 if let Some(commit_lsn) = table_handler_state.table_consistent_view_lsn {
                                     table.flush(commit_lsn).await.unwrap();
                                     table_handler_state.reset_iceberg_state_at_mooncake_snapshot();
-                                    assert!(table.create_snapshot(SnapshotOption {
-                                        force_create: true,
-                                        skip_iceberg_snapshot: table_handler_state.iceberg_snapshot_ongoing,
-                                        index_merge_option: table_handler_state.get_index_merge_maintenance_option(),
-                                        data_compaction_option: table_handler_state.get_data_compaction_maintenance_option(),
-                                    }));
+                                    assert!(table.create_snapshot(table_handler_state.get_mooncake_snapshot_option(/*request_force=*/true)));
                                     table_handler_state.mooncake_snapshot_ongoing = true;
                                     continue;
                                 }
@@ -526,12 +636,7 @@ impl TableHandler {
 
                             // Fallback to normal periodic snapshot.
                             table_handler_state.reset_iceberg_state_at_mooncake_snapshot();
-                            table_handler_state.mooncake_snapshot_ongoing = table.create_snapshot(SnapshotOption {
-                                force_create: table_handler_state.index_merge_request_status != MaintenanceRequestStatus::Unrequested || table_handler_state.data_compaction_request_status != MaintenanceRequestStatus::Unrequested,
-                                skip_iceberg_snapshot: table_handler_state.iceberg_snapshot_ongoing,
-                                index_merge_option: table_handler_state.get_index_merge_maintenance_option(),
-                                data_compaction_option: table_handler_state.get_data_compaction_maintenance_option(),
-                            });
+                            table_handler_state.mooncake_snapshot_ongoing = table.create_snapshot(table_handler_state.get_mooncake_snapshot_option(/*request_force=*/false));
                         }
                         TableEvent::MooncakeTableSnapshotResult { lsn, iceberg_snapshot_payload, data_compaction_payload, file_indice_merge_payload, evicted_data_files_to_delete } => {
                             // Spawn a detached best-effort task to delete evicted object storage cache.
@@ -552,6 +657,11 @@ impl TableHandler {
                             // Process iceberg snapshot and trigger iceberg snapshot if necessary.
                             if table_handler_state.can_initiate_iceberg_snapshot() {
                                 if let Some(iceberg_snapshot_payload) = iceberg_snapshot_payload {
+                                    // Update table maintainence status.
+                                    if iceberg_snapshot_payload.contains_table_maintenance_payload() && table_handler_state.table_maintenance_process_status == MaintenanceProcessStatus::ReadyToPersist {
+                                        table_handler_state.table_maintenance_process_status = MaintenanceProcessStatus::InPersist;
+                                    }
+
                                     table_handler_state.iceberg_snapshot_ongoing = true;
                                     table.persist_iceberg_snapshot(iceberg_snapshot_payload);
                                 }
@@ -563,6 +673,8 @@ impl TableHandler {
                             if !table_handler_state.maintenance_ongoing {
                                 if let Some(data_compaction_payload) = data_compaction_payload {
                                     table_handler_state.maintenance_ongoing = true;
+                                    assert_eq!(table_handler_state.table_maintenance_process_status, MaintenanceProcessStatus::Unrequested);
+                                    table_handler_state.table_maintenance_process_status = MaintenanceProcessStatus::InProcess;
                                     table.perform_data_compaction(data_compaction_payload);
                                 }
                             }
@@ -573,6 +685,8 @@ impl TableHandler {
                             if !table_handler_state.maintenance_ongoing {
                                 if let Some(file_indice_merge_payload) = file_indice_merge_payload {
                                     table_handler_state.maintenance_ongoing = true;
+                                    assert_eq!(table_handler_state.table_maintenance_process_status, MaintenanceProcessStatus::Unrequested);
+                                    table_handler_state.table_maintenance_process_status = MaintenanceProcessStatus::InProcess;
                                     table.perform_index_merge(file_indice_merge_payload);
                                 }
                             }
@@ -583,6 +697,13 @@ impl TableHandler {
                             table_handler_state.iceberg_snapshot_ongoing = false;
                             match iceberg_snapshot_result {
                                 Ok(snapshot_res) => {
+                                    // Update table maintenance operation status.
+                                    if table_handler_state.table_maintenance_process_status == MaintenanceProcessStatus::InPersist && snapshot_res.contains_maintanence_result() {
+                                        table_handler_state.table_maintenance_process_status = MaintenanceProcessStatus::Unrequested;
+                                        table_handler_state.table_maintenance_completion_tx.send(Ok(())).unwrap();
+                                    }
+
+                                    // Buffer iceberg persistence result, which later will be reflected to mooncake snapshot.
                                     let iceberg_flush_lsn = snapshot_res.flush_lsn;
                                     event_sync_sender.flush_lsn_tx.send(iceberg_flush_lsn).unwrap();
                                     table.set_iceberg_snapshot_res(snapshot_res);
@@ -597,10 +718,17 @@ impl TableHandler {
                                 Err(e) => {
                                     let err = Err(Error::IcebergMessage(format!("Failed to create iceberg snapshot: {e:?}")));
                                     if table_handler_state.has_pending_force_snapshot_request() {
-                                        if let Err(send_err) = table_handler_state.force_snapshot_completion_tx.send(Some(err)) {
+                                        if let Err(send_err) = table_handler_state.force_snapshot_completion_tx.send(Some(err.clone())) {
                                             error!(error = ?send_err, "failed to notify force snapshot, because receive end has closed channel");
                                         }
                                     }
+
+                                    // Update table maintainence operation status.
+                                    if table_handler_state.table_maintenance_process_status == MaintenanceProcessStatus::InPersist {
+                                        table_handler_state.table_maintenance_process_status = MaintenanceProcessStatus::Unrequested;
+                                        table_handler_state.table_maintenance_completion_tx.send(Err(e)).unwrap();
+                                    }
+
                                     // If iceberg snapshot fails, send error back to all broadcast subscribers and unset force snapshot requests.
                                     table_handler_state.largest_force_snapshot_lsn = None;
                                 }
@@ -727,7 +855,8 @@ impl TableHandler {
                 // and 2. LSN which meets force snapshot requirement has appeared, before that we still allow buffering
                 // and 3. there's no snapshot creation operation ongoing
 
-                let should_force_snapshot = table_handler_state.should_force_snapshot_impl(lsn);
+                let should_force_snapshot =
+                    table_handler_state.should_force_snapshot_by_commit_lsn(lsn);
 
                 match xact_id {
                     Some(xact_id) => {
@@ -747,14 +876,9 @@ impl TableHandler {
 
                 if should_force_snapshot {
                     table_handler_state.reset_iceberg_state_at_mooncake_snapshot();
-                    assert!(table.create_snapshot(SnapshotOption {
-                        force_create: true,
-                        skip_iceberg_snapshot: table_handler_state.iceberg_snapshot_ongoing,
-                        index_merge_option: table_handler_state
-                            .get_index_merge_maintenance_option(),
-                        data_compaction_option: table_handler_state
-                            .get_data_compaction_maintenance_option(),
-                    }));
+                    assert!(table.create_snapshot(
+                        table_handler_state.get_mooncake_snapshot_option(/*request_force=*/ true)
+                    ));
                     table_handler_state.mooncake_snapshot_ongoing = true;
                 }
             }
@@ -778,65 +902,11 @@ impl TableHandler {
     }
 }
 
-impl TableHandlerState {
-    /// Get the largest LSN where all updates have been persisted into iceberg.
-    /// The difference between "persisted table LSN" and "iceberg snapshot LSN" is, suppose we have two tables, table A has persisted all changes to iceberg with flush LSN-1;
-    /// if there're no further updates to the table A, meanwhile there're updates to table B with LSN-2, flush LSN-1 actually represents a consistent view of LSN-2.
-    ///
-    /// In the above situation, LSN-1 is "iceberg snapshot LSN", while LSN-2 is "persisted table LSN".
-    pub(crate) fn get_persisted_table_lsn(
-        &self,
-        iceberg_snapshot_lsn: Option<u64>,
-        replication_lsn: u64,
-    ) -> u64 {
-        // Case-1: there're no activities in the current table, but replication LSN already covers requested LSN.
-        if iceberg_snapshot_lsn.is_none() && self.table_consistent_view_lsn.is_none() {
-            return replication_lsn;
-        }
-
-        // Case-2: if there're no updates since last iceberg snapshot, replication LSN indicates persisted table LSN.
-        if iceberg_snapshot_lsn == self.table_consistent_view_lsn {
-            // Notice: replication LSN comes from replication events, so if all events have been processed (i.e., a clean recovery case), replication LSN is 0.
-            return std::cmp::max(replication_lsn, iceberg_snapshot_lsn.unwrap());
-        }
-
-        // Case-3: iceberg snapshot LSN indicates the persisted table LSN.
-        // No guarantee an iceberg snapshot has been persisted here.
-        iceberg_snapshot_lsn.unwrap_or(0)
-    }
-
-    /// Update requested iceberg snapshot LSNs, if applicable.
-    fn update_force_iceberg_snapshot_requests(
-        &mut self,
-        iceberg_snapshot_lsn: u64,
-        replication_lsn: u64,
-    ) {
-        if !self.has_pending_force_snapshot_request() {
-            return;
-        }
-
-        let persisted_table_lsn =
-            self.get_persisted_table_lsn(Some(iceberg_snapshot_lsn), replication_lsn);
-        self.notify_persisted_table_lsn(persisted_table_lsn);
-        let largest_force_snapshot_lsn = self.largest_force_snapshot_lsn.unwrap();
-        if persisted_table_lsn >= largest_force_snapshot_lsn {
-            self.largest_force_snapshot_lsn = None;
-        }
-    }
-
-    /// Notify the persisted table LSN.
-    fn notify_persisted_table_lsn(&mut self, persisted_table_lsn: u64) {
-        if let Err(e) = self
-            .force_snapshot_completion_tx
-            .send(Some(Ok(persisted_table_lsn)))
-        {
-            error!(error = ?e, "failed to notify force snapshot, because receiver end has closed channel");
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests;
 
 #[cfg(test)]
 mod test_utils;
+
+#[cfg(test)]
+mod failure_tests;

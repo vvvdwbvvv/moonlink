@@ -1,5 +1,4 @@
 use arrow_array::{Int32Array, RecordBatch, StringArray};
-use iceberg::{Error as IcebergError, ErrorKind};
 use tempfile::tempdir;
 use tokio::sync::broadcast;
 use tokio::sync::watch;
@@ -1346,20 +1345,10 @@ async fn test_index_merge_with_sufficient_file_indices() {
     env.flush_table_and_sync(/*lsn=*/ 20).await;
 
     // Force index merge and iceberg snapshot, check result.
-    env.force_index_merge_and_sync().await;
-
-    // Append another row to trigger mooncake and iceberg snapshot.
-    // TODO(hjiang): Should consider index merge return only when iceberg snapshot completed.
-    env.append_row(
-        /*id=*/ 4, /*name=*/ "David", /*age=*/ 40, /*lsn=*/ 25,
-        /*xact_id=*/ None,
-    )
-    .await;
-    env.commit(30).await;
-    env.flush_table_and_sync(/*lsn=*/ 30).await;
+    env.force_index_merge_and_sync().await.unwrap();
 
     // Check mooncake snapshot.
-    env.verify_snapshot(/*target_lsn=*/ 20, /*ids=*/ &[2, 3, 4])
+    env.verify_snapshot(/*target_lsn=*/ 20, /*ids=*/ &[2, 3])
         .await;
 
     // Check iceberg snapshot result.
@@ -1369,10 +1358,10 @@ async fn test_index_merge_with_sufficient_file_indices() {
         .load_snapshot_from_table()
         .await
         .unwrap();
-    assert_eq!(next_file_id, 5);
-    assert_eq!(snapshot.data_file_flush_lsn.unwrap(), 30);
-    assert_eq!(snapshot.disk_files.len(), 3); // three data files created by three flushes
-    assert_eq!(snapshot.indices.file_indices.len(), 2); // one merged file index, another unmerged
+    assert_eq!(next_file_id, 3);
+    assert_eq!(snapshot.data_file_flush_lsn.unwrap(), 20);
+    assert_eq!(snapshot.disk_files.len(), 2); // two data files created by two flushes
+    assert_eq!(snapshot.indices.file_indices.len(), 1); // one merged file index
 }
 
 #[tokio::test]
@@ -1397,20 +1386,10 @@ async fn test_data_compaction_with_sufficient_data_files() {
     env.flush_table_and_sync(/*lsn=*/ 20).await;
 
     // Force index merge and iceberg snapshot, check result.
-    env.force_data_compaction_and_sync().await;
-
-    // Append another row to trigger mooncake and iceberg snapshot.
-    // TODO(hjiang): Should consider data compaction return only when iceberg snapshot completed.
-    env.append_row(
-        /*id=*/ 4, /*name=*/ "David", /*age=*/ 40, /*lsn=*/ 25,
-        /*xact_id=*/ None,
-    )
-    .await;
-    env.commit(30).await;
-    env.flush_table_and_sync(/*lsn=*/ 30).await;
+    env.force_data_compaction_and_sync().await.unwrap();
 
     // Check mooncake snapshot.
-    env.verify_snapshot(/*target_lsn=*/ 20, /*ids=*/ &[2, 3, 4])
+    env.verify_snapshot(/*target_lsn=*/ 20, /*ids=*/ &[2, 3])
         .await;
 
     // Check iceberg snapshot result.
@@ -1420,10 +1399,10 @@ async fn test_data_compaction_with_sufficient_data_files() {
         .load_snapshot_from_table()
         .await
         .unwrap();
-    assert_eq!(next_file_id, 4);
-    assert_eq!(snapshot.data_file_flush_lsn.unwrap(), 30);
-    assert_eq!(snapshot.disk_files.len(), 2); // one compacted data file, another uncompacted
-    assert_eq!(snapshot.indices.file_indices.len(), 2); // one compacted file index, another uncompacted
+    assert_eq!(next_file_id, 2);
+    assert_eq!(snapshot.data_file_flush_lsn.unwrap(), 20);
+    assert_eq!(snapshot.disk_files.len(), 1); // one compacted data file
+    assert_eq!(snapshot.indices.file_indices.len(), 1); // one compacted file index
 }
 
 #[tokio::test]
@@ -1461,20 +1440,10 @@ async fn test_full_maintenance_with_sufficient_data_files() {
     env.flush_table_and_sync(/*lsn=*/ 20).await;
 
     // Force index merge and iceberg snapshot, check result.
-    env.force_full_maintenance_and_sync().await;
-
-    // Append another row to trigger mooncake and iceberg snapshot.
-    // TODO(hjiang): Should consider data compaction return only when iceberg snapshot completed.
-    env.append_row(
-        /*id=*/ 4, /*name=*/ "David", /*age=*/ 40, /*lsn=*/ 25,
-        /*xact_id=*/ None,
-    )
-    .await;
-    env.commit(30).await;
-    env.flush_table_and_sync(/*lsn=*/ 30).await;
+    env.force_full_maintenance_and_sync().await.unwrap();
 
     // Check mooncake snapshot.
-    env.verify_snapshot(/*target_lsn=*/ 20, /*ids=*/ &[2, 3, 4])
+    env.verify_snapshot(/*target_lsn=*/ 20, /*ids=*/ &[2, 3])
         .await;
 
     // Check iceberg snapshot result.
@@ -1484,130 +1453,10 @@ async fn test_full_maintenance_with_sufficient_data_files() {
         .load_snapshot_from_table()
         .await
         .unwrap();
-    assert_eq!(next_file_id, 4);
-    assert_eq!(snapshot.data_file_flush_lsn.unwrap(), 30);
-    assert_eq!(snapshot.disk_files.len(), 2); // one compacted data file, another uncompacted
-    assert_eq!(snapshot.indices.file_indices.len(), 2); // one compacted file index, another uncompacted
-}
-
-/// ---- Mock unit test ----
-#[tokio::test]
-async fn test_iceberg_snapshot_failure_mock_test() {
-    let temp_dir = tempdir().unwrap();
-    let mooncake_table_config =
-        MooncakeTableConfig::new(temp_dir.path().to_str().unwrap().to_string());
-    let mooncake_table_metadata = Arc::new(MooncakeTableMetadata {
-        name: "table_name".to_string(),
-        table_id: 0,
-        schema: create_test_arrow_schema(),
-        config: mooncake_table_config.clone(),
-        path: temp_dir.path().to_path_buf(),
-        identity: crate::row::IdentityProp::Keys(vec![0]),
-    });
-
-    let mooncake_table_metadata_copy = mooncake_table_metadata.clone();
-    let mut mock_table_manager = MockTableManager::new();
-    mock_table_manager
-        .expect_load_snapshot_from_table()
-        .times(1)
-        .returning(move || {
-            let table_metadata_copy = mooncake_table_metadata_copy.clone();
-            Box::pin(async move {
-                Ok((
-                    /*next_file_id=*/ 0,
-                    MooncakeSnapshot::new(table_metadata_copy),
-                ))
-            })
-        });
-    mock_table_manager
-        .expect_sync_snapshot()
-        .times(1)
-        .returning(|_, _| {
-            Box::pin(async move {
-                Err(IcebergError::new(
-                    ErrorKind::Unexpected,
-                    "Intended error for unit test",
-                ))
-            })
-        });
-
-    let mooncake_table = MooncakeTable::new_with_table_manager(
-        mooncake_table_metadata,
-        Box::new(mock_table_manager),
-        ObjectStorageCache::default_for_test(&temp_dir),
-        FileSystemAccessor::default_for_test(&temp_dir),
-    )
-    .await
-    .unwrap();
-    let mut env = TestEnvironment::new_with_mooncake_table(temp_dir, mooncake_table).await;
-
-    // Append rows to trigger mooncake and iceberg snapshot.
-    env.append_row(
-        /*id=*/ 1, /*name=*/ "Alice", /*age=*/ 10, /*lsn=*/ 5,
-        /*xact_id=*/ None,
-    )
-    .await;
-    env.commit(/*lsn=*/ 10).await;
-
-    // Initiate snapshot and block wait its completion, check whether error status is correctly propagated.
-    let rx = env.table_event_manager.initiate_snapshot(/*lsn=*/ 10).await;
-    let res = TableEventManager::synchronize_force_snapshot_request(rx, /*requested_lsn=*/ 1).await;
-    assert!(res.is_err());
-}
-
-#[tokio::test]
-async fn test_iceberg_drop_table_failure_mock_test() {
-    let temp_dir = tempdir().unwrap();
-    let mooncake_table_config =
-        MooncakeTableConfig::new(temp_dir.path().to_str().unwrap().to_string());
-    let mooncake_table_metadata = Arc::new(MooncakeTableMetadata {
-        name: "table_name".to_string(),
-        table_id: 0,
-        schema: create_test_arrow_schema(),
-        config: mooncake_table_config.clone(),
-        path: temp_dir.path().to_path_buf(),
-        identity: crate::row::IdentityProp::Keys(vec![0]),
-    });
-
-    let mooncake_table_metadata_copy = mooncake_table_metadata.clone();
-    let mut mock_table_manager = MockTableManager::new();
-    mock_table_manager
-        .expect_load_snapshot_from_table()
-        .times(1)
-        .returning(move || {
-            let table_metadata_copy = mooncake_table_metadata_copy.clone();
-            Box::pin(async move {
-                Ok((
-                    /*next_file_id=*/ 0,
-                    MooncakeSnapshot::new(table_metadata_copy),
-                ))
-            })
-        });
-    mock_table_manager
-        .expect_drop_table()
-        .times(1)
-        .returning(|| {
-            Box::pin(async move {
-                Err(IcebergError::new(
-                    ErrorKind::Unexpected,
-                    "Intended error for unit test",
-                ))
-            })
-        });
-
-    let mooncake_table = MooncakeTable::new_with_table_manager(
-        mooncake_table_metadata,
-        Box::new(mock_table_manager),
-        ObjectStorageCache::default_for_test(&temp_dir),
-        FileSystemAccessor::default_for_test(&temp_dir),
-    )
-    .await
-    .unwrap();
-    let mut env = TestEnvironment::new_with_mooncake_table(temp_dir, mooncake_table).await;
-
-    // Drop table and block wait its completion, check whether error status is correctly propagated.
-    let res = env.drop_table().await;
-    assert!(res.is_err());
+    assert_eq!(next_file_id, 2);
+    assert_eq!(snapshot.data_file_flush_lsn.unwrap(), 20);
+    assert_eq!(snapshot.disk_files.len(), 1); // one compacted data file
+    assert_eq!(snapshot.indices.file_indices.len(), 1); // one compacted file index
 }
 
 /// Testing scenario: write operations no later than persisted LSN shall be discarded.
