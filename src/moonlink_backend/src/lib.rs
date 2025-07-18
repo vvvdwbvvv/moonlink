@@ -7,6 +7,7 @@ mod recovery_utils;
 pub use error::{Error, Result};
 use mooncake_table_id::MooncakeTableId;
 pub use moonlink::ReadState;
+use moonlink::TableEventManager;
 use moonlink_connectors::ReplicationManager;
 use moonlink_metadata_store::base_metadata_store::MetadataStoreTrait;
 use moonlink_metadata_store::SqliteMetadataStore;
@@ -64,7 +65,7 @@ where
 
     /// Create an iceberg snapshot with the given LSN, return when the a snapshot is successfully created.
     pub async fn create_snapshot(&self, database_id: D, table_id: T, lsn: u64) -> Result<()> {
-        let mut rx = {
+        let rx = {
             let mut manager = self.replication_manager.write().await;
             let mooncake_table_id = MooncakeTableId {
                 database_id,
@@ -73,7 +74,7 @@ where
             let writer = manager.get_table_event_manager(&mooncake_table_id);
             writer.initiate_snapshot(lsn).await
         };
-        rx.recv().await.unwrap()?;
+        TableEventManager::synchronize_force_snapshot_request(rx, lsn).await?;
         Ok(())
     }
 

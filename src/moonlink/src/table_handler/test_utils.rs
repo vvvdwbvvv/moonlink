@@ -46,6 +46,7 @@ pub struct TestEnvironment {
     replication_tx: watch::Sender<u64>,
     last_commit_tx: watch::Sender<u64>,
     snapshot_lsn_tx: watch::Sender<u64>,
+    pub(crate) force_snapshot_completion_rx: watch::Receiver<Option<Result<u64>>>,
     pub(crate) table_event_manager: TableEventManager,
     pub(crate) temp_dir: TempDir,
     pub(crate) object_storage_cache: ObjectStorageCache,
@@ -83,6 +84,9 @@ impl TestEnvironment {
             last_commit_rx,
         )));
         let (table_event_sync_sender, table_event_sync_receiver) = create_table_event_syncer();
+        let force_snapshot_completion_rx = table_event_sync_receiver
+            .force_snapshot_completion_rx
+            .clone();
 
         let handler = TableHandler::new(
             mooncake_table,
@@ -103,6 +107,7 @@ impl TestEnvironment {
             replication_tx,
             last_commit_tx,
             snapshot_lsn_tx,
+            force_snapshot_completion_rx,
             table_event_manager,
             temp_dir,
             object_storage_cache,
@@ -227,15 +232,16 @@ impl TestEnvironment {
         rx.recv().await.unwrap().unwrap();
     }
 
-    pub async fn flush_table_and_sync(&self, lsn: u64) {
+    pub async fn flush_table_and_sync(&mut self, lsn: u64) {
         self.send_event(TableEvent::Flush { lsn }).await;
-        let (tx, mut rx) = mpsc::channel(1);
-        self.send_event(TableEvent::ForceSnapshot {
-            lsn: Some(lsn),
-            tx: Some(tx),
-        })
-        .await;
-        rx.recv().await.unwrap().unwrap();
+        self.send_event(TableEvent::ForceSnapshot { lsn: Some(lsn) })
+            .await;
+        TableEventManager::synchronize_force_snapshot_request(
+            self.force_snapshot_completion_rx.clone(),
+            lsn,
+        )
+        .await
+        .unwrap();
     }
 
     pub async fn flush_table(&self, lsn: u64) {
@@ -329,8 +335,8 @@ pub async fn check_read_snapshot(
     .await;
 }
 
-/// Test util function to load all arrow batch from the given local parquet file.
-pub(crate) async fn load_arrow_batch(filepath: &str) -> RecordBatch {
+/// Test util function to load one arrow batch from the given local parquet file.
+pub(crate) async fn load_one_arrow_batch(filepath: &str) -> RecordBatch {
     let file_io = FileIOBuilder::new_fs_io().build().unwrap();
     let input_file = file_io.new_input(filepath).unwrap();
     let input_file_metadata = input_file.metadata().await.unwrap();

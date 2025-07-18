@@ -2,7 +2,7 @@ use arrow_array::{Int32Array, RecordBatch, StringArray};
 use iceberg::{Error as IcebergError, ErrorKind};
 use tempfile::tempdir;
 use tokio::sync::broadcast;
-use tokio::sync::mpsc;
+use tokio::sync::watch;
 
 use super::test_utils::*;
 use super::TableEvent;
@@ -22,6 +22,7 @@ use crate::storage::PersistenceResult;
 use crate::storage::TableManager;
 use crate::table_handler::TableHandlerState;
 use crate::ObjectStorageCache;
+use crate::TableEventManager;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -599,8 +600,10 @@ async fn test_iceberg_snapshot_creation_for_batch_write() {
     env.commit(/*lsn=*/ 1).await;
 
     // Attempt an iceberg snapshot, with requested LSN already committed.
-    let mut rx = env.table_event_manager.initiate_snapshot(/*lsn=*/ 1).await;
-    rx.recv().await.unwrap().unwrap();
+    let rx = env.table_event_manager.initiate_snapshot(/*lsn=*/ 1).await;
+    TableEventManager::synchronize_force_snapshot_request(rx, /*requested_lsn=*/ 1)
+        .await
+        .unwrap();
 
     // Load from iceberg table manager to check snapshot status.
     let mut iceberg_table_manager = env.create_iceberg_table_manager(mooncake_table_config.clone());
@@ -612,7 +615,7 @@ async fn test_iceberg_snapshot_creation_for_batch_write() {
     assert_eq!(snapshot.disk_files.len(), 1);
     let (cur_data_file, cur_deletion_vector) = snapshot.disk_files.into_iter().next().unwrap();
     // Check data file.
-    let actual_arrow_batch = load_arrow_batch(cur_data_file.file_path()).await;
+    let actual_arrow_batch = load_one_arrow_batch(cur_data_file.file_path()).await;
     let expected_arrow_batch = arrow_batch_1.clone();
     assert_eq!(actual_arrow_batch, expected_arrow_batch);
     // Check deletion vector.
@@ -627,7 +630,7 @@ async fn test_iceberg_snapshot_creation_for_batch_write() {
     // ---- Create snapshot after new records appended and old records deleted ----
     //
     // Attempt an iceberg snapshot, which is a future flush LSN, and contains both new records and deletion records.
-    let mut rx = env.table_event_manager.initiate_snapshot(/*lsn=*/ 5).await;
+    let rx = env.table_event_manager.initiate_snapshot(/*lsn=*/ 5).await;
     env.append_row(
         /*id=*/ 2, /*name=*/ "Bob", /*age=*/ 20, /*lsn=*/ 2,
         /*xact_id=*/ None,
@@ -642,7 +645,9 @@ async fn test_iceberg_snapshot_creation_for_batch_write() {
     env.commit(/*lsn=*/ 5).await;
 
     // Block wait until iceberg snapshot created.
-    rx.recv().await.unwrap().unwrap();
+    TableEventManager::synchronize_force_snapshot_request(rx, /*requested_lsn=*/ 5)
+        .await
+        .unwrap();
 
     // Load from iceberg table manager to check snapshot status.
     let mut iceberg_table_manager = env.create_iceberg_table_manager(mooncake_table_config.clone());
@@ -655,7 +660,7 @@ async fn test_iceberg_snapshot_creation_for_batch_write() {
     for (cur_data_file, cur_deletion_vector) in snapshot.disk_files.into_iter() {
         // Check the first data file.
         if cur_data_file.file_path() == old_data_file.file_path() {
-            let actual_arrow_batch = load_arrow_batch(cur_data_file.file_path()).await;
+            let actual_arrow_batch = load_one_arrow_batch(cur_data_file.file_path()).await;
             let expected_arrow_batch = arrow_batch_1.clone();
             assert_eq!(actual_arrow_batch, expected_arrow_batch);
             // Check the first deletion vector.
@@ -670,7 +675,7 @@ async fn test_iceberg_snapshot_creation_for_batch_write() {
         }
 
         // Check the second data file.
-        let actual_arrow_batch = load_arrow_batch(cur_data_file.file_path()).await;
+        let actual_arrow_batch = load_one_arrow_batch(cur_data_file.file_path()).await;
         let expected_arrow_batch = arrow_batch_2.clone();
         assert_eq!(actual_arrow_batch, expected_arrow_batch);
         // Check the second deletion vector.
@@ -685,7 +690,7 @@ async fn test_iceberg_snapshot_creation_for_batch_write() {
     }
 
     // ---- Create snapshot only with old records deleted ----
-    let mut rx = env.table_event_manager.initiate_snapshot(/*lsn=*/ 7).await;
+    let rx = env.table_event_manager.initiate_snapshot(/*lsn=*/ 7).await;
     env.delete_row(
         /*id=*/ 2, /*name=*/ "Bob", /*age=*/ 20, /*lsn=*/ 6,
         /*xact_id=*/ None,
@@ -694,7 +699,9 @@ async fn test_iceberg_snapshot_creation_for_batch_write() {
     env.commit(/*lsn=*/ 7).await;
 
     // Block wait until iceberg snapshot created.
-    rx.recv().await.unwrap().unwrap();
+    TableEventManager::synchronize_force_snapshot_request(rx, /*requested_lsn=*/ 7)
+        .await
+        .unwrap();
 
     // Load from iceberg table manager to check snapshot status.
     let mut iceberg_table_manager = env.create_iceberg_table_manager(mooncake_table_config.clone());
@@ -707,7 +714,7 @@ async fn test_iceberg_snapshot_creation_for_batch_write() {
     for (cur_data_file, cur_deletion_vector) in snapshot.disk_files.into_iter() {
         // Check the first data file.
         if cur_data_file.file_path() == old_data_file.file_path() {
-            let actual_arrow_batch = load_arrow_batch(cur_data_file.file_path()).await;
+            let actual_arrow_batch = load_one_arrow_batch(cur_data_file.file_path()).await;
             let expected_arrow_batch = arrow_batch_1.clone();
             assert_eq!(actual_arrow_batch, expected_arrow_batch);
             // Check the first deletion vector.
@@ -722,7 +729,7 @@ async fn test_iceberg_snapshot_creation_for_batch_write() {
         }
 
         // Check the second data file.
-        let actual_arrow_batch = load_arrow_batch(cur_data_file.file_path()).await;
+        let actual_arrow_batch = load_one_arrow_batch(cur_data_file.file_path()).await;
         let expected_arrow_batch = arrow_batch_2.clone();
         assert_eq!(actual_arrow_batch, expected_arrow_batch);
         // Check the second deletion vector.
@@ -737,8 +744,10 @@ async fn test_iceberg_snapshot_creation_for_batch_write() {
     }
 
     // Requested LSN is no later than current iceberg snapshot LSN.
-    let mut rx = env.table_event_manager.initiate_snapshot(/*lsn=*/ 1).await;
-    rx.recv().await.unwrap().unwrap();
+    let rx = env.table_event_manager.initiate_snapshot(/*lsn=*/ 1).await;
+    TableEventManager::synchronize_force_snapshot_request(rx, /*requested_lsn=*/ 1)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -793,8 +802,10 @@ async fn test_iceberg_snapshot_creation_for_streaming_write() {
     env.stream_commit(/*lsn=*/ 1, /*xact_id=*/ 0).await;
 
     // Attempt an iceberg snapshot, with requested LSN already committed.
-    let mut rx = env.table_event_manager.initiate_snapshot(/*lsn=*/ 1).await;
-    rx.recv().await.unwrap().unwrap();
+    let rx = env.table_event_manager.initiate_snapshot(/*lsn=*/ 1).await;
+    TableEventManager::synchronize_force_snapshot_request(rx, /*requested_lsn=*/ 1)
+        .await
+        .unwrap();
 
     // Load from iceberg table manager to check snapshot status.
     let mut iceberg_table_manager = env.create_iceberg_table_manager(mooncake_table_config.clone());
@@ -806,7 +817,7 @@ async fn test_iceberg_snapshot_creation_for_streaming_write() {
     assert_eq!(snapshot.disk_files.len(), 1);
     let (cur_data_file, cur_deletion_vector) = snapshot.disk_files.into_iter().next().unwrap();
     // Check data file.
-    let actual_arrow_batch = load_arrow_batch(cur_data_file.file_path()).await;
+    let actual_arrow_batch = load_one_arrow_batch(cur_data_file.file_path()).await;
     let expected_arrow_batch = arrow_batch_1.clone();
     assert_eq!(actual_arrow_batch, expected_arrow_batch);
     // Check deletion vector.
@@ -821,7 +832,7 @@ async fn test_iceberg_snapshot_creation_for_streaming_write() {
     // ---- Create snapshot after new records appended and old records deleted ----
     //
     // Attempt an iceberg snapshot, which is a future flush LSN, and contains both new records and deletion records.
-    let mut rx = env.table_event_manager.initiate_snapshot(/*lsn=*/ 5).await;
+    let rx = env.table_event_manager.initiate_snapshot(/*lsn=*/ 5).await;
     env.append_row(
         /*id=*/ 2,
         /*name=*/ "Bob",
@@ -842,7 +853,9 @@ async fn test_iceberg_snapshot_creation_for_streaming_write() {
     env.stream_commit(/*lsn=*/ 5, /*xact_id=*/ 4).await;
 
     // Block wait until iceberg snapshot created.
-    rx.recv().await.unwrap().unwrap();
+    TableEventManager::synchronize_force_snapshot_request(rx, /*requested_lsn=*/ 5)
+        .await
+        .unwrap();
 
     // Load from iceberg table manager to check snapshot status.
     let mut iceberg_table_manager = env.create_iceberg_table_manager(mooncake_table_config.clone());
@@ -855,7 +868,7 @@ async fn test_iceberg_snapshot_creation_for_streaming_write() {
     for (cur_data_file, cur_deletion_vector) in snapshot.disk_files.into_iter() {
         // Check the first data file.
         if cur_data_file.file_path() == old_data_file.file_path() {
-            let actual_arrow_batch = load_arrow_batch(cur_data_file.file_path()).await;
+            let actual_arrow_batch = load_one_arrow_batch(cur_data_file.file_path()).await;
             let expected_arrow_batch = arrow_batch_1.clone();
             assert_eq!(actual_arrow_batch, expected_arrow_batch);
             // Check the first deletion vector.
@@ -870,7 +883,7 @@ async fn test_iceberg_snapshot_creation_for_streaming_write() {
         }
 
         // Check the second data file.
-        let actual_arrow_batch = load_arrow_batch(cur_data_file.file_path()).await;
+        let actual_arrow_batch = load_one_arrow_batch(cur_data_file.file_path()).await;
         let expected_arrow_batch = arrow_batch_2.clone();
         assert_eq!(actual_arrow_batch, expected_arrow_batch);
         // Check the second deletion vector.
@@ -885,7 +898,7 @@ async fn test_iceberg_snapshot_creation_for_streaming_write() {
     }
 
     // ---- Create snapshot only with old records deleted ----
-    let mut rx = env.table_event_manager.initiate_snapshot(/*lsn=*/ 7).await;
+    let rx = env.table_event_manager.initiate_snapshot(/*lsn=*/ 7).await;
     env.delete_row(
         /*id=*/ 2,
         /*name=*/ "Bob",
@@ -897,7 +910,9 @@ async fn test_iceberg_snapshot_creation_for_streaming_write() {
     env.stream_commit(/*lsn=*/ 7, /*xact_id*/ 5).await;
 
     // Block wait until iceberg snapshot created.
-    rx.recv().await.unwrap().unwrap();
+    TableEventManager::synchronize_force_snapshot_request(rx, /*requested_lsn=*/ 7)
+        .await
+        .unwrap();
 
     // Load from iceberg table manager to check snapshot status.
     let mut iceberg_table_manager = env.create_iceberg_table_manager(mooncake_table_config.clone());
@@ -910,7 +925,7 @@ async fn test_iceberg_snapshot_creation_for_streaming_write() {
     for (cur_data_file, cur_deletion_vector) in snapshot.disk_files.into_iter() {
         // Check the first data file.
         if cur_data_file.file_path() == old_data_file.file_path() {
-            let actual_arrow_batch = load_arrow_batch(cur_data_file.file_path()).await;
+            let actual_arrow_batch = load_one_arrow_batch(cur_data_file.file_path()).await;
             let expected_arrow_batch = arrow_batch_1.clone();
             assert_eq!(actual_arrow_batch, expected_arrow_batch);
             // Check the first deletion vector.
@@ -925,7 +940,7 @@ async fn test_iceberg_snapshot_creation_for_streaming_write() {
         }
 
         // Check the second data file.
-        let actual_arrow_batch = load_arrow_batch(cur_data_file.file_path()).await;
+        let actual_arrow_batch = load_one_arrow_batch(cur_data_file.file_path()).await;
         let expected_arrow_batch = arrow_batch_2.clone();
         assert_eq!(actual_arrow_batch, expected_arrow_batch);
         // Check the second deletion vector.
@@ -940,8 +955,10 @@ async fn test_iceberg_snapshot_creation_for_streaming_write() {
     }
 
     // Requested LSN is no later than current iceberg snapshot LSN.
-    let mut rx = env.table_event_manager.initiate_snapshot(/*lsn=*/ 1).await;
-    rx.recv().await.unwrap().unwrap();
+    let rx = env.table_event_manager.initiate_snapshot(/*lsn=*/ 1).await;
+    TableEventManager::synchronize_force_snapshot_request(rx, /*requested_lsn=*/ 1)
+        .await
+        .unwrap();
 }
 
 /// Testing scenario: iceberg snapshot request shouldn't block, even if there's no write operations to the table.
@@ -955,8 +972,10 @@ async fn test_empty_table_snapshot_creation() {
         let rx = env.table_event_manager.initiate_snapshot(/*lsn=*/ 0).await;
         rx_vec.push(rx);
     }
-    for mut cur_rx in rx_vec {
-        cur_rx.recv().await.unwrap().unwrap();
+    for cur_rx in rx_vec {
+        TableEventManager::synchronize_force_snapshot_request(cur_rx, /*requested_lsn=*/ 0)
+            .await
+            .unwrap();
     }
 }
 
@@ -1013,8 +1032,10 @@ async fn test_multiple_snapshot_requests() {
     rx_vec.push(env.table_event_manager.initiate_snapshot(/*lsn=*/ 2).await);
     // A LSN already satisfied.
     rx_vec.push(env.table_event_manager.initiate_snapshot(/*lsn=*/ 0).await);
+    // Record the largest requested LSN.
+    let largest_requested_lsn = 2;
 
-    // Append a new row to the mooncake table.
+    // Append a new row to the mooncake table, won't trigger a force snapshot.
     env.append_row(
         /*id=*/ 1, /*name=*/ "John", /*age=*/ 30, /*lsn=*/ 0,
         /*xact_id=*/ None,
@@ -1022,7 +1043,7 @@ async fn test_multiple_snapshot_requests() {
     .await;
     env.commit(/*lsn=*/ 1).await;
 
-    // Append a new row to the mooncake table.
+    // Append a new row to the mooncake table, will trigger a force snapshot.
     env.append_row(
         /*id=*/ 2, /*name=*/ "Bob", /*age=*/ 20, /*lsn=*/ 2,
         /*xact_id=*/ None,
@@ -1030,8 +1051,11 @@ async fn test_multiple_snapshot_requests() {
     .await;
     env.commit(/*lsn=*/ 3).await;
 
-    for mut rx in rx_vec.into_iter() {
-        rx.recv().await.unwrap().unwrap();
+    for rx in rx_vec.into_iter() {
+        // For all receive handlers, it should receive at least once a persisted table LSN which is >= the largest requested LSN.
+        TableEventManager::synchronize_force_snapshot_request(rx, largest_requested_lsn)
+            .await
+            .unwrap();
     }
 
     // Check iceberg snapshot content.
@@ -1040,28 +1064,28 @@ async fn test_multiple_snapshot_requests() {
         .load_snapshot_from_table()
         .await
         .unwrap();
-    assert_eq!(next_file_id, 4); // two data files, two index block files
-    assert_eq!(snapshot.disk_files.len(), 2);
+    assert_eq!(next_file_id, 2); // one data file, one index block file
+    assert_eq!(snapshot.disk_files.len(), 1);
+    let (cur_data_file, cur_deletion_vector) = snapshot.disk_files.into_iter().next().unwrap();
 
-    let mut visited = [false, false]; // Check both row flushed.
-    for (cur_data_file, cur_deletion_vector) in snapshot.disk_files.into_iter() {
-        // Check the data file.
-        let actual_arrow_batch = load_arrow_batch(cur_data_file.file_path()).await;
-        if actual_arrow_batch == arrow_batch_1 {
-            visited[0] = true;
-        }
-        if actual_arrow_batch == arrow_batch_2 {
-            visited[1] = true;
-        }
+    // Check the data file.
+    let actual_arrow_batch = load_one_arrow_batch(cur_data_file.file_path()).await;
+    assert_eq!(actual_arrow_batch.num_rows(), 2);
+    assert_eq!(
+        actual_arrow_batch.slice(/*offset=*/ 0, /*length=*/ 1),
+        arrow_batch_1
+    );
+    assert_eq!(
+        actual_arrow_batch.slice(/*offset=*/ 1, /*length=*/ 1),
+        arrow_batch_2
+    );
 
-        // Check the deletion vector.
-        assert!(cur_deletion_vector
-            .batch_deletion_vector
-            .collect_deleted_rows()
-            .is_empty(),);
-        check_deletion_vector_consistency(&cur_deletion_vector).await;
-    }
-    assert_eq!(visited, [true, true]);
+    // Check the deletion vector.
+    assert!(cur_deletion_vector
+        .batch_deletion_vector
+        .collect_deleted_rows()
+        .is_empty(),);
+    check_deletion_vector_consistency(&cur_deletion_vector).await;
 }
 
 /// Test that flush_lsn correctly reflects LSN ordering for batch operations
@@ -1081,8 +1105,10 @@ async fn test_flush_lsn_ordering() {
     env.commit(10).await;
 
     // Request iceberg snapshot at LSN 10
-    let mut rx = env.table_event_manager.initiate_snapshot(10).await;
-    rx.recv().await.unwrap().unwrap();
+    let rx = env.table_event_manager.initiate_snapshot(10).await;
+    TableEventManager::synchronize_force_snapshot_request(rx, /*requested_lsn=*/ 10)
+        .await
+        .unwrap();
 
     // Verify that flush_lsn was updated to 10
     flush_lsn_rx.changed().await.unwrap();
@@ -1093,8 +1119,10 @@ async fn test_flush_lsn_ordering() {
     env.commit(20).await;
 
     // Request iceberg snapshot at LSN 20
-    let mut rx = env.table_event_manager.initiate_snapshot(20).await;
-    rx.recv().await.unwrap().unwrap();
+    let rx = env.table_event_manager.initiate_snapshot(20).await;
+    TableEventManager::synchronize_force_snapshot_request(rx, /*requested_lsn=*/ 20)
+        .await
+        .unwrap();
 
     // Flush LSN should now be 20
     flush_lsn_rx.changed().await.unwrap();
@@ -1123,8 +1151,10 @@ async fn test_flush_lsn_out_of_order_lsn_operations() {
     env.commit(40).await;
 
     // Request snapshot at LSN 40 (should include all committed data)
-    let mut rx = env.table_event_manager.initiate_snapshot(40).await;
-    rx.recv().await.unwrap().unwrap();
+    let rx = env.table_event_manager.initiate_snapshot(40).await;
+    TableEventManager::synchronize_force_snapshot_request(rx, /*requested_lsn=*/ 40)
+        .await
+        .unwrap();
 
     // Verify flush_lsn reflects the snapshot LSN
     flush_lsn_rx.changed().await.unwrap();
@@ -1161,8 +1191,10 @@ async fn test_flush_lsn_consistency_across_snapshots() {
         env.commit(lsn).await;
 
         // Create snapshot
-        let mut rx = env.table_event_manager.initiate_snapshot(lsn).await;
-        rx.recv().await.unwrap().unwrap();
+        let rx = env.table_event_manager.initiate_snapshot(lsn).await;
+        TableEventManager::synchronize_force_snapshot_request(rx, /*requested_lsn=*/ lsn)
+            .await
+            .unwrap();
 
         // Verify flush_lsn matches expected LSN
         flush_lsn_rx.changed().await.unwrap();
@@ -1248,15 +1280,16 @@ async fn test_periodical_force_snapshot_with_empty_table() {
     let sender = env.handler.get_event_sender();
 
     // Mimic force snapshot.
-    let (tx, mut rx) = mpsc::channel(1);
     sender
-        .send(TableEvent::ForceSnapshot {
-            lsn: None,
-            tx: Some(tx),
-        })
+        .send(TableEvent::ForceSnapshot { lsn: None })
         .await
         .unwrap();
-    rx.recv().await.unwrap().unwrap();
+    TableEventManager::synchronize_force_snapshot_request(
+        env.force_snapshot_completion_rx.clone(),
+        /*requested_lsn=*/ 0,
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -1270,15 +1303,16 @@ async fn test_periodical_force_snapshot() {
     env.commit(10).await;
 
     // Mimic force snapshot.
-    let (tx, mut rx) = mpsc::channel(1);
     sender
-        .send(TableEvent::ForceSnapshot {
-            lsn: None,
-            tx: Some(tx),
-        })
+        .send(TableEvent::ForceSnapshot { lsn: None })
         .await
         .unwrap();
-    rx.recv().await.unwrap().unwrap();
+    TableEventManager::synchronize_force_snapshot_request(
+        env.force_snapshot_completion_rx.clone(),
+        /*requested_lsn=*/ 0,
+    )
+    .await
+    .unwrap();
 
     // Check iceberg snapshot result.
     let mut iceberg_table_manager =
@@ -1516,8 +1550,8 @@ async fn test_iceberg_snapshot_failure_mock_test() {
     env.commit(/*lsn=*/ 10).await;
 
     // Initiate snapshot and block wait its completion, check whether error status is correctly propagated.
-    let mut rx = env.table_event_manager.initiate_snapshot(/*lsn=*/ 10).await;
-    let res = rx.recv().await.unwrap();
+    let rx = env.table_event_manager.initiate_snapshot(/*lsn=*/ 10).await;
+    let res = TableEventManager::synchronize_force_snapshot_request(rx, /*requested_lsn=*/ 1).await;
     assert!(res.is_err());
 }
 
@@ -1672,99 +1706,13 @@ async fn test_discard_duplicate_writes() {
 }
 
 /// ---- Util functions unit test ----
-///
-/// Invariants:
-/// - replication lsn >= table consistent view lsn, if assigned
-/// - replication lsn >= iceberg snapshot lsn, if assigned
-#[test]
-fn test_is_iceberg_snapshot_satisfy_force_snapshot() {
-    let (table_maintenance_completion_tx, _) = broadcast::channel(64usize);
-    let mut table_handler_state = TableHandlerState::new(
-        table_maintenance_completion_tx,
-        /*initial_persistence_lsn=*/ None,
-    );
-
-    // Case-1: iceberg snapshot already satisfies requested lsn.
-    {
-        let requested_lsn = 0;
-        let iceberg_snapshot_lsn = Some(1);
-        let replication_lsn = 1;
-        table_handler_state.table_consistent_view_lsn = Some(1);
-        assert!(
-            table_handler_state.is_iceberg_snapshot_satisfy_force_snapshot(
-                requested_lsn,
-                iceberg_snapshot_lsn,
-                replication_lsn,
-            )
-        );
-    }
-
-    // Case-2: iceberg snapshot doesn't satisfied requested, and table not consistent.
-    {
-        let requested_lsn = 2;
-        let iceberg_snapshot_lsn = Some(1);
-        let replication_lsn = 1;
-        table_handler_state.table_consistent_view_lsn = None;
-        assert!(
-            !table_handler_state.is_iceberg_snapshot_satisfy_force_snapshot(
-                requested_lsn,
-                iceberg_snapshot_lsn,
-                replication_lsn,
-            )
-        );
-    }
-
-    // Case-3: iceberg snapshot doesn't satisfied requested, table at consistent state, and replication satisifies requested.
-    {
-        let requested_lsn = 2;
-        let iceberg_snapshot_lsn = Some(1);
-        let replication_lsn = 2;
-        table_handler_state.table_consistent_view_lsn = Some(1);
-        assert!(
-            table_handler_state.is_iceberg_snapshot_satisfy_force_snapshot(
-                requested_lsn,
-                iceberg_snapshot_lsn,
-                replication_lsn,
-            )
-        );
-    }
-
-    // Case-4: iceberg snapshot doesn't satisfied requested, table at consistent state, and replication doesn't satisify requested.
-    {
-        let requested_lsn = 3;
-        let iceberg_snapshot_lsn = Some(1);
-        let replication_lsn = 2;
-        table_handler_state.table_consistent_view_lsn = Some(1);
-        assert!(
-            !table_handler_state.is_iceberg_snapshot_satisfy_force_snapshot(
-                requested_lsn,
-                iceberg_snapshot_lsn,
-                replication_lsn,
-            )
-        );
-    }
-
-    // Case-5: iceberg snapshot doesn't satisfied requested, and iceberg / mooncake LSN doesn't match.
-    {
-        let requested_lsn = 2;
-        let iceberg_snapshot_lsn = Some(1);
-        let replication_lsn = 1;
-        table_handler_state.table_consistent_view_lsn = Some(2);
-        assert!(
-            !table_handler_state.is_iceberg_snapshot_satisfy_force_snapshot(
-                requested_lsn,
-                iceberg_snapshot_lsn,
-                replication_lsn,
-            )
-        );
-    }
-}
-
 #[test]
 fn test_get_persisted_table_lsn() {
     let (table_maintenance_completion_tx, _) = broadcast::channel(64usize);
+    let (force_snapshot_completion_tx, _) = watch::channel(None);
     let mut table_handler_state = TableHandlerState::new(
         table_maintenance_completion_tx,
+        force_snapshot_completion_tx,
         /*initial_persistence_lsn=*/ None,
     );
 
