@@ -3,8 +3,6 @@ use async_trait::async_trait;
 #[cfg(feature = "storage-gcs")]
 use futures::TryStreamExt;
 use futures::{Stream, StreamExt};
-use opendal::layers::RetryLayer;
-use opendal::services;
 use opendal::Operator;
 #[cfg(test)]
 use tempfile::TempDir;
@@ -15,8 +13,10 @@ use tokio::sync::mpsc;
 use tokio::sync::OnceCell;
 
 use crate::storage::filesystem::accessor::base_filesystem_accessor::BaseFileSystemAccess;
-use crate::storage::filesystem::accessor::configs::*;
+use crate::storage::filesystem::accessor::base_unbuffered_stream_writer::BaseUnbufferedStreamWriter;
 use crate::storage::filesystem::accessor::metadata::ObjectMetadata;
+use crate::storage::filesystem::accessor::operator_utils;
+use crate::storage::filesystem::accessor::unbuffered_stream_writer::UnbufferedStreamWriter;
 use crate::storage::filesystem::filesystem_config::FileSystemConfig;
 use crate::Result;
 
@@ -62,76 +62,8 @@ impl FileSystemAccessor {
 
     /// Get IO operator from the catalog.
     async fn get_operator(&self) -> Result<&Operator> {
-        let retry_layer = RetryLayer::new()
-            .with_max_times(MAX_RETRY_COUNT)
-            .with_jitter()
-            .with_factor(RETRY_DELAY_FACTOR)
-            .with_min_delay(MIN_RETRY_DELAY)
-            .with_max_delay(MAX_RETRY_DELAY);
-
         self.operator
-            .get_or_try_init(|| async {
-                match &self.config {
-                    #[cfg(feature = "storage-fs")]
-                    FileSystemConfig::FileSystem { root_directory } => {
-                        let builder = services::Fs::default().root(root_directory);
-                        let op = Operator::new(builder)?.layer(retry_layer).finish();
-                        Ok(op)
-                    }
-                    #[cfg(feature = "storage-gcs")]
-                    FileSystemConfig::Gcs {
-                        region,
-                        bucket,
-                        endpoint,
-                        access_key_id,
-                        secret_access_key,
-                        disable_auth,
-                        ..
-                    } => {
-                        // Test environment.
-                        if *disable_auth {
-                            let builder = services::Gcs::default()
-                                .root("/")
-                                .bucket(bucket)
-                                .endpoint(endpoint.as_ref().unwrap())
-                                .disable_config_load()
-                                .disable_vm_metadata()
-                                .allow_anonymous();
-                            let op = Operator::new(builder)?.layer(retry_layer).finish();
-                            return Ok(op);
-                        }
-
-                        let builder = services::S3::default()
-                            .root("/")
-                            .region(region)
-                            .bucket(bucket)
-                            .endpoint("https://storage.googleapis.com")
-                            .access_key_id(access_key_id)
-                            .secret_access_key(secret_access_key);
-                        let op = Operator::new(builder)?.layer(retry_layer).finish();
-                        Ok(op)
-                    }
-                    #[cfg(feature = "storage-s3")]
-                    FileSystemConfig::S3 {
-                        access_key_id,
-                        secret_access_key,
-                        region,
-                        bucket,
-                        endpoint,
-                    } => {
-                        let mut builder = services::S3::default()
-                            .bucket(bucket)
-                            .region(region)
-                            .access_key_id(access_key_id)
-                            .secret_access_key(secret_access_key);
-                        if let Some(endpoint) = endpoint {
-                            builder = builder.endpoint(endpoint);
-                        }
-                        let op = Operator::new(builder)?.layer(retry_layer).finish();
-                        Ok(op)
-                    }
-                }
-            })
+            .get_or_try_init(|| async { operator_utils::create_opendal_operator(&self.config) })
             .await
     }
 
@@ -330,6 +262,18 @@ impl BaseFileSystemAccess for FileSystemAccessor {
         Ok(())
     }
 
+    async fn create_unbuffered_stream_writer(
+        &self,
+        object_filepath: &str,
+    ) -> Result<Box<dyn BaseUnbufferedStreamWriter>> {
+        let sanitized_object = self.sanitize_path(object_filepath);
+        let operator = self.get_operator().await?;
+        Ok(Box::new(UnbufferedStreamWriter::new(
+            operator.clone(),
+            sanitized_object.to_string(),
+        )?))
+    }
+
     async fn delete_object(&self, object: &str) -> Result<()> {
         let sanitized_object = self.sanitize_path(object);
         let operator = self.get_operator().await?;
@@ -451,7 +395,9 @@ impl BaseFileSystemAccess for FileSystemAccessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::filesystem::accessor::test_utils::*;
+    use crate::storage::filesystem::{
+        accessor::test_utils::*, test_utils::writer_test_utils::test_unbuffered_stream_writer_impl,
+    };
     use rstest::rstest;
 
     #[tokio::test]
@@ -549,5 +495,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(actual_content, expected_content);
+    }
+
+    #[tokio::test]
+    async fn test_unbuffered_stream_write() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root_directory = temp_dir.path().to_str().unwrap().to_string();
+        let filesystem_config = FileSystemConfig::FileSystem {
+            root_directory: root_directory.clone(),
+        };
+        let filesystem_accessor = FileSystemAccessor::new(filesystem_config.clone());
+
+        let dst_filename = "dst".to_string();
+        let dst_filepath = format!("{}/{}", &root_directory, dst_filename);
+        let writer = filesystem_accessor
+            .create_unbuffered_stream_writer(&dst_filepath)
+            .await
+            .unwrap();
+        test_unbuffered_stream_writer_impl(writer, dst_filename, filesystem_config).await;
     }
 }

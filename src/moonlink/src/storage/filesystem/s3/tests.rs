@@ -1,8 +1,11 @@
 use crate::storage::filesystem::accessor::base_filesystem_accessor::BaseFileSystemAccess;
 use crate::storage::filesystem::accessor::filesystem_accessor::FileSystemAccessor;
+use crate::storage::filesystem::accessor::operator_utils;
 use crate::storage::filesystem::accessor::test_utils::*;
+use crate::storage::filesystem::accessor::unbuffered_stream_writer::UnbufferedStreamWriter;
 use crate::storage::filesystem::s3::s3_test_utils::*;
 use crate::storage::filesystem::s3::test_guard::TestGuard;
+use crate::storage::filesystem::test_utils::writer_test_utils::*;
 
 use futures::StreamExt;
 use rstest::rstest;
@@ -98,4 +101,34 @@ async fn test_copy_from_remote_to_local(#[case] file_size: usize) {
     // Validate destination file content.
     let actual_content = tokio::fs::read_to_string(dst_filepath).await.unwrap();
     assert_eq!(actual_content, expected_content);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_unbuffered_stream_writer() {
+    let dst_filename = "dst".to_string();
+    let (bucket, warehouse_uri) = get_test_s3_bucket_and_warehouse();
+    let _test_guard = TestGuard::new(bucket.clone()).await;
+    let s3_filesystem_config = create_s3_filesystem_config(&warehouse_uri);
+    let operator = operator_utils::create_opendal_operator(&s3_filesystem_config).unwrap();
+
+    // Create writer and append in blocks.
+    let writer =
+        Box::new(UnbufferedStreamWriter::new(operator.clone(), dst_filename.clone()).unwrap());
+    test_unbuffered_stream_writer_impl(writer, dst_filename, s3_filesystem_config).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_unbuffered_stream_write_with_filesystem_accessor() {
+    let (bucket, warehouse_uri) = get_test_s3_bucket_and_warehouse();
+    let _test_guard = TestGuard::new(bucket.clone()).await;
+    let s3_filesystem_config = create_s3_filesystem_config(&warehouse_uri);
+    let filesystem_accessor = FileSystemAccessor::new(s3_filesystem_config.clone());
+
+    let dst_filename = "dst".to_string();
+    let dst_filepath = format!("{}/{}", &warehouse_uri, dst_filename);
+    let writer = filesystem_accessor
+        .create_unbuffered_stream_writer(&dst_filepath)
+        .await
+        .unwrap();
+    test_unbuffered_stream_writer_impl(writer, dst_filename, s3_filesystem_config).await;
 }
