@@ -984,6 +984,12 @@ impl SnapshotTableState {
             // Update flush LSN.
             self.current_snapshot.data_file_flush_lsn = Some(new_flush_lsn);
         }
+
+        // Assert and update WAL persisted LSN.
+        if let Some(wal_persistence_metadata) = task.new_wal_persistence_metadata {
+            self.current_snapshot.wal_persistence_metadata = Some(wal_persistence_metadata);
+        }
+
         if task.new_commit_lsn != 0 {
             self.current_snapshot.snapshot_version = task.new_commit_lsn;
         }
