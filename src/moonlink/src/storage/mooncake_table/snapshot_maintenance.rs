@@ -4,11 +4,37 @@ use std::collections::HashSet;
 use crate::storage::compaction::table_compaction::SingleFileToCompact;
 use crate::storage::mooncake_table::snapshot::SnapshotTableState;
 use crate::storage::mooncake_table::{
-    DataCompactionPayload, FileIndiceMergePayload, MaintenanceOption,
+    DataCompactionPayload, FileIndiceMergePayload, MaintenanceOption, SnapshotTask,
 };
-use crate::storage::storage_utils::{TableId, TableUniqueFileId};
+use crate::storage::storage_utils::{ProcessedDeletionRecord, TableId, TableUniqueFileId};
+
+/// Remap single record location after compaction.
+/// Return if remap succeeds.
+fn remap_record_location_after_compaction(
+    deletion_log: &mut ProcessedDeletionRecord,
+    task: &mut SnapshotTask,
+) -> bool {
+    if task.data_compaction_result.is_empty() {
+        return false;
+    }
+
+    let old_record_location = &deletion_log.pos;
+    let remapped_data_files_after_compaction = &mut task.data_compaction_result;
+    let new_record_location = remapped_data_files_after_compaction
+        .remapped_data_files
+        .remove(old_record_location);
+    if new_record_location.is_none() {
+        return false;
+    }
+    deletion_log.pos = new_record_location.unwrap().record_location;
+    true
+}
 
 impl SnapshotTableState {
+    /// ===============================
+    /// Get maintence payload
+    /// ===============================
+    ///
     /// Util function to decide whether and what to compact data files.
     /// To simplify states (aka, avoid data compaction already in iceberg with those not), only merge those already persisted.
     pub(super) fn get_payload_to_compact(
@@ -159,5 +185,112 @@ impl SnapshotTableState {
             });
         }
         None
+    }
+
+    /// ===============================
+    /// Reflect maintenance result
+    /// ===============================
+    ///
+    /// Reflect data compaction results to mooncake snapshot.
+    /// Return evicted data files to delete due to data compaction.
+    pub(super) async fn update_data_compaction_to_mooncake_snapshot(
+        &mut self,
+        task: &SnapshotTask,
+    ) -> Vec<String> {
+        // Aggregate evicted files to delete.
+        let mut evicted_files_to_delete = vec![];
+
+        if task.data_compaction_result.is_empty() {
+            return vec![];
+        }
+
+        // NOTICE: Update data files before file indices, so when update file indices, data files for new file indices already exist in disk files map.
+        let data_compaction_res = task.data_compaction_result.clone();
+        let cur_evicted_files = self
+            .update_data_files_to_mooncake_snapshot_impl(
+                data_compaction_res.old_data_files,
+                data_compaction_res.new_data_files,
+                data_compaction_res.remapped_data_files,
+            )
+            .await;
+        evicted_files_to_delete.extend(cur_evicted_files);
+
+        let cur_evicted_files = self
+            .update_file_indices_to_mooncake_snapshot_impl(
+                data_compaction_res.old_file_indices,
+                data_compaction_res.new_file_indices,
+            )
+            .await;
+        evicted_files_to_delete.extend(cur_evicted_files);
+
+        // Apply evicted data files to delete within data compaction process.
+        evicted_files_to_delete.extend(
+            task.data_compaction_result
+                .evicted_files_to_delete
+                .iter()
+                .cloned()
+                .to_owned(),
+        );
+
+        evicted_files_to_delete
+    }
+
+    /// Return evicted files to delete.
+    pub(super) async fn update_file_indices_merge_to_mooncake_snapshot(
+        &mut self,
+        task: &SnapshotTask,
+    ) -> Vec<String> {
+        self.update_file_indices_to_mooncake_snapshot_impl(
+            task.index_merge_result.old_file_indices.clone(),
+            task.index_merge_result.new_file_indices.clone(),
+        )
+        .await
+    }
+
+    /// Data compaction might delete existing persisted files, which invalidates record locations and requires a record location remap.
+    pub(super) fn remap_and_prune_deletion_logs_after_compaction(
+        &mut self,
+        task: &mut SnapshotTask,
+    ) {
+        // No need to prune and remap if no compaction happening.
+        if task.data_compaction_result.is_empty() {
+            return;
+        }
+
+        // Remap and prune committed deletion log.
+        let mut new_committed_deletion_log = vec![];
+        let old_committed_deletion_log = std::mem::take(&mut self.committed_deletion_log);
+        for mut cur_deletion_log in old_committed_deletion_log.into_iter() {
+            if let Some(file_id) = cur_deletion_log.get_file_id() {
+                // Case-1: the deletion log doesn't indicate a compacted data file.
+                if !task
+                    .data_compaction_result
+                    .old_data_files
+                    .contains(&file_id)
+                {
+                    new_committed_deletion_log.push(cur_deletion_log);
+                    continue;
+                }
+                // Case-2: the deletion log exists in the compacted new data file, perform a remap.
+                let remap_succ =
+                    remap_record_location_after_compaction(&mut cur_deletion_log, task);
+                if remap_succ {
+                    new_committed_deletion_log.push(cur_deletion_log);
+                    continue;
+                }
+                // Case-3: the deletion log doesn't exist in the compacted new file, directly remove it.
+            } else {
+                new_committed_deletion_log.push(cur_deletion_log);
+            }
+        }
+        self.committed_deletion_log = new_committed_deletion_log;
+
+        // Remap uncommitted deletion log.
+        for cur_deletion_log in &mut self.uncommitted_deletion_log {
+            if cur_deletion_log.is_none() {
+                continue;
+            }
+            remap_record_location_after_compaction(cur_deletion_log.as_mut().unwrap(), task);
+        }
     }
 }
