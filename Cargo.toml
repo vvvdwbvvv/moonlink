@@ -19,6 +19,7 @@ arrow = { version = "55", default-features = false, features = [
   "canonical_extension_types",
 ] }
 arrow-array = "55"
+arrow-ipc = "55"
 arrow-schema = "55"
 async-stream = "0.3.6"
 async-trait = "0.1"

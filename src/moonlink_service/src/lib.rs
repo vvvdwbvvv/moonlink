@@ -1,5 +1,6 @@
 mod error;
 
+use arrow_ipc::writer::StreamWriter;
 pub use error::{Error, Result};
 use moonlink_backend::MoonlinkBackend;
 use moonlink_metadata_store::SqliteMetadataStore;
@@ -79,6 +80,15 @@ async fn handle_stream(
             } => {
                 backend.drop_table(database_id, table_id).await;
                 write(&mut stream, &()).await?;
+            }
+            Request::GetTableSchema {
+                database_id,
+                table_id,
+            } => {
+                let schema = backend.get_table_schema(database_id, table_id).await?;
+                let writer = StreamWriter::try_new(vec![], &schema)?;
+                let data = writer.into_inner()?;
+                write(&mut stream, &data).await?;
             }
             Request::ListTables {} => {
                 let tables = backend.list_tables().await?;

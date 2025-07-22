@@ -2797,6 +2797,8 @@ dependencies = [
 name = "moonlink_service"
 version = "0.0.1"
 dependencies = [
+ "arrow-ipc",
+ "arrow-schema",
  "clap",
  "moonlink_backend",
  "moonlink_metadata_store",
