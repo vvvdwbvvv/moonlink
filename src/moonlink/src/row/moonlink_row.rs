@@ -5,10 +5,11 @@ use arrow::datatypes::Field;
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use parquet::arrow::ProjectionMask;
+use serde::{Deserialize, Serialize};
 use std::hash::{Hash, Hasher};
 use std::mem::take;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct MoonlinkRow {
     pub values: Vec<RowValue>,
 }
