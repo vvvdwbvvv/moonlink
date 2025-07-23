@@ -9,7 +9,7 @@ use crate::pg_replicate::table_init::build_table_components;
 use crate::Result;
 use moonlink::{
     FileSystemConfig, MoonlinkTableConfig, ObjectStorageCache, ReadStateManager, TableEventManager,
-    TableStateReader,
+    TableStatusReader,
 };
 use std::io::{Error, ErrorKind};
 use std::sync::Arc;
@@ -44,20 +44,21 @@ pub enum Command {
     Shutdown,
 }
 
-struct TableState {
+struct TableStatus {
     schema: TableSchema,
     reader: ReadStateManager,
     event_manager: TableEventManager,
-    state_reader: TableStateReader,
+    status_reader: TableStatusReader,
 }
 /// Manages replication for table(s) within a database.
 pub struct ReplicationConnection {
     uri: String,
+    database_id: u32,
     table_base_path: String,
     table_temp_files_directory: String,
     postgres_client: Client,
     handle: Option<JoinHandle<Result<()>>>,
-    table_states: HashMap<SrcTableId, TableState>,
+    table_states: HashMap<SrcTableId, TableStatus>,
     cmd_tx: mpsc::Sender<Command>,
     cmd_rx: Option<mpsc::Receiver<Command>>,
     replication_state: Arc<ReplicationState>,
@@ -73,6 +74,7 @@ pub struct ReplicationConnection {
 impl ReplicationConnection {
     pub async fn new(
         uri: String,
+        database_id: u32,
         table_base_path: String,
         table_temp_files_directory: String,
         object_storage_cache: ObjectStorageCache,
@@ -125,6 +127,7 @@ impl ReplicationConnection {
 
         Ok(Self {
             uri,
+            database_id,
             table_base_path,
             table_temp_files_directory,
             postgres_client,
@@ -235,8 +238,15 @@ impl ReplicationConnection {
         &self.table_states.get(&src_table_id).unwrap().reader
     }
 
-    pub fn get_table_state_reader(&self, src_table_id: SrcTableId) -> &TableStateReader {
-        &self.table_states.get(&src_table_id).unwrap().state_reader
+    pub fn get_table_status_reader(&self, src_table_id: SrcTableId) -> &TableStatusReader {
+        &self.table_states.get(&src_table_id).unwrap().status_reader
+    }
+
+    pub fn get_table_status_readers(&self) -> Vec<&TableStatusReader> {
+        self.table_states
+            .values()
+            .map(|cur_table_state| &cur_table_state.status_reader)
+            .collect::<Vec<_>>()
     }
 
     pub fn table_count(&self) -> usize {
@@ -284,6 +294,7 @@ impl ReplicationConnection {
         debug!(src_table_id, "adding table to replication");
         let (table_resources, moonlink_table_config) = build_table_components(
             mooncake_table_id.to_string(),
+            self.database_id,
             table_id,
             schema,
             &self.table_base_path,
@@ -298,11 +309,11 @@ impl ReplicationConnection {
 
         self.table_states.insert(
             src_table_id,
-            TableState {
+            TableStatus {
                 schema: schema.clone(),
                 reader: table_resources.read_state_manager,
                 event_manager: table_resources.table_event_manager,
-                state_reader: table_resources.table_state_reader,
+                status_reader: table_resources.table_status_reader,
             },
         );
         if let Err(e) = self

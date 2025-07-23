@@ -8,7 +8,7 @@ use arrow_schema::Schema;
 pub use error::{Error, Result};
 use mooncake_table_id::MooncakeTableId;
 pub use moonlink::ReadState;
-use moonlink::{TableEventManager, TableState};
+use moonlink::{TableEventManager, TableStatus};
 use moonlink_connectors::ReplicationManager;
 use moonlink_metadata_store::base_metadata_store::MetadataStoreTrait;
 use std::hash::Hash;
@@ -101,6 +101,7 @@ where
                 .add_table(
                     &src_uri,
                     mooncake_table_id,
+                    database_id,
                     table_id,
                     &src_table_name,
                     /*override_iceberg_filesystem_config=*/ None,
@@ -161,18 +162,15 @@ where
         Ok(table_schema)
     }
 
-    /// Get the current mooncake table state.
-    pub async fn get_table_state(&self, database_id: D, table_id: T) -> Result<TableState> {
-        let table_state = {
-            let manager = self.replication_manager.read().await;
-            let mooncake_table_id = MooncakeTableId {
-                database_id,
-                table_id,
-            };
-            let table_state_reader = manager.get_table_state_reader(&mooncake_table_id);
-            table_state_reader.get_current_table_state().await?
-        };
-        Ok(table_state)
+    /// List all tables at moonlink backend, and return their states.
+    pub async fn list_tables(&self) -> Result<Vec<TableStatus>> {
+        let mut table_states = vec![];
+        let manager = self.replication_manager.read().await;
+        let table_state_readers = manager.get_table_status_readers();
+        for cur_table_state_reader in table_state_readers.into_iter() {
+            table_states.push(cur_table_state_reader.get_current_table_state().await?);
+        }
+        Ok(table_states)
     }
 
     pub async fn scan_table(
