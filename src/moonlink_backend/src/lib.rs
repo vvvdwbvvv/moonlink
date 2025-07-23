@@ -173,25 +173,6 @@ where
         Ok(table_states)
     }
 
-    pub async fn scan_table(
-        &self,
-        database_id: D,
-        table_id: T,
-        lsn: Option<u64>,
-    ) -> Result<Arc<ReadState>> {
-        let read_state = {
-            let manager = self.replication_manager.read().await;
-            let mooncake_table_id = MooncakeTableId {
-                database_id,
-                table_id,
-            };
-            let table_reader = manager.get_table_reader(&mooncake_table_id);
-            table_reader.try_read(lsn).await?
-        };
-
-        Ok(read_state.clone())
-    }
-
     /// Perform a table maintaince operation based on requested mode, block wait until maintenance results have been persisted.
     /// Notice, it's only exposed for debugging, testing and admin usage.
     ///
@@ -222,6 +203,25 @@ where
 
         rx.recv().await.unwrap().unwrap();
         Ok(())
+    }
+
+    pub async fn scan_table(
+        &self,
+        database_id: D,
+        table_id: T,
+        lsn: Option<u64>,
+    ) -> Result<Arc<ReadState>> {
+        let read_state = {
+            let manager = self.replication_manager.read().await;
+            let mooncake_table_id = MooncakeTableId {
+                database_id,
+                table_id,
+            };
+            let table_reader = manager.get_table_reader(&mooncake_table_id);
+            table_reader.try_read(lsn).await?
+        };
+
+        Ok(read_state.clone())
     }
 
     /// Gracefully shutdown a replication connection identified by its URI.

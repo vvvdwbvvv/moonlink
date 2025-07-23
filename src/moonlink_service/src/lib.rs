@@ -3,7 +3,7 @@ mod error;
 pub use error::{Error, Result};
 use moonlink_backend::MoonlinkBackend;
 use moonlink_metadata_store::SqliteMetadataStore;
-use moonlink_rpc::{read, write, Request};
+use moonlink_rpc::{read, write, Request, Table};
 use std::collections::HashMap;
 use std::io::ErrorKind::{BrokenPipe, ConnectionReset, UnexpectedEof};
 use std::sync::Arc;
@@ -79,6 +79,20 @@ async fn handle_stream(
             } => {
                 backend.drop_table(database_id, table_id).await;
                 write(&mut stream, &()).await?;
+            }
+            Request::ListTables {} => {
+                let tables = backend.list_tables().await?;
+                let tables: Vec<Table> = tables
+                    .into_iter()
+                    .map(|table| Table {
+                        database_id: table.database_id,
+                        table_id: table.table_id,
+                        commit_lsn: table.commit_lsn,
+                        flush_lsn: table.flush_lsn,
+                        iceberg_warehouse_location: table.iceberg_warehouse_location,
+                    })
+                    .collect();
+                write(&mut stream, &tables).await?;
             }
             Request::OptimizeTable {
                 database_id,
