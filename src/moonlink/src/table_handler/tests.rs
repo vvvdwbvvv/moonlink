@@ -1626,7 +1626,7 @@ async fn test_discard_duplicate_writes() {
         /*id=*/ 40,
         /*name=*/ "Dog",
         /*age=*/ 40,
-        /*lsn=*/ 25,
+        /*lsn=*/ 0,
         /*xact_id=*/ Some(40),
     )
     .await;
