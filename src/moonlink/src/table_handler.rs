@@ -385,7 +385,7 @@ impl TableHandler {
 
                                     // Notify all waiters with LSN satisfied.
                                     let replication_lsn = *replication_lsn_rx.borrow();
-                                    table_handler_state.update_force_iceberg_snapshot_requests(iceberg_flush_lsn, replication_lsn);
+                                    table_handler_state.update_iceberg_persisted_lsn(iceberg_flush_lsn, replication_lsn);
                                 }
                                 Err(e) => {
                                     let err = Err(Error::IcebergMessage(format!("Failed to create iceberg snapshot: {e:?}")));

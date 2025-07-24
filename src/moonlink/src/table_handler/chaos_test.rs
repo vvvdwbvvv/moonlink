@@ -3,7 +3,7 @@
 /// System invariants:
 /// - Begin events happen only after end events
 /// - End events happen only after begin events
-/// - Rows to delete comes from appended ones
+/// - Rows to delete comes from committed appended ones
 /// - LSN always increases
 use crate::event_sync::create_table_event_syncer;
 use crate::row::{MoonlinkRow, RowValue};
@@ -36,6 +36,7 @@ fn create_row(id: i32, name: &str, age: i32) -> MoonlinkRow {
 struct ChaosEvent {
     table_events: Vec<TableEvent>,
     snapshot_read_lsn: Option<u64>,
+    force_snapshot_lsn: Option<u64>,
 }
 
 impl ChaosEvent {
@@ -43,12 +44,21 @@ impl ChaosEvent {
         Self {
             table_events,
             snapshot_read_lsn: None,
+            force_snapshot_lsn: None,
         }
     }
     fn create_snapshot_read(lsn: u64) -> Self {
         Self {
             table_events: vec![],
             snapshot_read_lsn: Some(lsn),
+            force_snapshot_lsn: None,
+        }
+    }
+    fn create_force_snapshot(lsn: u64) -> Self {
+        Self {
+            table_events: vec![],
+            snapshot_read_lsn: None,
+            force_snapshot_lsn: Some(lsn),
         }
     }
 }
@@ -158,12 +168,20 @@ impl ChaosState {
             EndWithFlush,
             EndNoFlush,
             ReadSnapshot,
+            /// Foreground force snapshot only happens after commit operation, otherwise it gets blocked.
+            ForegroundForceSnapshot,
         }
 
         let mut choices = vec![];
 
         if self.last_commit_lsn.is_some() {
             choices.push(EventKind::ReadSnapshot);
+            // Foreground force snapshot happens after a commit operation.
+            if self.uncommitted_inserted_rows.is_empty()
+                && self.uncommitted_inserted_rows.is_empty()
+            {
+                choices.push(EventKind::ForegroundForceSnapshot);
+            }
         }
         if !self.has_begun {
             choices.push(EventKind::Begin);
@@ -181,6 +199,9 @@ impl ChaosState {
         match *choices.choose(&mut self.rng).unwrap() {
             EventKind::ReadSnapshot => {
                 ChaosEvent::create_snapshot_read(self.last_commit_lsn.unwrap())
+            }
+            EventKind::ForegroundForceSnapshot => {
+                ChaosEvent::create_force_snapshot(self.last_commit_lsn.unwrap())
             }
             EventKind::Begin => {
                 self.begin_transaction();
@@ -301,6 +322,7 @@ async fn test_chaos() {
     let mut env = TestEnvironment::new().await;
     let event_sender = env.event_sender.clone();
     let read_state_manager = env.read_state_manager;
+    let mut table_event_manager = env.table_event_manager;
     let last_commit_lsn_tx = env.last_commit_lsn_tx.clone();
     let replication_lsn_tx = env.replication_lsn_tx.clone();
 
@@ -311,6 +333,7 @@ async fn test_chaos() {
         for _ in 0..100 {
             let chaos_events = state.generate_random_events();
             for cur_event in chaos_events.table_events.into_iter() {
+                // For commit events, need to set up corresponding replication and commit LSN.
                 if let TableEvent::Commit { lsn, .. } = cur_event {
                     replication_lsn_tx.send(lsn).unwrap();
                     last_commit_lsn_tx.send(lsn).unwrap();
@@ -320,6 +343,8 @@ async fn test_chaos() {
                 }
                 event_sender.send(cur_event).await.unwrap();
             }
+
+            // Perform snapshot read operation and check.
             if let Some(read_lsn) = chaos_events.snapshot_read_lsn {
                 let requested_read_lsn = if read_lsn == 0 { None } else { Some(read_lsn) };
                 let expected_ids = state.get_valid_ids();
@@ -330,10 +355,18 @@ async fn test_chaos() {
                 )
                 .await;
             }
+
+            // Perform force snapshot and check.
+            if let Some(snapshot_lsn) = chaos_events.force_snapshot_lsn {
+                let rx = table_event_manager.initiate_snapshot(snapshot_lsn).await;
+                TableEventManager::synchronize_force_snapshot_request(rx, snapshot_lsn)
+                    .await
+                    .unwrap();
+            }
         }
 
         // TODO(hjiang): Temporarily hard code a sleep time to trigger background tasks.
-        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
         // If anything bad happens in the eventloop, drop table would fail.
         event_sender.send(TableEvent::DropTable).await.unwrap();
