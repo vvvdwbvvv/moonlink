@@ -9,21 +9,20 @@ use crate::storage::cache::object_storage::base_cache::{
     CacheEntry as DataFileCacheEntry, CacheTrait, FileMetadata,
 };
 use crate::storage::cache::object_storage::object_storage_cache::ObjectStorageCache;
-use crate::storage::compaction::table_compaction::{
-    CompactedDataEntry, DataCompactionPayload, RemappedRecordLocation,
-};
+use crate::storage::compaction::table_compaction::{CompactedDataEntry, RemappedRecordLocation};
 use crate::storage::filesystem::accessor::base_filesystem_accessor::BaseFileSystemAccess;
 use crate::storage::index::{cache_utils as index_cache_utils, FileIndex};
 use crate::storage::mooncake_table::persistence_buffer::UnpersistedRecords;
 use crate::storage::mooncake_table::shared_array::SharedRowBufferSnapshot;
-use crate::storage::mooncake_table::table_snapshot::FileIndiceMergePayload;
 use crate::storage::mooncake_table::MoonlinkRow;
 use crate::storage::mooncake_table::SnapshotOption;
 use crate::storage::storage_utils::{FileId, TableId, TableUniqueFileId};
 use crate::storage::storage_utils::{
     MooncakeDataFileRef, ProcessedDeletionRecord, RawDeletionRecord, RecordLocation,
 };
-use crate::table_notify::TableEvent;
+use crate::table_notify::{
+    DataCompactionMaintenanceStatus, IndexMergeMaintenanceStatus, TableEvent,
+};
 use crate::NonEvictableHandle;
 use more_asserts as ma;
 use std::cmp::Ordering;
@@ -91,10 +90,10 @@ pub(crate) struct MooncakeSnapshotOutput {
     pub(crate) commit_lsn: u64,
     /// Iceberg snapshot payload.
     pub(crate) iceberg_snapshot_payload: Option<IcebergSnapshotPayload>,
-    /// Data compaction payload.
-    pub(crate) data_compaction_payload: Option<DataCompactionPayload>,
     /// File indice merge payload.
-    pub(crate) file_indices_merge_payload: Option<FileIndiceMergePayload>,
+    pub(crate) file_indices_merge_payload: IndexMergeMaintenanceStatus,
+    /// Data compaction payload.
+    pub(crate) data_compaction_payload: DataCompactionMaintenanceStatus,
     /// Evicted local data cache files to delete.
     pub(crate) evicted_data_files_to_delete: Vec<String>,
 }
@@ -488,8 +487,8 @@ impl SnapshotTableState {
         let data_compaction_payload = self.get_payload_to_compact(&opt.data_compaction_option);
 
         // Decide whether to merge an index merge, which cannot be performed together with data compaction.
-        let mut file_indices_merge_payload: Option<FileIndiceMergePayload> = None;
-        if data_compaction_payload.is_none() {
+        let mut file_indices_merge_payload = IndexMergeMaintenanceStatus::Unknown;
+        if !data_compaction_payload.has_payload() {
             file_indices_merge_payload = self.get_file_indices_to_merge(&opt.index_merge_option);
         }
 
