@@ -44,7 +44,7 @@ pub enum Command {
     Shutdown,
 }
 
-struct TableStatus {
+struct TableState {
     schema: TableSchema,
     reader: ReadStateManager,
     event_manager: TableEventManager,
@@ -58,7 +58,7 @@ pub struct ReplicationConnection {
     table_temp_files_directory: String,
     postgres_client: Client,
     handle: Option<JoinHandle<Result<()>>>,
-    table_states: HashMap<SrcTableId, TableStatus>,
+    table_states: HashMap<SrcTableId, TableState>,
     cmd_tx: mpsc::Sender<Command>,
     cmd_rx: Option<mpsc::Receiver<Command>>,
     replication_state: Arc<ReplicationState>,
@@ -309,7 +309,7 @@ impl ReplicationConnection {
 
         self.table_states.insert(
             src_table_id,
-            TableStatus {
+            TableState {
                 schema: schema.clone(),
                 reader: table_resources.read_state_manager,
                 event_manager: table_resources.table_event_manager,
@@ -390,11 +390,12 @@ impl ReplicationConnection {
 
     async fn remove_table_from_replication(&mut self, src_table_id: SrcTableId) -> Result<()> {
         debug!(src_table_id, "removing table from replication");
-        let table_state = self.table_states.remove(&src_table_id).unwrap();
+        let TableState {
+            mut event_manager, ..
+        } = self.table_states.remove(&src_table_id).unwrap();
         // Notify the table handler to clean up cache, mooncake and iceberg table state.
         debug!(src_table_id, "drop table from table handler");
-        let mut table_event_manager = table_state.event_manager;
-        table_event_manager.drop_table().await?;
+        event_manager.drop_table().await?;
         if let Err(e) = self.cmd_tx.send(Command::DropTable { src_table_id }).await {
             error!(error = ?e, "failed to enqueue DropTable command");
         }
