@@ -110,7 +110,7 @@ impl SnapshotTableState {
         non_streaming_batch_id_counter: Arc<BatchIdCounter>,
     ) -> Result<Self> {
         let mut batches = BTreeMap::new();
-        // Properly consume a batch ID from the counter to avoid collision with main MemSlice
+        // Properly load a batch ID from the counter to ensure correspondence with MemSlice.
         let initial_batch_id = non_streaming_batch_id_counter.next();
         batches.insert(
             initial_batch_id,
@@ -566,8 +566,8 @@ impl SnapshotTableState {
 
         // start a fresh empty batch after the newest data
         let batch_size = self.current_snapshot.metadata.config.batch_size;
-        // Use the counter to ensure unique ID and follow proper allocation strategy
-        let next_id = self.non_streaming_batch_id_counter.next();
+        // Use the ID from the incoming batches rather than the counter, since the counter may have been further advanced elsewhere.
+        let next_id = incoming.last().unwrap().0 + 1;
 
         // Add to batch and assert that the batch is not already in the map.
         assert!(self
