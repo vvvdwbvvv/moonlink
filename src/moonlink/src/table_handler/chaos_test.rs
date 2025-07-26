@@ -98,6 +98,8 @@ enum EventKind {
     BeginNonStreamingTxn,
     Append,
     Delete,
+    StreamAbort,
+    StreamFlush,
     EndWithFlush,
     EndNoFlush,
     ReadSnapshot,
@@ -144,6 +146,8 @@ struct ChaosState {
     read_state_manager: ReadStateManager,
     /// Last commit LSN.
     last_commit_lsn: Option<u64>,
+    /// Whether the last finished transaction committed successfully, or not.
+    last_txn_is_committed: bool,
 }
 
 impl ChaosState {
@@ -166,6 +170,7 @@ impl ChaosState {
             cur_lsn: 0,
             cur_xact_id: 0,
             last_commit_lsn: None,
+            last_txn_is_committed: false,
         }
     }
 
@@ -195,6 +200,17 @@ impl ChaosState {
         self.txn_state = TxnState::InNonStreaming;
     }
 
+    /// Abort the current stream transaction.
+    fn stream_abort_transaction(&mut self) {
+        assert_eq!(self.txn_state, TxnState::InStreaming);
+        self.txn_state = TxnState::Empty;
+        self.cur_xact_id += 1;
+        self.uncommitted_inserted_rows.clear();
+        self.deleted_committed_row_ids.clear();
+        self.deleted_uncommitted_row_ids.clear();
+        self.last_txn_is_committed = false;
+    }
+
     fn commit_transaction(&mut self, lsn: u64) {
         // Update transaction id if streaming one.
         if self.txn_state == TxnState::InStreaming {
@@ -205,6 +221,7 @@ impl ChaosState {
         assert_ne!(self.txn_state, TxnState::Empty);
         self.txn_state = TxnState::Empty;
         self.last_commit_lsn = Some(lsn);
+        self.last_txn_is_committed = true;
 
         // Set table states.
         self.committed_inserted_rows
@@ -318,8 +335,11 @@ impl ChaosState {
             return;
         }
 
-        // Foreground table maintenance operations happen after a commit operation.
-        if self.uncommitted_inserted_rows.is_empty() && self.uncommitted_inserted_rows.is_empty() {
+        // Foreground table maintenance operations happen after a sucessfully committed transaction.
+        if self.uncommitted_inserted_rows.is_empty()
+            && self.uncommitted_inserted_rows.is_empty()
+            && self.last_txn_is_committed
+        {
             if self.cur_lsn - self.non_table_update_cmd_call.force_snapshot_lsn
                 >= NON_UPDATE_COMMAND_INTERVAL_LSN
             {
@@ -353,6 +373,10 @@ impl ChaosState {
             choices.push(EventKind::Append);
             if self.can_delete() {
                 choices.push(EventKind::Delete);
+            }
+            if self.txn_state == TxnState::InStreaming {
+                choices.push(EventKind::StreamFlush);
+                choices.push(EventKind::StreamAbort);
             }
             choices.push(EventKind::EndWithFlush);
             choices.push(EventKind::EndNoFlush);
@@ -402,6 +426,16 @@ impl ChaosState {
                 xact_id: self.get_cur_xact_id(),
                 lsn: self.get_and_update_cur_lsn(),
             }]),
+            EventKind::StreamFlush => {
+                ChaosEvent::create_table_events(vec![TableEvent::StreamFlush {
+                    xact_id: self.get_cur_xact_id().unwrap(),
+                }])
+            }
+            EventKind::StreamAbort => {
+                let xact_id = self.get_cur_xact_id().unwrap();
+                self.stream_abort_transaction();
+                ChaosEvent::create_table_events(vec![TableEvent::StreamAbort { xact_id }])
+            }
             EventKind::EndWithFlush => {
                 let lsn = self.get_and_update_cur_lsn();
                 let xact_id = self.get_cur_xact_id();
