@@ -169,12 +169,35 @@ impl SnapshotTableState {
             object_storage_cache: self.object_storage_cache.clone(),
             filesystem_accessor: self.filesystem_accessor.clone(),
             disk_files: tentative_data_files_to_compact
-                .iter()
-                .cloned()
+                .into_iter()
                 .collect::<Vec<_>>(),
-            file_indices: file_indices_to_compact.iter().cloned().collect::<Vec<_>>(),
+            file_indices: file_indices_to_compact.into_iter().collect::<Vec<_>>(),
         };
+
+        #[cfg(any(test, debug_assertions))]
+        {
+            Self::validate_compaction_payload(&payload);
+        }
         DataCompactionMaintenanceStatus::Payload(payload)
+    }
+
+    /// Util function to validate the consistency of data compaction payload.
+    #[cfg(any(test, debug_assertions))]
+    fn validate_compaction_payload(payload: &DataCompactionPayload) {
+        // Data files to compact.
+        let data_files = payload
+            .disk_files
+            .iter()
+            .map(|f| f.file_id.file_id)
+            .collect::<HashSet<_>>();
+
+        // Data files indicated by file indices.
+        let mut data_files_by_file_indices = HashSet::new();
+        for cur_file_index in payload.file_indices.iter() {
+            data_files_by_file_indices.extend(cur_file_index.files.iter().map(|f| f.file_id()));
+        }
+
+        assert_eq!(data_files, data_files_by_file_indices);
     }
 
     /// Util function to decide whether and what to merge index.
