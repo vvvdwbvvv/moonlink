@@ -66,8 +66,8 @@ impl BaseFileSystemAccess for FileSystemRetryWrapper {
             .await
     }
 
-    async fn get_object_size(&self, object: &str) -> Result<u64> {
-        self.retry_async(|| async { self.inner.get_object_size(object).await })
+    async fn stats_object(&self, object: &str) -> Result<opendal::Metadata> {
+        self.retry_async(|| async { self.inner.stats_object(object).await })
             .await
     }
 
@@ -93,6 +93,24 @@ impl BaseFileSystemAccess for FileSystemRetryWrapper {
         self.retry_async(|| {
             let content = content.clone();
             async move { self.inner.write_object(object, content).await }
+        })
+        .await
+    }
+
+    async fn conditional_write_object(
+        &self,
+        object: &str,
+        content: Vec<u8>,
+        etag: Option<String>,
+    ) -> Result<opendal::Metadata> {
+        self.retry_async(|| {
+            let content = content.clone();
+            let etag = etag.clone();
+            async move {
+                self.inner
+                    .conditional_write_object(object, content, etag)
+                    .await
+            }
         })
         .await
     }

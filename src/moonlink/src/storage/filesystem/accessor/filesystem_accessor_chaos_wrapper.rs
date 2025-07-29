@@ -127,9 +127,9 @@ impl BaseFileSystemAccess for FileSystemChaosWrapper {
         self.inner.object_exists(object).await
     }
 
-    async fn get_object_size(&self, object: &str) -> Result<u64> {
+    async fn stats_object(&self, object: &str) -> Result<opendal::Metadata> {
         self.perform_wrapper_function().await?;
-        self.inner.get_object_size(object).await
+        self.inner.stats_object(object).await
     }
 
     async fn read_object(&self, object: &str) -> Result<Vec<u8>> {
@@ -153,6 +153,18 @@ impl BaseFileSystemAccess for FileSystemChaosWrapper {
     async fn write_object(&self, object: &str, content: Vec<u8>) -> Result<()> {
         self.perform_wrapper_function().await?;
         self.inner.write_object(object, content).await
+    }
+
+    async fn conditional_write_object(
+        &self,
+        object_filepath: &str,
+        content: Vec<u8>,
+        etag: Option<String>,
+    ) -> Result<opendal::Metadata> {
+        self.perform_wrapper_function().await?;
+        self.inner
+            .conditional_write_object(object_filepath, content, etag)
+            .await
     }
 
     async fn create_unbuffered_stream_writer(
@@ -211,10 +223,6 @@ mod tests {
             .write_object(&filename, content.clone())
             .await
             .unwrap();
-
-        // Get file size.
-        let size = wrapper.get_object_size(&filename).await.unwrap();
-        assert_eq!(size, content.len() as u64);
 
         // Read object.
         let read_content = wrapper.read_object(&filename).await.unwrap();
