@@ -72,6 +72,7 @@ where
     }
 
     /// Create an iceberg snapshot with the given LSN, return when the a snapshot is successfully created.
+    /// If the requested database or table doesn't exist, return [`TableNotFound`] error.
     pub async fn create_snapshot(&self, database_id: D, table_id: T, lsn: u64) -> Result<()> {
         let rx = {
             let mut manager = self.replication_manager.write().await;
@@ -79,7 +80,7 @@ where
                 database_id,
                 table_id,
             };
-            let writer = manager.get_table_event_manager(&mooncake_table_id);
+            let writer = manager.get_table_event_manager(&mooncake_table_id)?;
             writer.initiate_snapshot(lsn).await
         };
         TableEventManager::synchronize_force_snapshot_request(rx, lsn).await?;
@@ -159,6 +160,7 @@ where
     }
 
     /// Get the current mooncake table schema.
+    /// If the requested database or table doesn't exist, return [`TableNotFound`] error.
     pub async fn get_table_schema(&self, database_id: D, table_id: T) -> Result<Arc<Schema>> {
         let table_schema = {
             let manager = self.replication_manager.read().await;
@@ -166,7 +168,7 @@ where
                 database_id,
                 table_id,
             };
-            let table_state_reader = manager.get_table_state_reader(&mooncake_table_id);
+            let table_state_reader = manager.get_table_state_reader(&mooncake_table_id)?;
             table_state_reader.get_current_table_schema().await?
         };
         Ok(table_schema)
@@ -197,7 +199,7 @@ where
                 database_id,
                 table_id,
             };
-            let writer = manager.get_table_event_manager(&mooncake_table_id);
+            let writer = manager.get_table_event_manager(&mooncake_table_id)?;
 
             match mode {
                 "data" => writer.initiate_data_compaction().await,
@@ -215,6 +217,7 @@ where
         Ok(())
     }
 
+    /// If the requested database or table doesn't exist, return [`TableNotFound`] error.
     pub async fn scan_table(
         &self,
         database_id: D,
@@ -227,7 +230,7 @@ where
                 database_id,
                 table_id,
             };
-            let table_reader = manager.get_table_reader(&mooncake_table_id);
+            let table_reader = manager.get_table_reader(&mooncake_table_id)?;
             table_reader.try_read(lsn).await?
         };
 
