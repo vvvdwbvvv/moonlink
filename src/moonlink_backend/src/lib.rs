@@ -3,6 +3,7 @@ pub mod file_utils;
 mod logging;
 pub mod mooncake_table_id;
 mod recovery_utils;
+pub mod table_config;
 
 use arrow_schema::Schema;
 pub use error::{Error, Result};
@@ -16,11 +17,16 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use crate::recovery_utils::BackendAttributes;
+use crate::table_config::TableConfig;
 
 pub struct MoonlinkBackend<
     D: std::convert::From<u32> + Eq + Hash + Clone + std::fmt::Display,
     T: std::convert::From<u32> + Eq + Hash + Clone + std::fmt::Display,
 > {
+    // Base directory for all tables.
+    base_path: String,
+    // Directory used to store union read temporary files.
+    temp_files_dir: String,
     // Metadata storage accessor.
     metadata_store_accessor: Box<dyn MetadataStoreTrait>,
     // Could be either relative or absolute path.
@@ -51,7 +57,6 @@ where
 
         let mut replication_manager = ReplicationManager::new(
             base_path_str.to_string(),
-            temp_files_dir.to_str().unwrap().to_string(),
             file_utils::create_default_object_storage_cache(read_cache_files_dir),
         );
 
@@ -66,6 +71,8 @@ where
         .await?;
 
         Ok(Self {
+            base_path: base_path_str.to_string(),
+            temp_files_dir: temp_files_dir.to_str().unwrap().to_string(),
             replication_manager: RwLock::new(replication_manager),
             metadata_store_accessor,
         })
@@ -90,12 +97,14 @@ where
     /// # Arguments
     ///
     /// * src_uri: connection string for source database (row storage database).
+    /// * table_config: json serialized table configuration.
     pub async fn create_table(
         &self,
         database_id: D,
         table_id: T,
         src_table_name: String,
         src_uri: String,
+        serialized_table_config: &str,
     ) -> Result<()> {
         let mooncake_table_id = MooncakeTableId {
             database_id: database_id.clone(),
@@ -105,22 +114,24 @@ where
         let table_id = mooncake_table_id.get_table_id_value();
 
         // Add mooncake table to replication, and create corresponding mooncake table.
-        let moonlink_table_config = {
+        let table_config =
+            TableConfig::from_json_or_default(serialized_table_config, &self.base_path)?;
+        let moonlink_table_config = table_config
+            .take_as_moonlink_config(self.temp_files_dir.clone(), mooncake_table_id.to_string());
+        {
             let mut manager = self.replication_manager.write().await;
-            // TODO(hjiang): Should pass real secrets into the mooncake table.
-            let table_config = manager
+            manager
                 .add_table(
                     &src_uri,
                     mooncake_table_id,
                     database_id,
                     table_id,
                     &src_table_name,
-                    /*override_iceberg_storage_config=*/ None,
+                    moonlink_table_config.clone(),
                     /*is_recovery=*/ false,
                 )
                 .await?;
             manager.start_replication(&src_uri).await?;
-            table_config
         };
 
         // Create metadata store entry.
@@ -157,6 +168,11 @@ where
             .delete_table_metadata(database_id, table_id)
             .await
             .unwrap()
+    }
+
+    /// Get the base directory for all mooncake tables.
+    pub fn get_base_path(&self) -> String {
+        self.base_path.clone()
     }
 
     /// Get the current mooncake table schema.
