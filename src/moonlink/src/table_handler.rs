@@ -598,7 +598,7 @@ impl TableHandler {
                     Some(xact_id) => {
                         let res = table.append_in_stream_batch(row, xact_id);
                         if table.should_transaction_flush(xact_id) {
-                            if let Err(e) = table.flush_transaction_stream(xact_id).await {
+                            if let Err(e) = table.flush_stream(xact_id, None).await {
                                 error!(error = %e, "flush failed in append");
                             }
                         }
@@ -641,7 +641,7 @@ impl TableHandler {
                 .await;
             }
             TableEvent::StreamFlush { xact_id } => {
-                if let Err(e) = table.flush_transaction_stream(xact_id).await {
+                if let Err(e) = table.flush_stream(xact_id, None).await {
                     error!(error = %e, "stream flush failed");
                 }
             }
