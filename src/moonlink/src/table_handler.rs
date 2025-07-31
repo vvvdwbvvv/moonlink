@@ -57,14 +57,21 @@ impl TableHandler {
         let table_handler_event_sender = event_sender.clone();
         let event_sender_for_periodical_snapshot = event_sender.clone();
         let event_sender_for_periodical_force_snapshot = event_sender.clone();
+        let event_sender_for_periodical_wal = event_sender.clone();
         let periodic_event_handle = tokio::spawn(async move {
             let mut periodic_snapshot_interval = tokio::time::interval(Duration::from_millis(500));
             let mut periodic_force_snapshot_interval =
                 tokio::time::interval(Duration::from_secs(300));
+            let mut periodic_wal_interval = tokio::time::interval(Duration::from_millis(500));
 
             loop {
                 tokio::select! {
                     // Sending to channel fails only happens when eventloop exits, directly exit timer events.
+                    _ = periodic_wal_interval.tick() => {
+                        if event_sender_for_periodical_wal.send(TableEvent::PeriodicalPersistTruncateWal).await.is_err() {
+                            return;
+                        }
+                    }
                     _ = periodic_snapshot_interval.tick() => {
                         if event_sender_for_periodical_snapshot.send(TableEvent::PeriodicalMooncakeTableSnapshot(uuid::Uuid::new_v4())).await.is_err() {
                            return;
@@ -142,13 +149,19 @@ impl TableHandler {
                 return;
             }
 
-            // Step-3: delete the mooncake table.
+            // Step-3: delete the WAL files.
+            if let Err(e) = table.drop_wal().await {
+                let _ = event_sync_sender.drop_table_completion_tx.send(Err(e));
+                return;
+            }
+
+            // Step-4: delete the mooncake table.
             if let Err(e) = table.drop_mooncake_table().await {
                 let _ = event_sync_sender.drop_table_completion_tx.send(Err(e));
                 return;
             }
 
-            // Step-4: send back completion notification.
+            // Step-5: send back completion notification.
             let _ = event_sync_sender.drop_table_completion_tx.send(Ok(()));
         };
 
@@ -486,6 +499,32 @@ impl TableHandler {
                         TableEvent::EvictedFilesToDelete { evicted_files } => {
                             start_task_to_delete_evicted(evicted_files.files);
                         }
+                        TableEvent::PeriodicalPersistTruncateWal => {
+                            if !table_handler_state.wal_persist_ongoing {
+                                table_handler_state.wal_persist_ongoing = true;
+                                let ongoing_persist_truncate = table.persist_and_truncate_wal();
+                                table_handler_state.wal_persist_ongoing = ongoing_persist_truncate;
+                            }
+                        }
+                        TableEvent::PeriodicalPersistTruncateWalResult { result } => {
+                            match result {
+                                Ok(result) => {
+                                    table_handler_state.wal_persist_ongoing = false;
+                                    if let Some(highest_lsn) = table.handle_completed_persistence_and_truncate_wal(&result) {
+                                        event_sync_sender.wal_flush_lsn_tx.send(highest_lsn).unwrap();
+                                    }
+
+                                    // Check whether need to drop table.
+                                    if table_handler_state.special_table_state == SpecialTableState::DropTable && table_handler_state.can_drop_table_now() {
+                                        drop_table(&mut table, event_sync_sender).await;
+                                        return;
+                                    }
+                                }
+                                Err(e) => {
+                                    error!(error = %e, "failed to persist wal");
+                                }
+                            }
+                        }
                         // ==============================
                         // Replication events
                         // ==============================
@@ -538,6 +577,8 @@ impl TableHandler {
             is_initial_copy_event,
             table_handler_state.special_table_state == SpecialTableState::InitialCopy
         );
+
+        table.push_wal_event(&event);
 
         match event {
             TableEvent::Append {

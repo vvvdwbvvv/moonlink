@@ -48,6 +48,7 @@ pub(crate) use crate::storage::mooncake_table::table_snapshot::{
 use crate::storage::mooncake_table_config::MooncakeTableConfig;
 use crate::storage::storage_utils::{FileId, TableId};
 use crate::storage::wal::wal_persistence_metadata::WalPersistenceMetadata;
+use crate::storage::wal::{WalConfig, WalManager, WalPersistAndTruncateResult};
 use crate::table_notify::{EvictedFiles, TableEvent};
 use crate::NonEvictableHandle;
 use arrow::record_batch::RecordBatch;
@@ -577,6 +578,9 @@ pub struct MooncakeTable {
 
     /// Table notifier, which is used to sent multiple types of event completion information.
     table_notify: Option<Sender<TableEvent>>,
+
+    /// WAL manager, used to persist WAL events.
+    wal_manager: WalManager,
 }
 
 impl MooncakeTable {
@@ -592,8 +596,9 @@ impl MooncakeTable {
         identity: IdentityProp,
         iceberg_table_config: IcebergTableConfig,
         table_config: MooncakeTableConfig,
+        wal_config: WalConfig,
         object_storage_cache: ObjectStorageCache,
-        filesystem_accessor: Arc<dyn BaseFileSystemAccess>,
+        table_filesystem_accessor: Arc<dyn BaseFileSystemAccess>,
     ) -> Result<Self> {
         let metadata = Arc::new(TableMetadata {
             name,
@@ -606,14 +611,17 @@ impl MooncakeTable {
         let iceberg_table_manager = Box::new(IcebergTableManager::new(
             metadata.clone(),
             object_storage_cache.clone(),
-            filesystem_accessor.clone(),
+            table_filesystem_accessor.clone(),
             iceberg_table_config,
         )?);
+
+        let wal_manager = WalManager::new(&wal_config);
         Self::new_with_table_manager(
             metadata,
             iceberg_table_manager,
             object_storage_cache,
-            filesystem_accessor,
+            table_filesystem_accessor,
+            wal_manager,
         )
         .await
     }
@@ -622,7 +630,8 @@ impl MooncakeTable {
         table_metadata: Arc<TableMetadata>,
         mut table_manager: Box<dyn TableManager>,
         object_storage_cache: ObjectStorageCache,
-        filesystem_accessor: Arc<dyn BaseFileSystemAccess>,
+        table_filesystem_accessor: Arc<dyn BaseFileSystemAccess>,
+        wal_manager: WalManager,
     ) -> Result<Self> {
         table_metadata.config.validate();
         let (table_snapshot_watch_sender, table_snapshot_watch_receiver) = watch::channel(u64::MAX);
@@ -649,7 +658,7 @@ impl MooncakeTable {
                     table_manager.get_warehouse_location(),
                     table_metadata.clone(),
                     object_storage_cache,
-                    filesystem_accessor,
+                    table_filesystem_accessor,
                     current_snapshot,
                     Arc::clone(&non_streaming_batch_id_counter),
                 )
@@ -667,6 +676,7 @@ impl MooncakeTable {
             last_iceberg_snapshot_lsn,
             last_wal_persisted_metadata,
             table_notify: None,
+            wal_manager,
         })
     }
 
@@ -1091,11 +1101,6 @@ impl MooncakeTable {
         self.table_snapshot_watch_sender.send(lsn).unwrap();
     }
 
-    #[cfg(test)]
-    pub(crate) fn get_snapshot_watch_sender(&self) -> watch::Sender<u64> {
-        self.table_snapshot_watch_sender.clone()
-    }
-
     /// Persist an iceberg snapshot.
     async fn persist_iceberg_snapshot_impl(
         mut iceberg_table_manager: Box<dyn TableManager>,
@@ -1283,6 +1288,60 @@ impl MooncakeTable {
             .await
             .unwrap();
     }
+
+    /// Spawns a background task to persist and truncate WAL if needed.
+    /// Returns true if there was a task spawned, false otherwise.
+    #[must_use]
+    pub(crate) fn persist_and_truncate_wal(&mut self) -> bool {
+        let latest_iceberg_snapshot_lsn = self.get_iceberg_snapshot_lsn();
+        let files_to_truncate =
+            if let Some(latest_iceberg_snapshot_lsn) = latest_iceberg_snapshot_lsn {
+                self.wal_manager
+                    .get_files_to_truncate(latest_iceberg_snapshot_lsn)
+            } else {
+                vec![]
+            };
+        let file_to_persist = self.wal_manager.extract_next_persistent_file();
+
+        if !files_to_truncate.is_empty() || file_to_persist.is_some() {
+            let event_sender_clone = self.table_notify.as_ref().unwrap().clone();
+            let file_system_accessor = self.wal_manager.get_file_system_accessor();
+            tokio::spawn(async move {
+                WalManager::wal_persist_truncate_async(
+                    files_to_truncate,
+                    file_to_persist,
+                    file_system_accessor,
+                    event_sender_clone,
+                    latest_iceberg_snapshot_lsn,
+                )
+                .await;
+            });
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Handles the result of a persist and truncate operation.
+    /// Returns the highest LSN that has been persisted into WAL.
+    pub(crate) fn handle_completed_persistence_and_truncate_wal(
+        &mut self,
+        result: &WalPersistAndTruncateResult,
+    ) -> Option<u64> {
+        self.wal_manager
+            .handle_completed_persistence_and_truncate(result)
+    }
+
+    /// Drop the WAL files. Note that at the moment this drops WAL files in the mooncake table's local filesystem
+    /// and so behaves the same as MooncakeTable.drop_table(),
+    /// but in the future this is needed to support object storage
+    pub(crate) async fn drop_wal(&mut self) -> Result<()> {
+        self.wal_manager.drop_wal().await
+    }
+
+    pub fn push_wal_event(&mut self, event: &TableEvent) {
+        self.wal_manager.push(event);
+    }
 }
 
 #[cfg(test)]
@@ -1358,6 +1417,17 @@ mod mooncake_tests {
             /*persistence_lsn=*/ Some(1),
             &res_copy,
         );
+    }
+}
+
+#[cfg(test)]
+impl MooncakeTable {
+    pub fn get_table_id(&self) -> u32 {
+        self.metadata.table_id
+    }
+
+    pub(crate) fn get_snapshot_watch_sender(&self) -> watch::Sender<u64> {
+        self.table_snapshot_watch_sender.clone()
     }
 }
 
