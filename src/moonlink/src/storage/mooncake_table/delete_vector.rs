@@ -5,7 +5,7 @@ use arrow::record_batch::RecordBatch;
 use arrow::util::bit_util;
 use more_asserts as ma;
 
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BatchDeletionVector {
     /// Boolean array tracking deletions (false = deleted, true = active)
     deletion_vector: Option<Vec<u8>>,
@@ -48,8 +48,11 @@ impl BatchDeletionVector {
     }
 
     /// Mark a row as deleted, return whether deletion succeeds or not.
+    /// Precondition: deletion vector's capacity is larger than 0, otherwise panics.
     #[must_use]
     pub(crate) fn delete_row(&mut self, row_idx: usize) -> bool {
+        ma::assert_gt!(self.max_rows, 0);
+
         // Set the bit at row_idx to 1 (deleted)
         self.initialize_vector_for_once();
         let exist = bit_util::get_bit(self.deletion_vector.as_ref().unwrap(), row_idx);

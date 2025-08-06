@@ -216,13 +216,12 @@ impl MooncakeTable {
                                 lsn: record.lsn,
                             });
                             // Mark the row as deleted in the batch
-                            // TODO(hjiang): Add assertion after https://github.com/Mooncake-Labs/moonlink/pull/1243
-                            let _ = stream_state
+                            assert!(stream_state
                                 .new_record_batches
                                 .get_mut(&batch_id)
                                 .unwrap()
                                 .deletions
-                                .delete_row(row_id);
+                                .delete_row(row_id));
                             return;
                         }
                         RecordLocation::DiskFile(file_id, row_id) => {
@@ -315,11 +314,12 @@ impl MooncakeTable {
         for batch in batches.iter_mut() {
             let filtered_batch = batch.batch.get_filtered_batch()?;
             if let Some(filtered_batch) = filtered_batch {
+                let num_rows = filtered_batch.num_rows();
                 stream_state.new_record_batches.insert(
                     batch.id,
                     InMemoryBatch {
                         data: Some(Arc::new(filtered_batch)),
-                        deletions: BatchDeletionVector::default(),
+                        deletions: BatchDeletionVector::new(num_rows),
                     },
                 );
             }
@@ -459,11 +459,12 @@ impl MooncakeTable {
         for batch in batches.iter_mut() {
             let filtered_batch = batch.batch.get_filtered_batch()?;
             if let Some(filtered_batch) = filtered_batch {
+                let num_rows = filtered_batch.num_rows();
                 stream_state.new_record_batches.insert(
                     batch.id,
                     InMemoryBatch {
                         data: Some(Arc::new(filtered_batch)),
-                        deletions: BatchDeletionVector::default(),
+                        deletions: BatchDeletionVector::new(num_rows),
                     },
                 );
             }
