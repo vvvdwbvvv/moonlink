@@ -36,7 +36,7 @@ pub use mooncake_table::SnapshotReadOutput;
 pub(crate) use mooncake_table::{PuffinDeletionBlobAtRead, SnapshotTableState};
 pub use mooncake_table_config::IcebergPersistenceConfig;
 pub use mooncake_table_config::MooncakeTableConfig;
-pub use wal::WalConfig;
+pub use wal::{WalConfig, WalManager, WalTransactionState};
 
 #[cfg(test)]
 pub(crate) use iceberg::puffin_utils::*;
