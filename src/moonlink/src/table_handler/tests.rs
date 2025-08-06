@@ -1054,7 +1054,7 @@ async fn test_empty_table_snapshot_creation() {
     }
 }
 
-/// Testing senario: request iceberg snapshot with multiple LSNs.
+/// Testing scenario: request iceberg snapshot with multiple LSNs.
 #[tokio::test]
 async fn test_multiple_snapshot_requests() {
     // Set mooncake and iceberg flush and snapshot threshold to huge value, to verify force flush and force snapshot works as expected.
@@ -1555,7 +1555,7 @@ async fn test_data_compaction_with_sufficient_data_files() {
 #[tokio::test]
 async fn test_full_maintenance_with_sufficient_data_files() {
     let temp_dir = tempdir().unwrap();
-    // Setup mooncake config, which won't trigger any data compaction or index merge, if not full table maintaince.
+    // Setup mooncake config, which won't trigger any data compaction or index merge, if not full table maintenance.
     let mooncake_table_config = MooncakeTableConfig {
         data_compaction_config: DataCompactionConfig {
             min_data_file_to_compact: 2,
@@ -2020,7 +2020,7 @@ async fn test_wal_iceberg_snapshot_truncates_correctly() {
         .unwrap();
 
     expected_events.push(env.append_row(8, "George", 60, 9, None).await);
-    // we keep events in this WAL file, because the previous exact 101 is still uncomitted
+    // we keep events in this WAL file, because the previous exact 101 is still uncommitted
     env.force_wal_persistence(9).await;
 
     // Load the latest snapshot from the iceberg table manager
