@@ -16,11 +16,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Attributes for disk files.
+#[derive(Clone, Debug)]
 pub(crate) struct DiskFileAttrs {
     pub(crate) file_size: usize,
     pub(crate) row_num: usize,
 }
 
+#[derive(Clone)]
 pub struct DiskSliceWriter {
     /// The schema of the DiskSlice.
     ///
@@ -31,11 +33,11 @@ pub struct DiskSliceWriter {
     // input
     batches: Vec<BatchEntry>,
 
-    writer_lsn: Option<u64>,
+    pub(crate) writer_lsn: Option<u64>,
 
     old_index: Arc<MemIndex>,
 
-    table_auto_incr_id: u32,
+    pub table_auto_incr_id: u32,
 
     /// Parquet file flush threshold size.
     parquet_flush_threshold_size: usize,
@@ -49,6 +51,24 @@ pub struct DiskSliceWriter {
 
     /// Records already flushed data files.
     files: Vec<(MooncakeDataFileRef, DiskFileAttrs)>,
+}
+
+impl std::fmt::Debug for DiskSliceWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let batch_ids: Vec<u64> = self.batches.iter().map(|batch| batch.id).collect();
+        let num_data_files = self.files.len();
+        let num_index_blocks = self
+            .new_index
+            .as_ref()
+            .map(|idx| idx.index_blocks.len())
+            .unwrap_or(0);
+        f.debug_struct("DiskSliceWriter")
+            .field("batch_ids", &batch_ids)
+            .field("lsn", &self.writer_lsn)
+            .field("num_data_files", &num_data_files)
+            .field("num_index_blocks", &num_index_blocks)
+            .finish()
+    }
 }
 
 impl DiskSliceWriter {
@@ -102,13 +122,14 @@ impl DiskSliceWriter {
         Ok(())
     }
 
-    pub(super) fn lsn(&self) -> Option<u64> {
+    pub fn lsn(&self) -> Option<u64> {
         self.writer_lsn
     }
 
     pub(super) fn input_batches(&self) -> &Vec<BatchEntry> {
         &self.batches
     }
+
     /// Get the list of files in the DiskSlice
     pub(super) fn output_files(&self) -> &[(MooncakeDataFileRef, DiskFileAttrs)] {
         self.files.as_slice()
@@ -247,20 +268,26 @@ impl DiskSliceWriter {
         self.new_index.take()
     }
 
-    pub fn remap_deletion_if_needed(&self, deletion: &mut ProcessedDeletionRecord) {
+    pub fn remap_deletion_if_needed(
+        &self,
+        deletion: &mut ProcessedDeletionRecord,
+    ) -> Option<RecordLocation> {
         if let RecordLocation::MemoryBatch(batch_id, row_idx) = &deletion.pos {
             let batch_was_flushed = self.batch_id_to_idx.contains_key(batch_id);
             if batch_was_flushed {
                 let old_location = (*self.batch_id_to_idx.get(batch_id).unwrap(), *row_idx);
                 let new_location = self.row_offset_mapping[old_location.0][old_location.1];
                 if let Some(new_location) = new_location {
-                    deletion.pos = RecordLocation::DiskFile(
+                    let record_location = RecordLocation::DiskFile(
                         self.files[new_location.0].0.file_id(),
                         new_location.1,
                     );
+                    deletion.pos = record_location.clone();
+                    return Some(record_location);
                 }
             }
         }
+        None
     }
 }
 

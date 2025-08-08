@@ -525,8 +525,8 @@ impl SnapshotTableState {
             self.current_snapshot.flush_lsn = Some(new_flush_lsn);
         }
 
-        if task.new_commit_lsn != 0 {
-            self.current_snapshot.snapshot_version = task.new_commit_lsn;
+        if task.commit_lsn_baseline != 0 {
+            self.current_snapshot.snapshot_version = task.commit_lsn_baseline;
         }
         if let Some(cp) = task.new_commit_point {
             self.last_commit = cp;
@@ -562,10 +562,13 @@ impl SnapshotTableState {
             && (flush_by_new_files_or_maintenance || flush_by_deletion);
 
         // TODO(hjiang): When there's only schema evolution, we should also flush even no flush.
-        if !opt.skip_iceberg_snapshot && (force_empty_iceberg_payload || flush_by_table_write) {
+        let flush_lsn = self.current_snapshot.flush_lsn.unwrap_or(0);
+        if !opt.skip_iceberg_snapshot
+            && (force_empty_iceberg_payload || flush_by_table_write)
+            && flush_lsn < task.min_ongoing_flush_lsn
+        {
             // Getting persistable committed deletion logs is not cheap, which requires iterating through all logs,
             // so we only aggregate when there's committed deletion.
-            let flush_lsn = self.current_snapshot.flush_lsn.unwrap_or(0);
             let committed_deletion_logs = self.aggregate_committed_deletion_logs(flush_lsn);
             committed_deletion_logs.validate();
 
@@ -611,15 +614,15 @@ impl SnapshotTableState {
         let incoming = take(&mut task.new_record_batches);
         let (streaming_batches, mut non_streaming_batches): (Vec<_>, Vec<_>) = incoming
             .into_iter()
-            .partition(|(id, _, _)| *id < (1u64 << 63));
+            .partition(|batch| batch.batch_id < (1u64 << 63));
 
         if !non_streaming_batches.is_empty() {
             // close previously‐open batch
             assert!(self.batches.values().last().unwrap().data.is_none());
             // Use the ID from the incoming batches rather than the counter, since the counter may have been further advanced elsewhere.
-            let next_id = non_streaming_batches.last().unwrap().0 + 1;
+            let next_id = non_streaming_batches.last().unwrap().batch_id + 1;
             self.batches.last_entry().unwrap().get_mut().data =
-                Some(non_streaming_batches.remove(0).1.clone());
+                Some(non_streaming_batches.remove(0).record_batch.clone());
 
             // start a fresh empty batch after the newest data
             let batch_size = self.current_snapshot.metadata.config.batch_size;
@@ -633,26 +636,27 @@ impl SnapshotTableState {
 
         // Add completed batches
         // Assert that no incoming batch ID is already present in the map.
-        for (id, rb, deletion_vector) in streaming_batches
+        for batch in streaming_batches
             .into_iter()
             .chain(non_streaming_batches.into_iter())
         {
-            let deletions = match deletion_vector {
+            let deletions = match batch.deletion_vector {
                 Some(dv) => dv, // Use the deletion vector from streaming transaction
-                None => BatchDeletionVector::new(rb.num_rows()), // Create fresh deletion vector for non-streaming
+                None => BatchDeletionVector::new(batch.record_batch.num_rows()), // Create fresh deletion vector for non-streaming
             };
 
             assert!(
                 self.batches
                     .insert(
-                        id,
+                        batch.batch_id,
                         InMemoryBatch {
-                            data: Some(rb.clone()),
+                            data: Some(batch.record_batch.clone()),
                             deletions,
                         }
                     )
                     .is_none(),
-                "Batch ID {id} already exists in self.batches"
+                "Batch ID {} already exists in self.batches",
+                batch.batch_id
             );
         }
     }
@@ -663,13 +667,17 @@ impl SnapshotTableState {
         let mut evicted_files = vec![];
 
         for mut slice in take(&mut task.new_disk_slices) {
-            let write_lsn = slice.lsn();
-            let lsn = write_lsn.expect("committed datafile should have a valid LSN");
+            let write_lsn = slice
+                .lsn()
+                .expect("committed datafile should have a valid LSN");
 
             // Register new files into mooncake snapshot, add it into cache, and record LSN map.
             for (file, file_attrs) in slice.output_files().iter() {
                 ma::assert_gt!(file_attrs.file_size, 0);
-                assert!(task.disk_file_lsn_map.insert(file.file_id(), lsn).is_none());
+                assert!(task
+                    .disk_file_lsn_map
+                    .insert(file.file_id(), write_lsn)
+                    .is_none());
                 let unique_file_id = self.get_table_unique_file_id(file.file_id());
                 let (cache_handle, cur_evicted_files) = self
                     .object_storage_cache
@@ -701,21 +709,36 @@ impl SnapshotTableState {
             }
 
             // remap deletions written *after* this slice’s LSN
-            let cut = self.committed_deletion_log.partition_point(|d| {
-                d.lsn
-                    <= write_lsn.expect(
-                        "Critical: LSN is None after it should have been updated by commit process",
-                    )
-            });
+            // We set to write_lsn - 1 to maintain consistency with deletion LSNs from the streaming case.
+            // In the case a streaming transaction commits before flush, we assign disk_slice.writer_lsn = commit_lsn.
+            // The corresponding deletions have lsn = commit_lsn - 1, so we need >= write_lsn - 1
+            // to ensure these deletions get remapped from memory to disk locations.
+            // Use wrapping_sub(1) for the special initial copy case where write_lsn is 0. In this case we still want to remap the deletion log.
+            let cut = self
+                .committed_deletion_log
+                .partition_point(|d| d.lsn < write_lsn.wrapping_sub(1));
 
-            self.committed_deletion_log[cut..]
-                .iter_mut()
-                .for_each(|d| slice.remap_deletion_if_needed(d));
+            for deletion in self.committed_deletion_log[cut..].iter_mut() {
+                if let Some(RecordLocation::DiskFile(file_id, row_idx)) =
+                    slice.remap_deletion_if_needed(deletion)
+                {
+                    // Find the disk file entry and apply the deletion
+                    // Precondition: all new data files have been reflected to disk file map
+                    for (file_ref, disk_entry) in self.current_snapshot.disk_files.iter_mut() {
+                        if file_ref.file_id() == file_id {
+                            assert!(disk_entry.batch_deletion_vector.delete_row(row_idx));
+                            break;
+                        }
+                    }
+                }
+            }
 
             self.uncommitted_deletion_log
                 .iter_mut()
                 .flatten()
-                .for_each(|d| slice.remap_deletion_if_needed(d));
+                .for_each(|d| {
+                    slice.remap_deletion_if_needed(d);
+                });
 
             // swap indices and drop in-memory batches that were flushed
             if let Some(on_disk_index) = slice.take_index() {
@@ -896,7 +919,7 @@ impl SnapshotTableState {
 
         for mut entry in take(&mut self.uncommitted_deletion_log) {
             let deletion = entry.take().unwrap();
-            if deletion.lsn < task.new_commit_lsn {
+            if deletion.lsn < task.commit_lsn_baseline {
                 self.commit_deletion(deletion);
             } else {
                 still_uncommitted.push(Some(deletion));
@@ -933,7 +956,7 @@ impl SnapshotTableState {
                 true
             }
         });
-        self.add_processed_deletion(already_processed, task.new_commit_lsn);
+        self.add_processed_deletion(already_processed, task.commit_lsn_baseline);
         new_deletions.sort_by_key(|deletion| deletion.lookup_key);
         if new_deletions.is_empty() {
             return;
@@ -973,7 +996,7 @@ impl SnapshotTableState {
                     &task.disk_file_lsn_map,
                 )
                 .await;
-            self.add_processed_deletion(processed_deletions, task.new_commit_lsn);
+            self.add_processed_deletion(processed_deletions, task.commit_lsn_baseline);
         }
     }
 }
