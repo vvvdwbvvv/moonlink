@@ -530,6 +530,8 @@ enum TableMaintenanceOption {
 struct TestEnvConfig {
     /// Test name.
     test_name: &'static str,
+    /// Whether to enable disk slice writer chaos option.
+    disk_slice_write_chaos_enabled: bool,
     /// Whether to enable local filesystem optimization for object storage cache.
     local_filesystem_optimization_enabled: bool,
     /// Table background maintenance option.
@@ -564,18 +566,26 @@ struct TestEnvironment {
 impl TestEnvironment {
     async fn new(config: TestEnvConfig) -> Self {
         let table_temp_dir = tempdir().unwrap();
+        let chaos_test_arg = parse_chaos_test_args();
+        let disk_slice_write_config = create_disk_slice_write_option(
+            config.disk_slice_write_chaos_enabled,
+            chaos_test_arg.seed,
+        );
         let mooncake_table_metadata = match &config.maintenance_option {
             TableMaintenanceOption::NoTableMaintenance => create_test_table_metadata_disable_flush(
                 table_temp_dir.path().to_str().unwrap().to_string(),
+                disk_slice_write_config,
             ),
             TableMaintenanceOption::IndexMerge => {
                 create_test_table_metadata_with_index_merge_disable_flush(
                     table_temp_dir.path().to_str().unwrap().to_string(),
+                    disk_slice_write_config,
                 )
             }
             TableMaintenanceOption::DataCompaction => {
                 create_test_table_metadata_with_data_compaction_disable_flush(
                     table_temp_dir.path().to_str().unwrap().to_string(),
+                    disk_slice_write_config,
                 )
             }
         };
@@ -594,7 +604,6 @@ impl TestEnvironment {
         };
 
         // Create mooncake table and table event notification receiver.
-        let chaos_test_arg = parse_chaos_test_args();
         let iceberg_table_config = if config.error_injection_enabled {
             get_iceberg_table_config_with_chaos_injection(
                 config.storage_config.clone(),
@@ -802,6 +811,31 @@ async fn chaos_test_impl(mut env: TestEnvironment) {
 }
 
 /// ============================
+/// Disk slice write with chaos
+/// ============================
+///
+#[named]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_disk_slice_chaos_on_local_fs() {
+    let iceberg_temp_dir = tempdir().unwrap();
+    let root_directory = iceberg_temp_dir.path().to_str().unwrap().to_string();
+    let test_env_config = TestEnvConfig {
+        test_name: function_name!(),
+        local_filesystem_optimization_enabled: false,
+        disk_slice_write_chaos_enabled: true,
+        maintenance_option: TableMaintenanceOption::NoTableMaintenance,
+        error_injection_enabled: false,
+        event_count: 2000,
+        storage_config: StorageConfig::FileSystem {
+            root_directory,
+            atomic_write_dir: None,
+        },
+    };
+    let env = TestEnvironment::new(test_env_config).await;
+    chaos_test_impl(env).await;
+}
+
+/// ============================
 /// Local filesystem persistence
 /// ============================
 ///
@@ -814,6 +848,7 @@ async fn test_chaos_on_local_fs_with_no_background_maintenance() {
     let test_env_config = TestEnvConfig {
         test_name: function_name!(),
         local_filesystem_optimization_enabled: false,
+        disk_slice_write_chaos_enabled: false,
         maintenance_option: TableMaintenanceOption::NoTableMaintenance,
         error_injection_enabled: false,
         event_count: 3500,
@@ -835,6 +870,7 @@ async fn test_chaos_on_local_fs_with_index_merge() {
     let test_env_config = TestEnvConfig {
         test_name: function_name!(),
         local_filesystem_optimization_enabled: false,
+        disk_slice_write_chaos_enabled: false,
         maintenance_option: TableMaintenanceOption::IndexMerge,
         error_injection_enabled: false,
         event_count: 3500,
@@ -856,6 +892,7 @@ async fn test_chaos_on_local_fs_with_data_compaction() {
     let test_env_config = TestEnvConfig {
         test_name: function_name!(),
         local_filesystem_optimization_enabled: false,
+        disk_slice_write_chaos_enabled: false,
         maintenance_option: TableMaintenanceOption::DataCompaction,
         error_injection_enabled: false,
         event_count: 3500,
@@ -881,6 +918,7 @@ async fn test_local_system_optimization_chaos_with_no_background_maintenance() {
     let test_env_config = TestEnvConfig {
         test_name: function_name!(),
         local_filesystem_optimization_enabled: true,
+        disk_slice_write_chaos_enabled: false,
         maintenance_option: TableMaintenanceOption::NoTableMaintenance,
         error_injection_enabled: false,
         event_count: 3500,
@@ -902,6 +940,7 @@ async fn test_local_system_optimization_chaos_with_index_merge() {
     let test_env_config = TestEnvConfig {
         test_name: function_name!(),
         local_filesystem_optimization_enabled: true,
+        disk_slice_write_chaos_enabled: false,
         maintenance_option: TableMaintenanceOption::IndexMerge,
         error_injection_enabled: false,
         event_count: 3500,
@@ -923,6 +962,7 @@ async fn test_local_system_optimization_chaos_with_data_compaction() {
     let test_env_config = TestEnvConfig {
         test_name: function_name!(),
         local_filesystem_optimization_enabled: true,
+        disk_slice_write_chaos_enabled: false,
         maintenance_option: TableMaintenanceOption::DataCompaction,
         error_injection_enabled: false,
         event_count: 3500,
@@ -950,6 +990,7 @@ async fn test_s3_chaos_with_no_background_maintenance() {
     let test_env_config = TestEnvConfig {
         test_name: function_name!(),
         local_filesystem_optimization_enabled: false,
+        disk_slice_write_chaos_enabled: false,
         maintenance_option: TableMaintenanceOption::NoTableMaintenance,
         error_injection_enabled: false,
         event_count: 3500,
@@ -970,6 +1011,7 @@ async fn test_s3_chaos_with_index_merge() {
     let test_env_config = TestEnvConfig {
         test_name: function_name!(),
         local_filesystem_optimization_enabled: false,
+        disk_slice_write_chaos_enabled: false,
         maintenance_option: TableMaintenanceOption::IndexMerge,
         error_injection_enabled: false,
         event_count: 3500,
@@ -990,6 +1032,7 @@ async fn test_s3_chaos_with_data_compaction() {
     let test_env_config = TestEnvConfig {
         test_name: function_name!(),
         local_filesystem_optimization_enabled: false,
+        disk_slice_write_chaos_enabled: false,
         maintenance_option: TableMaintenanceOption::DataCompaction,
         error_injection_enabled: false,
         event_count: 3500,
@@ -1014,6 +1057,7 @@ async fn test_gcs_chaos_with_no_background_maintenance() {
     let test_env_config = TestEnvConfig {
         test_name: function_name!(),
         local_filesystem_optimization_enabled: false,
+        disk_slice_write_chaos_enabled: false,
         maintenance_option: TableMaintenanceOption::NoTableMaintenance,
         error_injection_enabled: false,
         event_count: 3500,
@@ -1034,6 +1078,7 @@ async fn test_gcs_chaos_with_index_merge() {
     let test_env_config = TestEnvConfig {
         test_name: function_name!(),
         local_filesystem_optimization_enabled: false,
+        disk_slice_write_chaos_enabled: false,
         maintenance_option: TableMaintenanceOption::IndexMerge,
         error_injection_enabled: false,
         event_count: 3500,
@@ -1054,6 +1099,7 @@ async fn test_gcs_chaos_with_data_compaction() {
     let test_env_config = TestEnvConfig {
         test_name: function_name!(),
         local_filesystem_optimization_enabled: false,
+        disk_slice_write_chaos_enabled: false,
         maintenance_option: TableMaintenanceOption::DataCompaction,
         error_injection_enabled: false,
         event_count: 3500,
@@ -1076,6 +1122,7 @@ async fn test_chaos_injection_with_no_background_maintenance() {
     let test_env_config = TestEnvConfig {
         test_name: function_name!(),
         local_filesystem_optimization_enabled: false,
+        disk_slice_write_chaos_enabled: false,
         maintenance_option: TableMaintenanceOption::NoTableMaintenance,
         error_injection_enabled: true,
         event_count: 100,
@@ -1097,6 +1144,7 @@ async fn test_chaos_injection_with_index_merge() {
     let test_env_config = TestEnvConfig {
         test_name: function_name!(),
         local_filesystem_optimization_enabled: false,
+        disk_slice_write_chaos_enabled: false,
         maintenance_option: TableMaintenanceOption::IndexMerge,
         error_injection_enabled: true,
         event_count: 100,
@@ -1118,6 +1166,7 @@ async fn test_chaos_injection_with_data_compaction() {
     let test_env_config = TestEnvConfig {
         test_name: function_name!(),
         local_filesystem_optimization_enabled: false,
+        disk_slice_write_chaos_enabled: false,
         maintenance_option: TableMaintenanceOption::DataCompaction,
         error_injection_enabled: true,
         event_count: 100,
