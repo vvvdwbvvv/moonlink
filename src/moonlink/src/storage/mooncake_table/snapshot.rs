@@ -104,6 +104,8 @@ pub(crate) struct MooncakeSnapshotOutput {
     pub(crate) data_compaction_payload: DataCompactionMaintenanceStatus,
     /// Evicted local data cache files to delete.
     pub(crate) evicted_data_files_to_delete: Vec<String>,
+    /// Optional mooncake snapshot dump.
+    pub(crate) current_snapshot: Option<Snapshot>,
 }
 
 /// Committed deletion record to persist.
@@ -601,6 +603,7 @@ impl SnapshotTableState {
             data_compaction_payload,
             file_indices_merge_payload,
             evicted_data_files_to_delete,
+            current_snapshot: opt.dump_snapshot.then(|| self.current_snapshot.clone()),
         }
     }
 
