@@ -1025,86 +1025,6 @@ mod tests {
     }
 
     #[test]
-    fn test_column_array_builder_nested_struct() {
-        use arrow::array::StructArray;
-
-        // Create nested struct: { outer: { inner: { value: int32 } } }
-        let inner_fields = vec![Arc::new(arrow::datatypes::Field::new(
-            "value",
-            DataType::Int32,
-            /*nullable=*/ true,
-        ))];
-
-        let outer_fields = vec![Arc::new(arrow::datatypes::Field::new(
-            "inner",
-            DataType::Struct(inner_fields.clone().into()),
-            /*nullable=*/ true,
-        ))];
-
-        let root_fields = vec![Arc::new(arrow::datatypes::Field::new(
-            "outer",
-            DataType::Struct(outer_fields.clone().into()),
-            /*nullable=*/ true,
-        ))];
-
-        let mut builder = ColumnArrayBuilder::new(
-            &DataType::Struct(root_fields.clone().into()),
-            /*capacity=*/ 2,
-        );
-
-        // Add nested struct with values
-        builder
-            .append_value(&RowValue::Struct(vec![RowValue::Struct(vec![
-                RowValue::Struct(vec![RowValue::Int32(42)]),
-            ])]))
-            .unwrap();
-
-        // Add nested struct with null inner struct
-        builder
-            .append_value(&RowValue::Struct(vec![RowValue::Struct(vec![
-                RowValue::Null,
-            ])]))
-            .unwrap();
-
-        let array = builder.finish(&DataType::Struct(root_fields.into()));
-        assert_eq!(array.len(), 2);
-
-        let struct_array = array.as_any().downcast_ref::<StructArray>().unwrap();
-        assert_eq!(struct_array.num_columns(), 1);
-
-        // Check outer struct column
-        let outer_column = struct_array
-            .column(0)
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .unwrap();
-
-        // Check first row - valid nested struct
-        assert!(!outer_column.is_null(0));
-        let inner_struct = outer_column
-            .column(0)
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .unwrap();
-        assert!(!inner_struct.is_null(0));
-        let value_array = inner_struct
-            .column(0)
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        assert_eq!(value_array.value(0), 42);
-
-        // Check second row - null inner struct
-        assert!(!outer_column.is_null(1));
-        let inner_struct = outer_column
-            .column(0)
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .unwrap();
-        assert!(inner_struct.is_null(1));
-    }
-
-    #[test]
     fn test_column_array_builder_error_cases() {
         // Test type mismatch error - trying to append string to int32 builder
         let mut builder = ColumnArrayBuilder::new(&DataType::Int32, /*capacity=*/ 1);
@@ -1192,22 +1112,32 @@ mod tests {
             .to_string()
             .contains("Struct field count mismatch: expected 3 fields, got 5 values"));
 
-        // Test 4: Append with NULLs explicitly provided (should succeed)
+        // Test 4: Progressive NULL pattern testing (should succeed)
+        // Row with one NULL in middle field
         builder
             .append_value(&RowValue::Struct(vec![
                 RowValue::Int32(4),
-                RowValue::Null, // Explicit NULL
+                RowValue::Null, // Explicit NULL in middle
                 RowValue::Bool(false),
             ]))
             .unwrap();
 
+        // Row with two NULLs in last two fields
+        builder
+            .append_value(&RowValue::Struct(vec![
+                RowValue::Int32(5),
+                RowValue::Null, // NULL
+                RowValue::Null, // NULL
+            ]))
+            .unwrap();
+
         let array = builder.finish(&DataType::Struct(struct_fields.into()));
-        assert_eq!(array.len(), 2); // Only 2 successful appends
+        assert_eq!(array.len(), 3); // 3 successful appends (tests 2, 4, and 5)
 
         let struct_array = array.as_any().downcast_ref::<StructArray>().unwrap();
         assert_eq!(struct_array.num_columns(), 3);
 
-        // Check field1 values
+        // Check field1 values (no nulls)
         let field1 = struct_array
             .column(0)
             .as_any()
@@ -1215,17 +1145,19 @@ mod tests {
             .unwrap();
         assert_eq!(field1.value(0), 2);
         assert_eq!(field1.value(1), 4);
+        assert_eq!(field1.value(2), 5);
 
-        // Check field2 values
+        // Check field2 values (progressive nulls)
         let field2 = struct_array
             .column(1)
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
         assert_eq!(field2.value(0), "test");
-        assert!(field2.is_null(1)); // Explicit NULL
+        assert!(field2.is_null(1)); // NULL from row 2
+        assert!(field2.is_null(2)); // NULL from row 3
 
-        // Check field3 values
+        // Check field3 values (progressive nulls)
         let field3 = struct_array
             .column(2)
             .as_any()
@@ -1233,5 +1165,182 @@ mod tests {
             .unwrap();
         assert!(field3.value(0));
         assert!(!field3.value(1));
+        assert!(field3.is_null(2)); // NULL from row 3
+    }
+
+    #[test]
+    fn test_struct_with_list_field() {
+        use arrow::array::{ListArray, StructArray};
+
+        // Struct schema: { id: Int32, scores: List<Int32> }
+        let struct_fields = vec![
+            Arc::new(arrow::datatypes::Field::new("id", DataType::Int32, true)),
+            Arc::new(arrow::datatypes::Field::new(
+                "scores",
+                DataType::List(Arc::new(arrow::datatypes::Field::new(
+                    "item",
+                    DataType::Int32,
+                    true,
+                ))),
+                true,
+            )),
+        ];
+
+        let mut builder =
+            ColumnArrayBuilder::new(&DataType::Struct(struct_fields.clone().into()), 3);
+
+        builder
+            .append_value(&RowValue::Struct(vec![
+                RowValue::Int32(1),
+                RowValue::Array(vec![RowValue::Int32(85), RowValue::Int32(92)]),
+            ]))
+            .unwrap();
+        builder
+            .append_value(&RowValue::Struct(vec![
+                RowValue::Int32(2),
+                RowValue::Array(vec![]),
+            ]))
+            .unwrap();
+        builder
+            .append_value(&RowValue::Struct(vec![RowValue::Int32(3), RowValue::Null]))
+            .unwrap();
+
+        let array = builder.finish(&DataType::Struct(struct_fields.into()));
+        let struct_array = array.as_any().downcast_ref::<StructArray>().unwrap();
+        let scores_column = struct_array
+            .column(1)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+
+        // Verify list with values, empty list, and null
+        assert_eq!(scores_column.value(0).len(), 2);
+        assert_eq!(scores_column.value(1).len(), 0);
+        assert!(scores_column.is_null(2));
+    }
+
+    #[test]
+    fn test_deeply_nested_struct() {
+        use arrow::array::StructArray;
+
+        // Create 3-level nested struct: { level2: { level3: { value: Utf8 } } }
+        let level3 = DataType::Struct(
+            vec![Arc::new(arrow::datatypes::Field::new(
+                "value",
+                DataType::Utf8,
+                true,
+            ))]
+            .into(),
+        );
+        let level2 = DataType::Struct(
+            vec![Arc::new(arrow::datatypes::Field::new(
+                "level3", level3, true,
+            ))]
+            .into(),
+        );
+        let root = DataType::Struct(
+            vec![Arc::new(arrow::datatypes::Field::new(
+                "level2", level2, true,
+            ))]
+            .into(),
+        );
+
+        let mut builder = ColumnArrayBuilder::new(&root, 2);
+
+        // Add nested struct and struct with null
+        builder
+            .append_value(&RowValue::Struct(vec![RowValue::Struct(vec![
+                RowValue::Struct(vec![RowValue::ByteArray(b"deep".to_vec())]),
+            ])]))
+            .unwrap();
+        builder
+            .append_value(&RowValue::Struct(vec![RowValue::Null]))
+            .unwrap();
+
+        let array = builder.finish(&root);
+        let struct_array = array.as_any().downcast_ref::<StructArray>().unwrap();
+        let level2_column = struct_array
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+
+        // Verify deep nesting works and nulls are handled
+        assert!(!level2_column.is_null(0));
+        assert!(level2_column.is_null(1));
+    }
+
+    #[test]
+    fn test_struct_with_mixed_nested_types() {
+        use arrow::array::{ListArray, StructArray};
+
+        // Nested struct schema: { nested_id: Int32, nested_value: Float64 }
+        let nested_struct = DataType::Struct(
+            vec![
+                Arc::new(arrow::datatypes::Field::new(
+                    "nested_id",
+                    DataType::Int32,
+                    true,
+                )),
+                Arc::new(arrow::datatypes::Field::new(
+                    "nested_value",
+                    DataType::Float64,
+                    true,
+                )),
+            ]
+            .into(),
+        );
+
+        // Root struct: { id: Int32, nested: Struct, tags: List<Utf8> }
+        let struct_fields = vec![
+            Arc::new(arrow::datatypes::Field::new("id", DataType::Int32, true)),
+            Arc::new(arrow::datatypes::Field::new("nested", nested_struct, true)),
+            Arc::new(arrow::datatypes::Field::new(
+                "tags",
+                DataType::List(Arc::new(arrow::datatypes::Field::new(
+                    "item",
+                    DataType::Utf8,
+                    true,
+                ))),
+                true,
+            )),
+        ];
+
+        let mut builder =
+            ColumnArrayBuilder::new(&DataType::Struct(struct_fields.clone().into()), 2);
+
+        builder
+            .append_value(&RowValue::Struct(vec![
+                RowValue::Int32(1),
+                RowValue::Struct(vec![RowValue::Int32(100), RowValue::Float64(42.5)]),
+                RowValue::Array(vec![RowValue::ByteArray(b"tag1".to_vec())]),
+            ]))
+            .unwrap();
+        builder
+            .append_value(&RowValue::Struct(vec![
+                RowValue::Int32(2),
+                RowValue::Null,
+                RowValue::Array(vec![RowValue::ByteArray(b"tag2".to_vec())]),
+            ]))
+            .unwrap();
+
+        let array = builder.finish(&DataType::Struct(struct_fields.into()));
+        let struct_array = array.as_any().downcast_ref::<StructArray>().unwrap();
+        let nested_column = struct_array
+            .column(1)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let tags_column = struct_array
+            .column(2)
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .unwrap();
+
+        // Verify mixed types: valid nested struct, null nested struct, and lists
+        assert!(!nested_column.is_null(0));
+        assert!(nested_column.is_null(1));
+        assert_eq!(tags_column.value(0).len(), 1);
+        assert_eq!(tags_column.value(1).len(), 1);
     }
 }
