@@ -1324,6 +1324,7 @@ impl MooncakeTable {
         table_notify
             .send(TableEvent::MooncakeTableSnapshotResult {
                 uuid,
+                id: table_event_id,
                 lsn: snapshot_result.commit_lsn,
                 iceberg_snapshot_payload: snapshot_result.iceberg_snapshot_payload,
                 data_compaction_payload: snapshot_result.data_compaction_payload,
@@ -1592,6 +1593,18 @@ impl MooncakeTable {
 
     pub(crate) fn get_snapshot_watch_sender(&self) -> watch::Sender<u64> {
         self.table_snapshot_watch_sender.clone()
+    }
+
+    /// Get flushed disk file ids by [`xact_id`].
+    #[cfg(feature = "chaos-test")]
+    pub(crate) fn get_stream_transaction_disk_files(&self, xact_id: u32) -> Vec<FileId> {
+        let disk_files = &self
+            .transaction_stream_states
+            .get(&xact_id)
+            .as_ref()
+            .unwrap()
+            .flushed_files;
+        disk_files.iter().map(|f| f.0.file_id()).collect::<Vec<_>>()
     }
 }
 
