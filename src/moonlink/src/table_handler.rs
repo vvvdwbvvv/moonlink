@@ -130,11 +130,29 @@ impl TableHandler {
         event_replay_tx: Option<mpsc::UnboundedSender<TableEvent>>,
         mut table: MooncakeTable,
     ) {
-        let initial_persistence_lsn = table.get_iceberg_snapshot_lsn();
+        let iceberg_snapshot_lsn = table.get_iceberg_snapshot_lsn();
+        // Here we indicate that highest completion lsn of 0 indicates that we have not seen any completed WAL events yet.
+        let wal_highest_completion_lsn = table.get_wal_highest_completion_lsn();
+        let wal_curr_file_number = table.get_wal_curr_file_number();
+
+        let initial_persistence_lsn = if wal_curr_file_number > 0 {
+            if let Some(iceberg_snapshot_lsn) = iceberg_snapshot_lsn {
+                Some(std::cmp::max(
+                    iceberg_snapshot_lsn,
+                    wal_highest_completion_lsn,
+                ))
+            } else {
+                Some(wal_highest_completion_lsn)
+            }
+        } else {
+            iceberg_snapshot_lsn
+        };
+
         let mut table_handler_state = TableHandlerState::new(
             event_sync_sender.table_maintenance_completion_tx.clone(),
             event_sync_sender.force_snapshot_completion_tx.clone(),
             initial_persistence_lsn,
+            iceberg_snapshot_lsn,
         );
 
         // Used to clean up mooncake table status, and send completion notification.
@@ -659,6 +677,14 @@ impl TableHandler {
                         }
                     }
                 }
+                TableEvent::FinishRecovery {
+                    highest_completion_lsn,
+                } => {
+                    event_sync_sender
+                        .wal_flush_lsn_tx
+                        .send(highest_completion_lsn)
+                        .unwrap();
+                }
                 TableEvent::FlushResult {
                     id: _,
                     xact_id,
@@ -704,6 +730,7 @@ impl TableHandler {
         // Replication events
         // ==============================
         //
+
         let is_initial_copy_event = matches!(
             event,
             TableEvent::Append {
@@ -718,7 +745,10 @@ impl TableHandler {
         }
 
         // In the case that this is an initial copy event we actually expect the LSN to be less than the initial persistence LSN, hence we don't discard it.
-        if table_handler_state.should_discard_event(&event) && !is_initial_copy_event {
+        if table_handler_state.should_discard_event(&event)
+            && !is_initial_copy_event
+            && !event.is_recovery()
+        {
             return;
         }
         assert_eq!(
@@ -779,8 +809,15 @@ impl TableHandler {
                 )
                 .await;
             }
-            TableEvent::StreamAbort { xact_id, .. } => {
-                table.abort_in_stream_batch(xact_id);
+            TableEvent::StreamAbort {
+                xact_id,
+                closes_incomplete_wal_transaction,
+                ..
+            } => {
+                // If we are closing a transaction that is part of the WAL recovery process, then we do not need to process it, but just push it in to the WAL.
+                if !closes_incomplete_wal_transaction {
+                    table.abort_in_stream_batch(xact_id);
+                }
             }
             TableEvent::CommitFlush { lsn, xact_id, .. } => {
                 Self::commit_and_attempt_flush(

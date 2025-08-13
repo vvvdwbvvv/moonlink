@@ -88,7 +88,14 @@ pub enum TableEvent {
         is_recovery: bool,
     },
     /// Abort current stream with given xact_id
-    StreamAbort { xact_id: u32, is_recovery: bool },
+    /// If closes incomplete wal transaction is true, then this is being used during recovery
+    /// to close any incomplete transactions in the WAL that are now discarded as we will replay them from the source instead.
+    /// Note that in this case, is_recovery will be set to false as we want the event to be persisted into the WAL.
+    StreamAbort {
+        xact_id: u32,
+        is_recovery: bool,
+        closes_incomplete_wal_transaction: bool,
+    },
     FlushResult {
         /// Background event id.
         id: BackgroundEventId,
@@ -108,14 +115,19 @@ pub enum TableEvent {
         is_recovery: bool,
     },
     /// Flush the transaction stream with given xact_id
-    StreamFlush { xact_id: u32, is_recovery: bool },
+    StreamFlush {
+        xact_id: u32,
+        is_recovery: bool,
+    },
     /// ==============================
     /// Interactive blocking events
     /// ==============================
     ///
     /// Force a mooncake and iceberg snapshot.
     /// - If [`lsn`] unassigned, will force snapshot on the latest committed LSN.
-    ForceSnapshot { lsn: Option<u64> },
+    ForceSnapshot {
+        lsn: Option<u64>,
+    },
     /// There's at most one outstanding force table maintenance requests.
     ///
     /// Force a regular index merge operation.
@@ -127,13 +139,17 @@ pub enum TableEvent {
     /// Drop table.
     DropTable,
     /// Alter table,
-    AlterTable { columns_to_drop: Vec<String> },
+    AlterTable {
+        columns_to_drop: Vec<String>,
+    },
     /// Start initial table copy.
     /// `start_lsn` is the `pg_current_wal_lsn` when the initial copy starts.
     StartInitialCopy,
     /// Finish initial table copy and merge buffered changes.
     /// `start_lsn` is the `pg_current_wal_lsn` when the initial copy starts. We want this in FinishInitialCopy so we can set the commit LSN correctly.
-    FinishInitialCopy { start_lsn: u64 },
+    FinishInitialCopy {
+        start_lsn: u64,
+    },
     /// ==============================
     /// Table internal events
     /// ==============================
@@ -194,6 +210,9 @@ pub enum TableEvent {
     /// Periodic persist and truncate wal completes.
     PeriodicalWalPersistenceUpdateResult {
         result: Result<WalPersistenceUpdateResult>,
+    },
+    FinishRecovery {
+        highest_completion_lsn: u64,
     },
 }
 
