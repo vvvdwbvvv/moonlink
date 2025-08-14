@@ -933,6 +933,7 @@ impl MooncakeTable {
         // Record mooncake snapshot event initiation.
         let table_event_id = self.event_id_assigner.get_next_event_id();
         opt.id = Some(table_event_id);
+
         if let Some(event_replay_tx) = &self.event_replay_tx {
             let table_event = replay_events::create_mooncake_snapshot_event_initiation(
                 table_event_id,
@@ -1502,6 +1503,7 @@ impl MooncakeTable {
         let new_file_ids_to_create = snapshot_payload.get_new_file_ids_num();
         let table_auto_incr_ids = self.next_file_id..(self.next_file_id + new_file_ids_to_create);
         self.next_file_id += new_file_ids_to_create;
+        let table_event_id = snapshot_payload.id;
         tokio::task::spawn(
             Self::persist_iceberg_snapshot_impl(
                 iceberg_table_manager,
@@ -1509,7 +1511,7 @@ impl MooncakeTable {
                 self.table_notify.as_ref().unwrap().clone(),
                 table_auto_incr_ids,
                 self.event_replay_tx.clone(),
-                self.event_id_assigner.get_next_event_id(),
+                table_event_id,
             )
             .instrument(info_span!("persist_iceberg_snapshot")),
         );

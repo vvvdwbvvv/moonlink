@@ -46,7 +46,7 @@ impl Eq for SingleFileToCompact {}
 /// Payload to trigger a compaction operation.
 #[derive(Clone)]
 pub struct DataCompactionPayload {
-    /// Table event id.
+    /// Background event id.
     pub(crate) id: BackgroundEventId,
     /// UUID for current compaction operation, used for observability purpose.
     pub(crate) uuid: uuid::Uuid,
@@ -100,7 +100,7 @@ pub(crate) struct RemappedRecordLocation {
 /// Result for a compaction operation.
 #[derive(Clone, Default, PartialEq)]
 pub struct DataCompactionResult {
-    /// Event id.
+    /// Background event id.
     pub(crate) id: BackgroundEventId,
     /// UUID for current compaction operation, used for observability purpose.
     pub(crate) uuid: uuid::Uuid,

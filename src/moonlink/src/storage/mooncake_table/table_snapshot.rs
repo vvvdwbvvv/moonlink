@@ -127,6 +127,8 @@ impl IcebergSnapshotDataCompactionPayload {
 
 #[derive(Clone)]
 pub struct IcebergSnapshotPayload {
+    /// Background event id.
+    pub(crate) id: BackgroundEventId,
     /// UUID for the current persistence operation, used for observability purpose.
     pub(crate) uuid: uuid::Uuid,
     /// Flush LSN.
@@ -146,6 +148,7 @@ pub struct IcebergSnapshotPayload {
 impl std::fmt::Debug for IcebergSnapshotPayload {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IcebergSnapshotPayload")
+            .field("id", &self.id)
             .field("uuid", &self.uuid)
             .field("flush_lsn", &self.flush_lsn)
             .field(
@@ -353,7 +356,7 @@ impl std::fmt::Debug for IcebergSnapshotDataCompactionResult {
 }
 
 pub struct IcebergSnapshotResult {
-    /// Table event id.
+    /// Background event id.
     pub(crate) id: BackgroundEventId,
     /// UUID for the current persistence operation, used for observability purpose.
     pub(crate) uuid: uuid::Uuid,
@@ -407,6 +410,7 @@ impl std::fmt::Debug for IcebergSnapshotResult {
         f.debug_struct("IcebergSnapshotResult")
             .field("id", &self.id)
             .field("uuid", &self.uuid)
+            .field("id", &self.id)
             .field("flush_lsn", &self.flush_lsn)
             .field(
                 "committed deletion log count",
@@ -425,7 +429,7 @@ impl std::fmt::Debug for IcebergSnapshotResult {
 ///
 #[derive(Clone)]
 pub struct FileIndiceMergePayload {
-    /// Table event id.
+    /// Background event id.
     pub(crate) id: BackgroundEventId,
     /// UUID for current index merge operation, used for observability purpose.
     pub(crate) uuid: uuid::Uuid,
@@ -445,7 +449,7 @@ impl std::fmt::Debug for FileIndiceMergePayload {
 
 #[derive(Clone, Default)]
 pub struct FileIndiceMergeResult {
-    /// Table event id.
+    /// Background event id.
     pub(crate) id: BackgroundEventId,
     /// UUID for current index merge operation, used for observability purpose.
     pub(crate) uuid: uuid::Uuid,

@@ -84,7 +84,7 @@ pub(crate) struct SnapshotTableState {
     /// Batch ID counter for non-streaming operations
     pub(super) non_streaming_batch_id_counter: Arc<BatchIdCounter>,
 
-    /// Used to assign event ids.
+    /// Used to generated monotonically increasing id to differentiate each replay events.
     pub(super) event_id_assigner: EventIdAssigner,
 }
 
