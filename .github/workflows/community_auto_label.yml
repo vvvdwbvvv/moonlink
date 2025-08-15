@@ -13,61 +13,41 @@ jobs:
   label:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/github-script@v7
+      - name: Label PRs from external contributors
+        uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const org = 'Mooncake-Labs';
-            const pr = context.payload.pull_request;
-            const prAuthor = pr.user.login;
-
-            // Skip if already labeled
-            const existing = new Set((pr.labels || []).map(l => l.name));
-            if (existing.has('community')) {
-              core.info('Label "community" already present; skipping.');
-              return;
-            }
-
-            // Option A: org membership check (404 => not a member)
-            try {
-              await github.rest.orgs.checkMembershipForUser({ org, username: prAuthor });
-              core.info(`${prAuthor} is a member of ${org}; not adding label.`);
-              return;
-            } catch (error) {
-              if (error.status !== 404) {
-                core.setFailed(`Membership check failed: ${error.status} ${error.message}`);
-                return;
-              }
-            }
-
-            // Ensure label exists (create if missing)
             const labelName = 'community';
-            try {
-              await github.rest.issues.getLabel({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                name: labelName,
-              });
-            } catch (e) {
-              if (e.status === 404) {
-                await github.rest.issues.createLabel({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  name: labelName,
-                  color: 'ededed',           // neutral gray
-                  description: 'External contributor PR',
-                });
-              } else {
-                core.setFailed(`Failed to ensure label exists: ${e.status} ${e.message}`);
-                return;
-              }
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const pr = context.payload.pull_request;
+
+            const prNumber = pr.number;
+            const author = pr.user.login;
+            const assoc = pr.author_association; // OWNER, MEMBER, COLLABORATOR, CONTRIBUTOR, FIRST_TIMER, NONE
+            const existing = new Set((pr.labels || []).map(l => l.name));
+
+            core.info(`PR #${prNumber} by @${author}, author_association=${assoc}`);
+            core.info(`Existing labels: ${Array.from(existing).join(', ') || '(none)'}`);
+
+            // Internal authors shouldn't get "community"
+            const isInternal = ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(assoc);
+            if (isInternal) {
+              core.info('Internal author; not adding label.');
+              return;
             }
 
-            // Add label
+            // External contributors: add the label if not present
+            if (existing.has(labelName)) {
+              core.info(`"${labelName}" already present; nothing to do.`);
+              return;
+            }
+
             await github.rest.issues.addLabels({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: pr.number,
+              owner,
+              repo,
+              issue_number: prNumber,
               labels: [labelName],
             });
-            core.info(`Added label "${labelName}" to PR #${pr.number}.`);
+            core.info(`Added label "${labelName}" to PR #${prNumber}.`);
