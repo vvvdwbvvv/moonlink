@@ -1,10 +1,11 @@
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::error;
 use std::fmt;
 use std::panic::Location;
 use std::sync::Arc;
 
 /// Error status categories
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ErrorStatus {
     /// Temporary errors that can be resolved by retrying (e.g., rate limits, timeouts)
     Temporary,
@@ -22,12 +23,37 @@ impl fmt::Display for ErrorStatus {
 }
 
 /// Custom error struct for moonlink
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ErrorStruct {
     pub message: String,
     pub status: ErrorStatus,
+    #[serde(
+        serialize_with = "serialize_error_source",
+        deserialize_with = "deserialize_error_source"
+    )]
     pub source: Option<Arc<anyhow::Error>>,
-    pub location: Option<&'static Location<'static>>,
+    pub location: Option<String>,
+}
+
+fn serialize_error_source<S>(
+    error: &Option<Arc<anyhow::Error>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    match error {
+        Some(err) => serializer.serialize_str(&err.to_string()),
+        None => serializer.serialize_none(),
+    }
+}
+
+fn deserialize_error_source<'de, D>(deserializer: D) -> Result<Option<Arc<anyhow::Error>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s: Option<String> = Option::deserialize(deserializer)?;
+    Ok(s.map(|msg| Arc::new(anyhow::anyhow!(msg))))
 }
 
 impl fmt::Display for ErrorStruct {
@@ -35,13 +61,7 @@ impl fmt::Display for ErrorStruct {
         write!(f, "{} ({})", self.message, self.status)?;
 
         if let Some(location) = &self.location {
-            write!(
-                f,
-                " at {}:{}:{}",
-                location.file(),
-                location.line(),
-                location.column()
-            )?;
+            write!(f, " at {location}")?;
         }
 
         if let Some(source) = &self.source {
@@ -56,11 +76,17 @@ impl ErrorStruct {
     /// Creates a new ErrorStruct with the provided location.
     #[track_caller]
     pub fn new(message: String, status: ErrorStatus) -> Self {
+        let location = Location::caller();
         Self {
             message,
             status,
             source: None,
-            location: Some(Location::caller()),
+            location: Some(format!(
+                "{}:{}:{}",
+                location.file(),
+                location.line(),
+                location.column()
+            )),
         }
     }
 
@@ -146,5 +172,35 @@ mod tests {
         // Check the location matches the pattern error.rs:number:number
         let re_pattern = Regex::new(r"error\.rs:\d+:\d+").unwrap();
         assert!(re_pattern.is_match(&location_str));
+    }
+
+    #[test]
+    fn test_error_struct_with_source_serialization() {
+        use std::io;
+
+        // Create an ErrorStruct with a source error
+        let io_error = io::Error::new(io::ErrorKind::NotFound, "Test file not found");
+        let error = ErrorStruct::new("IO operation failed".to_string(), ErrorStatus::Permanent)
+            .with_source(io_error);
+
+        // Serialize
+        let serialized = serde_json::to_string(&error).expect("Failed to serialize");
+
+        // Check that serialized JSON contains expected fields
+        assert!(serialized.contains("Test file not found"));
+        assert!(serialized.contains("Permanent"));
+        assert!(serialized.contains("error.rs"));
+
+        // Deserialize
+        let deserialized: ErrorStruct =
+            serde_json::from_str(&serialized).expect("Failed to deserialize");
+
+        assert_eq!(deserialized.message, error.message);
+        assert_eq!(deserialized.status, error.status);
+        assert!(deserialized.source.is_some());
+
+        // The source should be recreated as type anyhow::Error
+        let source = deserialized.source.unwrap();
+        assert!(source.to_string().contains("Test file not found"));
     }
 }
