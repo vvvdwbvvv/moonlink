@@ -176,7 +176,7 @@ impl ReadStateManager {
             self.last_read_lsn.store(effective_lsn, Ordering::Release);
             *last_read_state_guard = snapshot_read_output
                 .take_as_read_state(self.read_state_filepath_remap.clone())
-                .await;
+                .await?;
         }
         Ok(last_read_state_guard.clone())
     }
