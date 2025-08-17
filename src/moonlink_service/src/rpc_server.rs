@@ -3,7 +3,7 @@ use arrow_ipc::writer::StreamWriter;
 use moonlink_backend::MoonlinkBackend;
 use moonlink_rpc::{read, write, Request, Table};
 use std::collections::HashMap;
-use std::error;
+use std::error::Error as StdError;
 use std::io::ErrorKind::{BrokenPipe, ConnectionReset, UnexpectedEof};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -31,14 +31,15 @@ pub async fn start_unix_server(
         let backend = Arc::clone(&backend);
         tokio::spawn(async move {
             match handle_stream(backend, stream).await {
-                Err(Error::Rpc(moonlink_rpc::Error::Io(e)))
-                    if error::Error::source(&e)
+                Err(Error::Rpc(error_struct))
+                    if error_struct
+                        .source()
                         .and_then(|src| src.downcast_ref::<std::io::Error>())
                         .map(|io_err| {
                             matches!(io_err.kind(), BrokenPipe | ConnectionReset | UnexpectedEof)
                         })
                         .unwrap_or(false) => {}
-                Err(e) => panic!("{e}"),
+                Err(e) => panic!("Unexpected Unix RPC server error: {e}"),
                 Ok(()) => {}
             }
         });
@@ -55,14 +56,15 @@ pub async fn start_tcp_server(backend: Arc<MoonlinkBackend>, addr: SocketAddr) -
         let backend = Arc::clone(&backend);
         tokio::spawn(async move {
             match handle_stream(backend, stream).await {
-                Err(Error::Rpc(moonlink_rpc::Error::Io(e)))
-                    if error::Error::source(&e)
+                Err(Error::Rpc(error_struct))
+                    if error_struct
+                        .source()
                         .and_then(|src| src.downcast_ref::<std::io::Error>())
                         .map(|io_err| {
                             matches!(io_err.kind(), BrokenPipe | ConnectionReset | UnexpectedEof)
                         })
                         .unwrap_or(false) => {}
-                Err(e) => panic!("{e}"),
+                Err(e) => panic!("Unexpected TCP RPC server error: {e}"),
                 Ok(()) => {}
             }
         });
