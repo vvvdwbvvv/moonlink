@@ -11,6 +11,7 @@ use crate::error::Result;
 use crate::sqlite::sqlite_conn_wrapper::SqliteConnWrapper;
 use crate::sqlite::utils;
 use moonlink::{MoonlinkTableConfig, MoonlinkTableSecret};
+use moonlink_error::{ErrorStatus, ErrorStruct};
 
 /// Default sqlite database filename.
 const METADATA_DATABASE_FILENAME: &str = "moonlink_metadata_store.sqlite";
@@ -140,7 +141,10 @@ impl MetadataStoreTrait for SqliteMetadataStore {
         .await?
         .rows_affected();
         if rows_affected != 1 {
-            return Err(Error::SqliteRowCountError(1, rows_affected as u32));
+            return Err(Error::SqliteRowCountError(ErrorStruct::new(
+                format!("expected 1 row affected, but got {rows_affected}"),
+                ErrorStatus::Permanent,
+            )));
         }
 
         // Insert into mooncake_secrets if present
@@ -163,7 +167,10 @@ impl MetadataStoreTrait for SqliteMetadataStore {
             .await?
             .rows_affected();
             if rows_affected != 1 {
-                return Err(Error::SqliteRowCountError(1, rows_affected as u32));
+                return Err(Error::SqliteRowCountError(ErrorStruct::new(
+                    format!("expected 1 row affected, but got {rows_affected}"),
+                    ErrorStatus::Permanent,
+                )));
             }
         }
 
@@ -190,7 +197,10 @@ impl MetadataStoreTrait for SqliteMetadataStore {
         .await?
         .rows_affected();
         if rows_affected != 1 {
-            return Err(Error::SqliteRowCountError(1, rows_affected as u32));
+            return Err(Error::SqliteRowCountError(ErrorStruct::new(
+                format!("expected 1 row affected, but got {rows_affected}"),
+                ErrorStatus::Permanent,
+            )));
         }
 
         // Delete from secret table.

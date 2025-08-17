@@ -8,6 +8,7 @@ use crate::postgres::pg_client_wrapper::PgClientWrapper;
 use crate::postgres::utils;
 use moonlink::MoonlinkTableConfig;
 use moonlink::MoonlinkTableSecret;
+use moonlink_error::{ErrorStatus, ErrorStruct};
 
 use async_trait::async_trait;
 use postgres_types::Json as PgJson;
@@ -138,7 +139,10 @@ impl MetadataStoreTrait for PgMetadataStore {
             )
             .await?;
         if rows_affected != 1 {
-            return Err(Error::PostgresRowCountError(1, rows_affected as u32));
+            return Err(Error::PostgresRowCountError(ErrorStruct::new(
+                format!("expected 1 row affected, but got {rows_affected}"),
+                ErrorStatus::Permanent,
+            )));
         }
 
         // Persist table secrets.
@@ -161,7 +165,10 @@ impl MetadataStoreTrait for PgMetadataStore {
                 )
                 .await?;
             if rows_affected != 1 {
-                return Err(Error::PostgresRowCountError(1, rows_affected as u32));
+                return Err(Error::PostgresRowCountError(ErrorStruct::new(
+                    format!("expected 1 row affected, but got {rows_affected}"),
+                    ErrorStatus::Permanent,
+                )));
             }
         }
 
@@ -190,7 +197,10 @@ impl MetadataStoreTrait for PgMetadataStore {
             )
             .await?;
         if rows_affected != 1 {
-            return Err(Error::PostgresRowCountError(1, rows_affected as u32));
+            return Err(Error::PostgresRowCountError(ErrorStruct::new(
+                format!("expected 1 row affected, but got {rows_affected}"),
+                ErrorStatus::Permanent,
+            )));
         }
 
         // Delete rows for secret table, intentionally no check affected row counts.
