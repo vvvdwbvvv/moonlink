@@ -1,8 +1,5 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow::datatypes::Schema as ArrowSchema;
-use arrow::datatypes::{DataType, Field};
 use arrow_array::{Int32Array, RecordBatch, StringArray};
 use bytes::Bytes;
 use moonlink::decode_serialized_read_state_for_testing;
@@ -11,6 +8,7 @@ use serde_json::json;
 use serial_test::serial;
 use tokio::net::TcpStream;
 
+use crate::test_utils::*;
 use crate::{start_with_config, ServiceConfig, READINESS_PROBE_PORT};
 use moonlink_rpc::{load_files, scan_table_begin, scan_table_end};
 
@@ -88,13 +86,16 @@ async fn create_table(client: &reqwest::Client, database: &str, table: &str) {
         .send()
         .await
         .unwrap();
-    assert!(response.status().is_success());
+    assert!(
+        response.status().is_success(),
+        "Response status is {response:?}"
+    );
 }
 
 /// Util function to load all record batches inside of the given [`path`].
 async fn read_all_batches(url: &str) -> Vec<RecordBatch> {
     let resp = reqwest::get(url).await.unwrap();
-    assert!(resp.status().is_success());
+    assert!(resp.status().is_success(), "Response status is {resp:?}");
     let data: Bytes = resp.bytes().await.unwrap();
     let reader = ParquetRecordBatchReaderBuilder::try_new(data)
         .unwrap()
@@ -104,32 +105,10 @@ async fn read_all_batches(url: &str) -> Vec<RecordBatch> {
     reader.into_iter().map(|b| b.unwrap()).collect()
 }
 
-/// Util function to create test arrow schema.
-fn create_test_arrow_schema() -> Arc<ArrowSchema> {
-    Arc::new(ArrowSchema::new(vec![
-        Field::new("id", DataType::Int32, /*nullable=*/ false).with_metadata(HashMap::from([(
-            "PARQUET:field_id".to_string(),
-            "0".to_string(),
-        )])),
-        Field::new("name", DataType::Utf8, /*nullable=*/ false).with_metadata(HashMap::from([(
-            "PARQUET:field_id".to_string(),
-            "1".to_string(),
-        )])),
-        Field::new("email", DataType::Utf8, /*nullable=*/ true).with_metadata(HashMap::from([(
-            "PARQUET:field_id".to_string(),
-            "2".to_string(),
-        )])),
-        Field::new("age", DataType::Int32, /*nullable=*/ true).with_metadata(HashMap::from([(
-            "PARQUET:field_id".to_string(),
-            "3".to_string(),
-        )])),
-    ]))
-}
-
 /// Test basic table creation, insertion and query.
 #[tokio::test]
 #[serial]
-async fn test_moonlink_standalone() {
+async fn test_moonlink_standalone_data_ingestion() {
     cleanup_directory(&get_moonlink_backend_dir()).await;
     let config = ServiceConfig {
         base_path: get_moonlink_backend_dir(),
@@ -164,7 +143,10 @@ async fn test_moonlink_standalone() {
         .send()
         .await
         .unwrap();
-    assert!(response.status().is_success());
+    assert!(
+        response.status().is_success(),
+        "Response status is {response:?}"
+    );
 
     // Scan table and get data file and puffin files back.
     let mut moonlink_stream = TcpStream::connect(MOONLINK_ADDR).await.unwrap();
@@ -206,6 +188,193 @@ async fn test_moonlink_standalone() {
 
     // Cleanup shared directory.
     cleanup_directory(&get_moonlink_backend_dir()).await;
+}
+
+/// Test basic table creation, file upload and query.
+#[tokio::test]
+#[serial]
+async fn test_moonlink_standalone_file_upload() {
+    let moonlink_backend_dir = get_moonlink_backend_dir();
+    cleanup_directory(&moonlink_backend_dir).await;
+    let config = ServiceConfig {
+        base_path: moonlink_backend_dir.clone(),
+        data_server_uri: Some(NGINX_ADDR.to_string()),
+        rest_api_port: Some(3030),
+        tcp_port: Some(3031),
+    };
+    tokio::spawn(async move {
+        start_with_config(config).await.unwrap();
+    });
+    test_readiness_probe().await;
+
+    // Create test table.
+    let client = reqwest::Client::new();
+    create_table(&client, DATABASE, TABLE).await;
+
+    // Upload a file.
+    let parquet_file = generate_parquet_file(&moonlink_backend_dir).await;
+    let file_upload_payload = json!({
+        "operation": "upload",
+        "files": [parquet_file],
+        "storage_config": {
+            "fs": {
+                "root_directory": get_moonlink_backend_dir(),
+                "atomic_write_dir": get_moonlink_backend_dir()
+            }
+        }
+    });
+    let crafted_src_table_name = format!("{DATABASE}.{TABLE}");
+    let response = client
+        .post(format!("{REST_ADDR}/upload/{crafted_src_table_name}"))
+        .header("content-type", "application/json")
+        .json(&file_upload_payload)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "Response status is {response:?}"
+    );
+
+    // Scan table and get data file and puffin files back.
+    let mut moonlink_stream = TcpStream::connect(MOONLINK_ADDR).await.unwrap();
+    let bytes = scan_table_begin(
+        &mut moonlink_stream,
+        DATABASE.to_string(),
+        TABLE.to_string(),
+        // Only one event generated, with commit LSN 1.
+        /*lsn=*/ 1,
+    )
+    .await
+    .unwrap();
+    let (data_file_paths, puffin_file_paths, puffin_deletion, positional_deletion) =
+        decode_serialized_read_state_for_testing(bytes);
+    assert_eq!(data_file_paths.len(), 1);
+    let record_batches = read_all_batches(&data_file_paths[0]).await;
+    let expected_arrow_batch = RecordBatch::try_new(
+        create_test_arrow_schema(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])),
+            Arc::new(StringArray::from(vec![
+                "Alice@gmail.com",
+                "Bob@gmail.com",
+                "Charlie@gmail.com",
+            ])),
+            Arc::new(Int32Array::from(vec![10, 20, 30])),
+        ],
+    )
+    .unwrap();
+    assert_eq!(record_batches, vec![expected_arrow_batch]);
+
+    assert!(puffin_file_paths.is_empty());
+    assert!(puffin_deletion.is_empty());
+    assert!(positional_deletion.is_empty());
+
+    scan_table_end(
+        &mut moonlink_stream,
+        DATABASE.to_string(),
+        TABLE.to_string(),
+    )
+    .await
+    .unwrap();
+
+    // Cleanup shared directory.
+    cleanup_directory(&moonlink_backend_dir).await;
+}
+
+/// Test basic table creation, file insert and query.
+#[tokio::test]
+#[serial]
+async fn test_moonlink_standalone_file_insert() {
+    let moonlink_backend_dir = get_moonlink_backend_dir();
+    cleanup_directory(&moonlink_backend_dir).await;
+    let config = ServiceConfig {
+        base_path: moonlink_backend_dir.clone(),
+        data_server_uri: Some(NGINX_ADDR.to_string()),
+        rest_api_port: Some(3030),
+        tcp_port: Some(3031),
+    };
+    tokio::spawn(async move {
+        start_with_config(config).await.unwrap();
+    });
+    test_readiness_probe().await;
+
+    // Create test table.
+    let client = reqwest::Client::new();
+    create_table(&client, DATABASE, TABLE).await;
+
+    // Upload a file.
+    let parquet_file = generate_parquet_file(&moonlink_backend_dir).await;
+    let file_upload_payload = json!({
+        "operation": "insert",
+        "files": [parquet_file],
+        "storage_config": {
+            "fs": {
+                "root_directory": get_moonlink_backend_dir(),
+                "atomic_write_dir": get_moonlink_backend_dir()
+            }
+        }
+    });
+    let crafted_src_table_name = format!("{DATABASE}.{TABLE}");
+    let response = client
+        .post(format!("{REST_ADDR}/upload/{crafted_src_table_name}"))
+        .header("content-type", "application/json")
+        .json(&file_upload_payload)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "Response status is {response:?}"
+    );
+
+    // Scan table and get data file and puffin files back.
+    let mut moonlink_stream = TcpStream::connect(MOONLINK_ADDR).await.unwrap();
+    let bytes = scan_table_begin(
+        &mut moonlink_stream,
+        DATABASE.to_string(),
+        TABLE.to_string(),
+        // Four events generated: three appends and one commit, with commit LSN 4.
+        /*lsn=*/
+        4,
+    )
+    .await
+    .unwrap();
+    let (data_file_paths, puffin_file_paths, puffin_deletion, positional_deletion) =
+        decode_serialized_read_state_for_testing(bytes);
+    assert_eq!(data_file_paths.len(), 1);
+    let record_batches = read_all_batches(&data_file_paths[0]).await;
+    let expected_arrow_batch = RecordBatch::try_new(
+        create_test_arrow_schema(),
+        vec![
+            Arc::new(Int32Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])),
+            Arc::new(StringArray::from(vec![
+                "Alice@gmail.com",
+                "Bob@gmail.com",
+                "Charlie@gmail.com",
+            ])),
+            Arc::new(Int32Array::from(vec![10, 20, 30])),
+        ],
+    )
+    .unwrap();
+    assert_eq!(record_batches, vec![expected_arrow_batch]);
+
+    assert!(puffin_file_paths.is_empty());
+    assert!(puffin_deletion.is_empty());
+    assert!(positional_deletion.is_empty());
+
+    scan_table_end(
+        &mut moonlink_stream,
+        DATABASE.to_string(),
+        TABLE.to_string(),
+    )
+    .await
+    .unwrap();
+
+    // Cleanup shared directory.
+    cleanup_directory(&moonlink_backend_dir).await;
 }
 
 /// Testing scenario: two tables with the same name, but under different databases are created.
