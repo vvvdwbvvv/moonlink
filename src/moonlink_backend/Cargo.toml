@@ -9,6 +9,7 @@ default = ["storage-fs"]
 
 profiling = ["console-subscriber"]
 test-utils = ["moonlink/test-utils"]
+metadata-postgres = ["moonlink_metadata_store/metadata-postgres"]
 
 storage-s3 = ["moonlink/storage-s3"]
 storage-gcs = ["moonlink/storage-gcs"]
@@ -20,6 +21,7 @@ arrow-schema = { workspace = true }
 console-subscriber = { version = "0.4", optional = true }
 moonlink = { path = "../moonlink", features = ["test-utils"] }
 moonlink_connectors = { path = "../moonlink_connectors" }
+moonlink_error = { path = "../moonlink_error" }
 moonlink_metadata_store = { path = "../moonlink_metadata_store" }
 more-asserts = { workspace = true }
 nix = { workspace = true }
