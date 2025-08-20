@@ -22,7 +22,15 @@ mod tests {
     async fn test_moonlink_service() {
         let (guard, client) = TestGuard::new(Some("test"), true).await;
         let backend = guard.backend();
+        // Till now, table already created at backend.
+
+        // First round of table operations.
+        backend
+            .drop_table(DATABASE.to_string(), TABLE.to_string())
+            .await;
         smoke_create_and_insert(guard.tmp().unwrap(), backend, &client, SRC_URI).await;
+
+        // Second round of table operations.
         backend
             .drop_table(DATABASE.to_string(), TABLE.to_string())
             .await;
