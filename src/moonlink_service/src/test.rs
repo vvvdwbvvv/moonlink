@@ -89,6 +89,15 @@ fn get_create_table_payload(database: &str, table: &str, append_only: bool) -> s
     create_table_payload
 }
 
+/// Util function to get table drop payload.
+fn get_drop_table_payload(database: &str, table: &str) -> serde_json::Value {
+    let drop_table_payload = json!({
+        "database": database,
+        "table": table
+    });
+    drop_table_payload
+}
+
 /// Util function to create table via REST API.
 async fn create_table(client: &reqwest::Client, database: &str, table: &str, append_only: bool) {
     // REST API doesn't allow duplicate source table name.
@@ -97,6 +106,23 @@ async fn create_table(client: &reqwest::Client, database: &str, table: &str, app
     let payload = get_create_table_payload(database, table, append_only);
     let response = client
         .post(format!("{REST_ADDR}/tables/{crafted_src_table_name}"))
+        .header("content-type", "application/json")
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "Response status is {response:?}"
+    );
+}
+
+/// Util function to drop table via REST API.
+async fn drop_table(client: &reqwest::Client, database: &str, table: &str) {
+    let payload = get_drop_table_payload(database, table);
+    let crafted_src_table_name = format!("{database}.{table}");
+    let response = client
+        .delete(format!("{REST_ADDR}/tables/{crafted_src_table_name}"))
         .header("content-type", "application/json")
         .json(&payload)
         .send()
@@ -449,6 +475,33 @@ async fn test_multiple_tables_creation() {
         /*append_only=*/ false,
     )
     .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_drop_table() {
+    cleanup_directory(&get_moonlink_backend_dir()).await;
+    let config = get_service_config();
+    tokio::spawn(async move {
+        start_with_config(config).await.unwrap();
+    });
+    test_readiness_probe().await;
+
+    // Create test table.
+    let client = reqwest::Client::new();
+    create_table(&client, DATABASE, TABLE, /*append_only=*/ false).await;
+
+    // List table before drop.
+    let mut moonlink_stream = TcpStream::connect(MOONLINK_ADDR).await.unwrap();
+    let list_results = list_tables(&mut moonlink_stream).await.unwrap();
+    assert_eq!(list_results.len(), 1);
+
+    // Drop test table.
+    drop_table(&client, DATABASE, TABLE).await;
+
+    // List table before drop.
+    let list_results = list_tables(&mut moonlink_stream).await.unwrap();
+    assert_eq!(list_results.len(), 0);
 }
 
 /// Testing scenario: create multiple tables, and check list table result.
