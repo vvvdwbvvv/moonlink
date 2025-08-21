@@ -5,14 +5,24 @@ mod tests {
     use crate::common::{ids_from_state, SRC_URI};
 
     use super::common::{
-        assert_scan_ids_eq, crash_and_recover_backend_with_guard, current_wal_lsn,
-        smoke_create_and_insert, TestGuard, TestGuardMode, DATABASE, TABLE,
+        assert_scan_ids_eq, crash_and_recover_backend_with_guard, create_backend_from_base_path,
+        current_wal_lsn, get_serialized_table_config, smoke_create_and_insert, TestGuard,
+        TestGuardMode, DATABASE, TABLE,
     };
-    use moonlink_backend::table_status::TableStatus;
+    use moonlink_backend::EventRequest;
+    use moonlink_backend::MoonlinkBackend;
+    use moonlink_backend::{
+        table_status::TableStatus, RowEventOperation, RowEventRequest, REST_API_URI,
+    };
     use moonlink_metadata_store::{base_metadata_store::MetadataStoreTrait, SqliteMetadataStore};
 
+    use arrow::datatypes::Schema as ArrowSchema;
+    use arrow_schema::{DataType, Field};
+    use serde_json::json;
     use serial_test::serial;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
+    use std::time::SystemTime;
+    use tempfile::TempDir;
 
     // ───────────────────────────── Tests ─────────────────────────────
 
@@ -398,14 +408,94 @@ mod tests {
         .await;
     }
 
+    /// Test recovery for rest ingested table.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn test_recovery_for_rest_table() {
+        let temp_dir = TempDir::new().unwrap();
+        let metadata_store_accessor =
+            SqliteMetadataStore::new_with_directory(temp_dir.path().to_str().unwrap())
+                .await
+                .unwrap();
+        let mut backend = MoonlinkBackend::new(
+            temp_dir.path().to_str().unwrap().into(),
+            /*data_server_uri=*/ None,
+            Box::new(metadata_store_accessor),
+        )
+        .await
+        .unwrap();
+        backend.initialize_event_api().await.unwrap();
+
+        // Create a rest table.
+        let arrow_schema = ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false).with_metadata(HashMap::from([(
+                "PARQUET:field_id".to_string(),
+                "0".to_string(),
+            )])),
+            Field::new("name", DataType::Utf8, true).with_metadata(HashMap::from([(
+                "PARQUET:field_id".to_string(),
+                "1".to_string(),
+            )])),
+            Field::new("age", DataType::Int32, false).with_metadata(HashMap::from([(
+                "PARQUET:field_id".to_string(),
+                "2".to_string(),
+            )])),
+        ]);
+        backend
+            .create_table(
+                DATABASE.to_string(),
+                TABLE.to_string(),
+                "public.recovery_for_rest_table".to_string(),
+                REST_API_URI.to_string(),
+                get_serialized_table_config(&temp_dir),
+                Some(arrow_schema),
+            )
+            .await
+            .unwrap();
+
+        // Ingest data into table.
+        let row_event_request = RowEventRequest {
+            src_table_name: "public.recovery_for_rest_table".to_string(),
+            operation: RowEventOperation::Insert,
+            payload: json!({
+                "id": 1,
+                "name": "Alice Johnson",
+                "age": 30
+            }),
+            timestamp: SystemTime::now(),
+        };
+        let rest_event_request = EventRequest::RowRequest(row_event_request);
+        backend
+            .send_event_request(rest_event_request)
+            .await
+            .unwrap();
+
+        // Force snapshot with LSN 2, LSN 1 = row insertion, LSN 2 = commit.
+        backend
+            .create_snapshot(DATABASE.to_string(), TABLE.to_string(), /*lsn=*/ 2)
+            .await
+            .unwrap();
+
+        // Crash backend recovery and recreate backend.
+        backend.shutdown_connection(REST_API_URI, false).await;
+        backend =
+            create_backend_from_base_path(temp_dir.path().to_str().unwrap().to_string()).await;
+        assert_scan_ids_eq(
+            &backend,
+            DATABASE.to_string(),
+            TABLE.to_string(),
+            /*lsn=*/ 2,
+            [1],
+        )
+        .await;
+    }
+
     #[cfg(feature = "test-utils")]
     use super::common::{assert_scan_nonunique_ids_eq, crash_and_recover_backend};
     #[cfg(feature = "test-utils")]
     use crate::common::nonunique_ids_from_state;
     #[cfg(feature = "test-utils")]
     use rstest::*;
-    #[cfg(feature = "test-utils")]
-    use std::collections::HashMap;
 
     /// Multiple failures and recovery from just the WAL
     #[cfg(feature = "test-utils")]
