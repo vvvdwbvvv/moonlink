@@ -32,8 +32,8 @@ pub enum Error {
     #[error("{0}")]
     MoonlinkMetadataStoreError(ErrorStruct),
 
-    #[error("Invalid argument: {0}")]
-    InvalidArgumentError(String),
+    #[error("{0}")]
+    InvalidArgumentError(ErrorStruct),
 
     #[error("{0}")]
     TokioWatchRecvError(ErrorStruct),
@@ -46,6 +46,13 @@ pub enum Error {
 }
 
 pub type Result<T> = result::Result<T, Error>;
+
+impl Error {
+    #[track_caller]
+    pub fn invalid_argument(message: String) -> Self {
+        Self::InvalidArgumentError(ErrorStruct::new(message, ErrorStatus::Permanent))
+    }
+}
 
 impl From<PostgresSourceError> for Error {
     #[track_caller]
