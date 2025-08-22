@@ -143,6 +143,7 @@ where
                     .map(|table| Table {
                         database: table.database,
                         table: table.table,
+                        cardinality: table.cardinality,
                         commit_lsn: table.commit_lsn,
                         flush_lsn: table.flush_lsn,
                         iceberg_warehouse_location: table.iceberg_warehouse_location,
