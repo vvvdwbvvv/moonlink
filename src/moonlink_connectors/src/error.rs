@@ -3,6 +3,7 @@ use crate::pg_replicate::postgres_source::{
 };
 use crate::rest_ingest::rest_source::RestSourceError;
 use crate::rest_ingest::{json_converter, SrcTableId};
+use anyhow;
 use moonlink::Error as MoonlinkError;
 use moonlink_error::{io_error_utils, ErrorStatus, ErrorStruct};
 use serde::{Deserialize, Serialize};
@@ -36,32 +37,32 @@ pub enum Error {
     MpscChannelSendError(ErrorStruct),
 
     // Requested database table not found.
-    #[error("Table {0} not found")]
-    TableNotFound(String),
+    #[error("{0}")]
+    TableNotFound(ErrorStruct),
 
     // Invalid source type for operation.
-    #[error("Invalid source type: {0}")]
-    InvalidSourceType(String),
+    #[error("{0}")]
+    InvalidSourceType(ErrorStruct),
 
     // Table replication error: duplicate table.
-    #[error("Duplicate table added to replication: {0}")]
-    ReplDuplicateTable(String),
+    #[error("{0}")]
+    ReplDuplicateTable(ErrorStruct),
 
     // REST API error.
-    #[error("REST API error: {0}")]
-    RestApi(String),
+    #[error("{0}")]
+    RestApi(ErrorStruct),
 
     // REST source error.
     #[error("{0}")]
     RestSource(ErrorStruct),
 
     // REST source error: duplicate source table to add.
-    #[error("REST source error: duplicate source table to add with table id {0}")]
-    RestDuplicateTable(SrcTableId),
+    #[error("{0}")]
+    RestDuplicateTable(ErrorStruct),
 
     // REST source error: non-existent source table to remove.
-    #[error("REST source error: non-existent source table to remove with table id {0}")]
-    RestNonExistentTable(SrcTableId),
+    #[error("{0}")]
+    RestNonExistentTable(ErrorStruct),
 
     // REST source error: conversion from payload to moonlink row fails.
     #[error("{0}")]
@@ -73,6 +74,70 @@ pub enum Error {
 }
 
 pub type Result<T> = result::Result<T, Error>;
+
+impl Error {
+    #[track_caller]
+    pub fn rest_duplicate_table(id: SrcTableId) -> Self {
+        Error::RestDuplicateTable(ErrorStruct {
+            message: format!("REST source error: duplicate source table to add with table id {id}"),
+            status: ErrorStatus::Permanent,
+            source: None,
+            location: Some(Location::caller().to_string()),
+        })
+    }
+
+    #[track_caller]
+    pub fn table_not_found(table_name: String) -> Self {
+        Error::TableNotFound(ErrorStruct {
+            message: format!("Table {table_name} not found"),
+            status: ErrorStatus::Permanent,
+            source: None,
+            location: Some(Location::caller().to_string()),
+        })
+    }
+
+    #[track_caller]
+    pub fn invalid_source_type(desc: String) -> Self {
+        Error::InvalidSourceType(ErrorStruct {
+            message: format!("Invalid source type: {desc}"),
+            status: ErrorStatus::Permanent,
+            source: None,
+            location: Some(Location::caller().to_string()),
+        })
+    }
+
+    #[track_caller]
+    pub fn repl_duplicate_table(table_name: String) -> Self {
+        Error::ReplDuplicateTable(ErrorStruct {
+            message: format!("Duplicate table added to replication: {table_name}"),
+            status: ErrorStatus::Permanent,
+            source: None,
+            location: Some(Location::caller().to_string()),
+        })
+    }
+
+    #[track_caller]
+    pub fn rest_api(err_msg: String, err: Option<Arc<anyhow::Error>>) -> Self {
+        Error::RestApi(ErrorStruct {
+            message: format!("REST API error: {err_msg}"),
+            status: ErrorStatus::Permanent,
+            source: err,
+            location: Some(Location::caller().to_string()),
+        })
+    }
+
+    #[track_caller]
+    pub fn rest_non_existent_table(id: SrcTableId) -> Self {
+        Error::RestNonExistentTable(ErrorStruct {
+            message: format!(
+                "REST source error: non-existent source table to remove with table id {id}"
+            ),
+            status: ErrorStatus::Permanent,
+            source: None,
+            location: Some(Location::caller().to_string()),
+        })
+    }
+}
 
 impl From<MoonlinkError> for Error {
     #[track_caller]

@@ -109,10 +109,12 @@ impl RestApiConnection {
             persist_lsn,
         };
 
-        self.cmd_tx
-            .send(command)
-            .await
-            .map_err(|e| crate::Error::RestApi(format!("Failed to send add table command: {e}")))?;
+        self.cmd_tx.send(command).await.map_err(|e| {
+            crate::Error::rest_api(
+                format!("Failed to send add table command: {e}"),
+                Some(Arc::new(e.into())),
+            )
+        })?;
 
         Ok(())
     }
@@ -125,7 +127,10 @@ impl RestApiConnection {
         };
 
         self.cmd_tx.send(command).await.map_err(|e| {
-            crate::Error::RestApi(format!("Failed to send drop table command: {e}"))
+            crate::Error::rest_api(
+                format!("Failed to send drop table command: {e}"),
+                Some(Arc::new(e.into())),
+            )
         })?;
 
         Ok(())
@@ -142,10 +147,12 @@ impl RestApiConnection {
     }
 
     pub async fn shutdown_replication(&mut self) -> Result<()> {
-        self.cmd_tx
-            .send(RestCommand::Shutdown)
-            .await
-            .map_err(|e| crate::Error::RestApi(format!("Failed to send shutdown command: {e}")))?;
+        self.cmd_tx.send(RestCommand::Shutdown).await.map_err(|e| {
+            crate::Error::rest_api(
+                format!("Failed to send shutdown command: {e}"),
+                Some(Arc::new(e.into())),
+            )
+        })?;
         Ok(())
     }
 
