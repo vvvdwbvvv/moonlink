@@ -400,12 +400,12 @@ impl MooncakeTable {
         &mut self,
         xact_id: u32,
         mut disk_slice: DiskSliceWriter,
-        flush_event_uuid: uuid::Uuid,
+        flush_event_id: uuid::Uuid,
     ) {
         // Record events for flush completion.
         if let Some(event_replay_tx) = &self.event_replay_tx {
             let table_event = replay_events::create_flush_event_completion(
-                flush_event_uuid,
+                flush_event_id,
                 disk_slice
                     .output_files()
                     .iter()
@@ -507,7 +507,12 @@ impl MooncakeTable {
         }
     }
 
-    pub fn flush_stream(&mut self, xact_id: u32, lsn: Option<u64>) -> Result<()> {
+    pub fn flush_stream(
+        &mut self,
+        xact_id: u32,
+        lsn: Option<u64>,
+        event_id: uuid::Uuid,
+    ) -> Result<()> {
         // Temporarily remove to drop reference to self
         let mut stream_state = self
             .transaction_stream_states
@@ -515,10 +520,9 @@ impl MooncakeTable {
             .expect("Stream state not found for xact_id, lsn: {xact_id, lsn}");
 
         // Record events for flush initiation.
-        let flush_event_id = uuid::Uuid::new_v4();
         if let Some(event_replay_tx) = &self.event_replay_tx {
             let table_event = replay_events::create_flush_event_initiation(
-                flush_event_id,
+                event_id,
                 /*xact_id=*/ Some(xact_id),
                 lsn,
                 stream_state.mem_slice.get_commit_check_point(),
@@ -534,12 +538,7 @@ impl MooncakeTable {
 
         stream_state.ongoing_flush_count += 1;
 
-        self.flush_disk_slice(
-            &mut disk_slice,
-            table_notify_tx,
-            Some(xact_id),
-            flush_event_id,
-        );
+        self.flush_disk_slice(&mut disk_slice, table_notify_tx, Some(xact_id), event_id);
 
         // Add back stream state
         self.transaction_stream_states.insert(xact_id, stream_state);
@@ -644,12 +643,17 @@ impl MooncakeTable {
     }
 
     /// Commit a transaction stream.
-    /// Flushes any remaining rows from stream mem slice
-    /// Adds all in mem batches and indices to next snapshot task
-    /// Updates deletion records
-    /// Enqueues `TransactionStreamOutput::Commit` for snapshot task
-    pub fn commit_transaction_stream(&mut self, xact_id: u32, lsn: u64) -> Result<()> {
-        self.flush_stream(xact_id, Some(lsn))?;
+    /// - Flushes any remaining rows from stream mem slice
+    /// - Adds all in mem batches and indices to next snapshot task
+    /// - Updates deletion records
+    /// - Enqueues `TransactionStreamOutput::Commit` for snapshot task
+    pub fn commit_transaction_stream(
+        &mut self,
+        xact_id: u32,
+        lsn: u64,
+        event_id: uuid::Uuid,
+    ) -> Result<()> {
+        self.flush_stream(xact_id, Some(lsn), event_id)?;
         self.commit_transaction_stream_impl(xact_id, lsn)
     }
 }

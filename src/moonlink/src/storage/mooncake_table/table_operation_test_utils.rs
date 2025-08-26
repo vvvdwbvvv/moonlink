@@ -11,8 +11,8 @@ use crate::storage::mooncake_table::{
     FileIndiceMergeResult, IcebergSnapshotPayload, IcebergSnapshotResult,
     TableMetadata as MooncakeTableMetadata,
 };
-use crate::storage::snapshot_options::MaintenanceOption;
 use crate::storage::snapshot_options::SnapshotOption;
+use crate::storage::snapshot_options::{IcebergSnapshotOption, MaintenanceOption};
 use crate::table_notify::{
     DataCompactionMaintenanceStatus, IndexMergeMaintenanceStatus, TableEvent,
 };
@@ -31,16 +31,17 @@ pub(crate) async fn flush_table_and_sync(
     receiver: &mut Receiver<TableEvent>,
     lsn: u64,
 ) -> Result<()> {
-    table.flush(lsn).unwrap();
+    let event_id = uuid::Uuid::new_v4();
+    table.flush(lsn, event_id).unwrap();
     let flush_result = receiver.recv().await.unwrap();
     match flush_result {
         TableEvent::FlushResult {
-            uuid,
+            event_id,
             xact_id: _,
             flush_result,
         } => match flush_result {
             Some(Ok(disk_slice)) => {
-                table.apply_flush_result(disk_slice, uuid);
+                table.apply_flush_result(disk_slice, event_id);
             }
             Some(Err(e)) => {
                 error!(error = ?e, "failed to flush disk slice");
@@ -64,11 +65,12 @@ pub(crate) async fn flush_table_and_sync_no_apply(
     receiver: &mut Receiver<TableEvent>,
     lsn: u64,
 ) -> Option<DiskSliceWriter> {
-    table.flush(lsn).unwrap();
+    let event_id = uuid::Uuid::new_v4();
+    table.flush(lsn, event_id).unwrap();
     let flush_result = receiver.recv().await.unwrap();
     match flush_result {
         TableEvent::FlushResult {
-            uuid: _,
+            event_id: _,
             xact_id: _,
             flush_result,
         } => match flush_result {
@@ -96,11 +98,12 @@ pub(crate) async fn flush_stream_and_sync_no_apply(
     xact_id: u32,
     lsn: Option<u64>,
 ) -> Option<DiskSliceWriter> {
-    table.flush_stream(xact_id, lsn).unwrap();
+    let event_id = uuid::Uuid::new_v4();
+    table.flush_stream(xact_id, lsn, event_id).unwrap();
     let flush_result = receiver.recv().await.unwrap();
     match flush_result {
         TableEvent::FlushResult {
-            uuid: _,
+            event_id: _,
             xact_id: _,
             flush_result,
         } => match flush_result {
@@ -128,16 +131,19 @@ pub(crate) async fn commit_transaction_stream_and_sync(
     xact_id: u32,
     lsn: u64,
 ) {
-    table.commit_transaction_stream(xact_id, lsn).unwrap();
+    let event_id = uuid::Uuid::new_v4();
+    table
+        .commit_transaction_stream(xact_id, lsn, event_id)
+        .unwrap();
     let flush_result = receiver.recv().await.unwrap();
     match flush_result {
         TableEvent::FlushResult {
-            uuid,
+            event_id,
             xact_id: Some(xact_id),
             flush_result,
         } => match flush_result {
             Some(Ok(disk_slice)) => {
-                table.apply_stream_flush_result(xact_id, disk_slice, uuid);
+                table.apply_stream_flush_result(xact_id, disk_slice, event_id);
             }
             Some(Err(e)) => {
                 error!(error = ?e, "failed to flush disk slice");
@@ -193,8 +199,8 @@ pub(crate) async fn perform_index_merge_for_test(
         uuid: uuid::Uuid::new_v4(),
         force_create: true,
         dump_snapshot: false,
-        skip_iceberg_snapshot: false,
-        index_merge_option: MaintenanceOption::BestEffort,
+        iceberg_snapshot_option: IcebergSnapshotOption::BestEffort(uuid::Uuid::new_v4()),
+        index_merge_option: MaintenanceOption::BestEffort(uuid::Uuid::new_v4()),
         data_compaction_option: MaintenanceOption::Skip,
     }));
     let (_, _, _, _, evicted_files_to_delete) = sync_mooncake_snapshot(table, receiver).await;
@@ -226,9 +232,9 @@ pub(crate) async fn perform_data_compaction_for_test(
         uuid: uuid::Uuid::new_v4(),
         force_create: true,
         dump_snapshot: false,
-        skip_iceberg_snapshot: false,
+        iceberg_snapshot_option: IcebergSnapshotOption::BestEffort(uuid::Uuid::new_v4()),
         index_merge_option: MaintenanceOption::Skip,
-        data_compaction_option: MaintenanceOption::BestEffort,
+        data_compaction_option: MaintenanceOption::BestEffort(uuid::Uuid::new_v4()),
     }));
     let (_, _, _, _, evicted_files_to_delete) = sync_mooncake_snapshot(table, receiver).await;
     // Delete evicted object storage cache entries immediately to make sure later accesses all happen on persisted files.
@@ -323,9 +329,9 @@ pub(crate) async fn create_mooncake_snapshot_for_test(
         uuid: uuid::Uuid::new_v4(),
         force_create: true,
         dump_snapshot: false,
-        skip_iceberg_snapshot: false,
-        data_compaction_option: MaintenanceOption::BestEffort,
-        index_merge_option: MaintenanceOption::BestEffort,
+        iceberg_snapshot_option: IcebergSnapshotOption::BestEffort(uuid::Uuid::new_v4()),
+        data_compaction_option: MaintenanceOption::BestEffort(uuid::Uuid::new_v4()),
+        index_merge_option: MaintenanceOption::BestEffort(uuid::Uuid::new_v4()),
     });
     assert!(mooncake_snapshot_created);
     sync_mooncake_snapshot(table, receiver).await
@@ -375,7 +381,7 @@ async fn sync_mooncake_snapshot_and_create_new_by_iceberg_payload(
         uuid: uuid::Uuid::new_v4(),
         force_create: true,
         dump_snapshot: false,
-        skip_iceberg_snapshot: true,
+        iceberg_snapshot_option: IcebergSnapshotOption::Skip,
         index_merge_option: MaintenanceOption::Skip,
         data_compaction_option: MaintenanceOption::Skip,
     }));
@@ -421,9 +427,9 @@ pub(crate) async fn create_mooncake_and_persist_for_data_compaction_for_test(
         uuid: uuid::Uuid::new_v4(),
         force_create: true,
         dump_snapshot: false,
-        skip_iceberg_snapshot: false,
+        iceberg_snapshot_option: IcebergSnapshotOption::BestEffort(uuid::Uuid::new_v4()),
         index_merge_option: MaintenanceOption::Skip,
-        data_compaction_option: MaintenanceOption::BestEffort,
+        data_compaction_option: MaintenanceOption::BestEffort(uuid::Uuid::new_v4()),
     };
     assert!(table.create_snapshot(force_snapshot_option.clone()));
 
@@ -472,9 +478,9 @@ pub(crate) async fn create_mooncake_and_persist_for_data_compaction_for_test(
         uuid: uuid::Uuid::new_v4(),
         force_create: true,
         dump_snapshot: false,
-        skip_iceberg_snapshot: false,
+        iceberg_snapshot_option: IcebergSnapshotOption::BestEffort(uuid::Uuid::new_v4()),
         index_merge_option: MaintenanceOption::Skip,
-        data_compaction_option: MaintenanceOption::BestEffort,
+        data_compaction_option: MaintenanceOption::BestEffort(uuid::Uuid::new_v4()),
     }));
     sync_mooncake_snapshot_and_create_new_by_iceberg_payload(table, receiver).await;
 }
@@ -490,9 +496,9 @@ pub(crate) async fn create_mooncake_and_iceberg_snapshot_for_index_merge_for_tes
         uuid: uuid::Uuid::new_v4(),
         force_create: true,
         dump_snapshot: false,
-        skip_iceberg_snapshot: false,
-        index_merge_option: MaintenanceOption::BestEffort,
-        data_compaction_option: MaintenanceOption::BestEffort,
+        iceberg_snapshot_option: IcebergSnapshotOption::BestEffort(uuid::Uuid::new_v4()),
+        index_merge_option: MaintenanceOption::BestEffort(uuid::Uuid::new_v4()),
+        data_compaction_option: MaintenanceOption::BestEffort(uuid::Uuid::new_v4()),
     };
     assert!(table.create_snapshot(force_snapshot_option.clone()));
 
@@ -529,9 +535,9 @@ pub(crate) async fn create_mooncake_and_iceberg_snapshot_for_index_merge_for_tes
         uuid: uuid::Uuid::new_v4(),
         force_create: true,
         dump_snapshot: false,
-        skip_iceberg_snapshot: false,
-        index_merge_option: MaintenanceOption::BestEffort,
-        data_compaction_option: MaintenanceOption::BestEffort,
+        iceberg_snapshot_option: IcebergSnapshotOption::BestEffort(uuid::Uuid::new_v4()),
+        index_merge_option: MaintenanceOption::BestEffort(uuid::Uuid::new_v4()),
+        data_compaction_option: MaintenanceOption::BestEffort(uuid::Uuid::new_v4()),
     }));
     sync_mooncake_snapshot_and_create_new_by_iceberg_payload(table, receiver).await;
 }

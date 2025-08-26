@@ -1,4 +1,4 @@
-use std::collections::{btree_map, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 use crate::storage::cache::object_storage::cache_config::ObjectStorageCacheConfig;
 use crate::storage::cache::object_storage::object_storage_cache::ObjectStorageCache;
@@ -124,7 +124,7 @@ async fn create_mooncake_table_for_replay(
 
 pub(crate) async fn replay() {
     // TODO(hjiang): Take an command line argument.
-    let replay_filepath = "/tmp/chaos_test_5x1yp1jigz5d";
+    let replay_filepath = "/tmp/chaos_test_tyxmnalugbgf";
     let cache_temp_dir = tempdir().unwrap();
     let table_temp_dir = tempdir().unwrap();
     let iceberg_temp_dir = tempdir().unwrap();
@@ -173,9 +173,9 @@ pub(crate) async fn replay() {
     let mut snapshot_disk_files = HashSet::new();
     // Pending background tasks to issue.
     // Maps from event id to payload.
-    let pending_iceberg_snapshot_payloads = Arc::new(Mutex::new(btree_map::BTreeMap::new()));
-    let pending_index_merge_payloads = Arc::new(Mutex::new(btree_map::BTreeMap::new()));
-    let pending_data_compaction_payloads = Arc::new(Mutex::new(btree_map::BTreeMap::new()));
+    let pending_iceberg_snapshot_payloads = Arc::new(Mutex::new(HashMap::new()));
+    let pending_index_merge_payloads = Arc::new(Mutex::new(HashMap::new()));
+    let pending_data_compaction_payloads = Arc::new(Mutex::new(HashMap::new()));
     let pending_iceberg_snapshot_payloads_clone = pending_iceberg_snapshot_payloads.clone();
     let pending_index_merge_payloads_clone = pending_index_merge_payloads.clone();
     let pending_data_compaction_payloads_clone = pending_data_compaction_payloads.clone();
@@ -191,7 +191,7 @@ pub(crate) async fn replay() {
             #[allow(clippy::single_match)]
             match table_event {
                 TableEvent::FlushResult {
-                    uuid,
+                    event_id,
                     xact_id,
                     flush_result,
                 } => {
@@ -200,7 +200,7 @@ pub(crate) async fn replay() {
                         flush_result,
                     };
                     let mut guard = completed_flush_events_clone.lock().await;
-                    assert!(guard.insert(uuid, completed_flush).is_none());
+                    assert!(guard.insert(event_id, completed_flush).is_none());
                     event_notification.notify_waiters();
                 }
                 TableEvent::MooncakeTableSnapshotResult {
@@ -347,12 +347,15 @@ pub(crate) async fn replay() {
             // =====================
             MooncakeTableEvent::FlushInitiation(flush_initiation_event) => {
                 assert!(ongoing_flush_event_id.insert(flush_initiation_event.uuid));
+                let event_id = flush_initiation_event.uuid;
                 if let Some(xact_id) = flush_initiation_event.xact_id {
                     table
-                        .flush_stream(xact_id, flush_initiation_event.lsn)
+                        .flush_stream(xact_id, flush_initiation_event.lsn, event_id)
                         .unwrap();
                 } else {
-                    table.flush(flush_initiation_event.lsn.unwrap()).unwrap();
+                    table
+                        .flush(flush_initiation_event.lsn.unwrap(), event_id)
+                        .unwrap();
                 }
             }
             MooncakeTableEvent::FlushCompletion(flush_completion_event) => {
@@ -438,10 +441,8 @@ pub(crate) async fn replay() {
                 assert!(ongoing_iceberg_snapshot_id.insert(snapshot_initiation_event.uuid));
                 let payload = {
                     let mut guard = pending_iceberg_snapshot_payloads_clone.lock().await;
-                    let payload = guard.remove(&snapshot_initiation_event.uuid).unwrap();
-                    let rest = guard.split_off(&snapshot_initiation_event.uuid);
-                    *guard = rest;
-                    payload
+
+                    guard.remove(&snapshot_initiation_event.uuid).unwrap()
                 };
                 table.persist_iceberg_snapshot(payload);
             }
@@ -469,10 +470,8 @@ pub(crate) async fn replay() {
                 assert!(ongoing_index_merge_id.insert(index_merge_initiation_event.uuid));
                 let payload = {
                     let mut guard = pending_index_merge_payloads_clone.lock().await;
-                    let payload = guard.remove(&index_merge_initiation_event.uuid).unwrap();
-                    let rest = guard.split_off(&index_merge_initiation_event.uuid);
-                    *guard = rest;
-                    payload
+
+                    guard.remove(&index_merge_initiation_event.uuid).unwrap()
                 };
                 table.perform_index_merge(payload);
             }
@@ -498,12 +497,10 @@ pub(crate) async fn replay() {
                 assert!(ongoing_data_compaction_id.insert(data_compaction_initiation_event.uuid));
                 let payload = {
                     let mut guard = pending_data_compaction_payloads_clone.lock().await;
-                    let payload = guard
+
+                    guard
                         .remove(&data_compaction_initiation_event.uuid)
-                        .unwrap();
-                    let rest = guard.split_off(&data_compaction_initiation_event.uuid);
-                    *guard = rest;
-                    payload
+                        .unwrap()
                 };
                 table.perform_data_compaction(payload);
             }

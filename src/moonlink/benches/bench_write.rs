@@ -92,7 +92,7 @@ fn bench_write(c: &mut Criterion) {
                         values: row.values.clone(),
                     });
                 }
-                let _ = table.flush(100000);
+                let _ = table.flush(100000, /*event_id=*/ uuid::Uuid::new_v4());
             });
         });
     });
@@ -144,7 +144,7 @@ fn bench_write(c: &mut Criterion) {
                         1,
                     );
                 }
-                let _ = table.flush(100000);
+                let _ = table.flush(100000, /*event_id=*/ uuid::Uuid::new_v4());
             });
         });
     });
@@ -197,7 +197,13 @@ fn bench_write(c: &mut Criterion) {
                             1,
                         );
                     }
-                    table.flush_stream(1, None).unwrap();
+                    table
+                        .flush_stream(
+                            /*xact_id=*/ 1,
+                            /*lsn=*/ None,
+                            /*event_id=*/ uuid::Uuid::new_v4(),
+                        )
+                        .unwrap();
                 });
                 table
             },
@@ -213,7 +219,13 @@ fn bench_write(c: &mut Criterion) {
                             )
                             .await;
                     }
-                    table.flush_stream(1, None).unwrap();
+                    table
+                        .flush_stream(
+                            /*xact_id=*/ 1,
+                            /*lsn=*/ None,
+                            /*event_id=*/ uuid::Uuid::new_v4(),
+                        )
+                        .unwrap();
                 });
             },
             BatchSize::PerIteration,

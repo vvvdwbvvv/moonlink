@@ -12,6 +12,7 @@ use crate::event_sync::EventSyncSender;
 use crate::storage::mooncake_table::replay::replay_events::MooncakeTableEvent;
 use crate::storage::mooncake_table::AlterTableRequest;
 use crate::storage::mooncake_table::INITIAL_COPY_XACT_ID;
+use crate::storage::snapshot_options::IcebergSnapshotOption;
 use crate::storage::snapshot_options::MaintenanceOption;
 use crate::storage::snapshot_options::SnapshotOption;
 use crate::storage::{io_utils, MooncakeTable};
@@ -351,9 +352,12 @@ impl TableHandler {
                     }
                     TableEvent::FinishInitialCopy { start_lsn } => {
                         debug!("finishing initial copy");
-                        if let Err(e) =
-                            table.commit_transaction_stream(INITIAL_COPY_XACT_ID, start_lsn)
-                        {
+                        let event_id = uuid::Uuid::new_v4();
+                        if let Err(e) = table.commit_transaction_stream(
+                            INITIAL_COPY_XACT_ID,
+                            start_lsn,
+                            event_id,
+                        ) {
                             error!(error = %e, "failed to finish initial copy");
                         }
                         // Force create the snapshot with LSN `start_lsn`
@@ -361,7 +365,7 @@ impl TableHandler {
                             uuid: uuid::Uuid::new_v4(),
                             force_create: true,
                             dump_snapshot: false,
-                            skip_iceberg_snapshot: true,
+                            iceberg_snapshot_option: IcebergSnapshotOption::Skip,
                             index_merge_option: MaintenanceOption::Skip,
                             data_compaction_option: MaintenanceOption::Skip,
                         }));
@@ -389,7 +393,8 @@ impl TableHandler {
                         {
                             if let Some(commit_lsn) = table_handler_state.table_consistent_view_lsn
                             {
-                                table.flush(commit_lsn).unwrap();
+                                let event_id = uuid::Uuid::new_v4();
+                                table.flush(commit_lsn, event_id).unwrap();
                                 table_handler_state.last_unflushed_commit_lsn = None;
                                 table_handler_state.reset_iceberg_state_at_mooncake_snapshot();
                                 if let SpecialTableState::AlterTable { .. } =
@@ -720,15 +725,15 @@ impl TableHandler {
                             .unwrap();
                     }
                     TableEvent::FlushResult {
-                        uuid,
+                        event_id,
                         xact_id,
                         flush_result,
                     } => match flush_result {
                         Some(Ok(disk_slice)) => {
                             if let Some(xact_id) = xact_id {
-                                table.apply_stream_flush_result(xact_id, disk_slice, uuid);
+                                table.apply_stream_flush_result(xact_id, disk_slice, event_id);
                             } else {
-                                table.apply_flush_result(disk_slice, uuid);
+                                table.apply_flush_result(disk_slice, event_id);
                             }
                         }
                         Some(Err(e)) => {
@@ -812,7 +817,10 @@ impl TableHandler {
                     Some(xact_id) => {
                         let res = table.append_in_stream_batch(row, xact_id);
                         if table.should_transaction_flush(xact_id) {
-                            if let Err(e) = table.flush_stream(xact_id, None) {
+                            let event_id = uuid::Uuid::new_v4();
+                            if let Err(e) =
+                                table.flush_stream(xact_id, /*lsn=*/ None, event_id)
+                            {
                                 error!(error = %e, "failed to flush stream");
                             }
                         }
@@ -864,7 +872,8 @@ impl TableHandler {
                 .await;
             }
             TableEvent::StreamFlush { xact_id, .. } => {
-                if let Err(e) = table.flush_stream(xact_id, None) {
+                let event_id = uuid::Uuid::new_v4();
+                if let Err(e) = table.flush_stream(xact_id, /*lsn=*/ None, event_id) {
                     error!(error = %e, "failed to flush stream");
                 }
             }
@@ -915,7 +924,8 @@ impl TableHandler {
                 if let Some(last_unflushed_commit_lsn) =
                     table_handler_state.last_unflushed_commit_lsn
                 {
-                    if let Err(e) = table.flush(last_unflushed_commit_lsn) {
+                    let event_id = uuid::Uuid::new_v4();
+                    if let Err(e) = table.flush(last_unflushed_commit_lsn, event_id) {
                         error!(error = %e, "flush non-streaming writes failed in LSN {lsn}");
                     }
                     table_handler_state.last_unflushed_commit_lsn = None;
@@ -929,7 +939,8 @@ impl TableHandler {
                         return;
                     }
                 }
-                if let Err(e) = table.commit_transaction_stream(xact_id, lsn) {
+                let event_id = uuid::Uuid::new_v4();
+                if let Err(e) = table.commit_transaction_stream(xact_id, lsn, event_id) {
                     error!(error = %e, "stream commit flush failed");
                 }
             }
@@ -937,7 +948,8 @@ impl TableHandler {
                 table.commit(lsn);
                 if table.should_flush() || should_force_snapshot || force_flush_requested {
                     table_handler_state.last_unflushed_commit_lsn = None;
-                    if let Err(e) = table.flush(lsn) {
+                    let event_id = uuid::Uuid::new_v4();
+                    if let Err(e) = table.flush(lsn, event_id) {
                         error!(error = %e, "flush failed in commit");
                     }
                 }
