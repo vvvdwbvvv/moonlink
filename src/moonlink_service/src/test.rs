@@ -100,6 +100,16 @@ fn get_drop_table_payload(database: &str, table: &str) -> serde_json::Value {
     drop_table_payload
 }
 
+/// Util function to get table optimize payload.
+fn get_optimize_table_payload(database: &str, table: &str, mode: &str) -> serde_json::Value {
+    let optimize_table_payload = json!({
+        "database": database,
+        "table": table,
+        "mode": mode
+    });
+    optimize_table_payload
+}
+
 /// Util function to create table via REST API.
 async fn create_table(client: &reqwest::Client, database: &str, table: &str, append_only: bool) {
     // REST API doesn't allow duplicate source table name.
@@ -212,6 +222,125 @@ async fn test_schema() {
         response.status().is_success(),
         "Response status is {response:?}"
     );
+}
+
+/// Util function to optimize table via REST API.
+async fn optimize_table(client: &reqwest::Client, database: &str, table: &str, mode: &str) {
+    let payload = get_optimize_table_payload(database, table, mode);
+    let crafted_src_table_name = format!("{database}.{table}");
+    let response = client
+        .post(format!(
+            "{REST_ADDR}/tables/{crafted_src_table_name}/optimize"
+        ))
+        .header("content-type", "application/json")
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "Response status is {response:?}"
+    );
+}
+
+/// Util function to test optimize table
+async fn run_optimize_table_test(mode: &str) {
+    cleanup_directory(&get_moonlink_backend_dir()).await;
+    let config = get_service_config();
+    tokio::spawn(async move {
+        start_with_config(config).await.unwrap();
+    });
+    test_readiness_probe().await;
+
+    // Create test table.
+    let client = reqwest::Client::new();
+    create_table(&client, DATABASE, TABLE, /*append_only=*/ false).await;
+
+    // Ingest some data.
+    let insert_payload = json!({
+        "operation": "insert",
+        "request_mode": "async",
+        "data": {
+            "id": 1,
+            "name": "Alice Johnson",
+            "email": "alice@example.com",
+            "age": 30
+        }
+    });
+    let crafted_src_table_name = format!("{DATABASE}.{TABLE}");
+    let response = client
+        .post(format!("{REST_ADDR}/ingest/{crafted_src_table_name}"))
+        .header("content-type", "application/json")
+        .json(&insert_payload)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "Response status is {response:?}"
+    );
+
+    // test for optimize table on mode 'full'
+    optimize_table(&client, DATABASE, TABLE, mode).await;
+
+    // Scan table and get data file and puffin files back.
+    let mut moonlink_stream = TcpStream::connect(MOONLINK_ADDR).await.unwrap();
+    let bytes = scan_table_begin(
+        &mut moonlink_stream,
+        DATABASE.to_string(),
+        TABLE.to_string(),
+        /*lsn=*/ 1,
+    )
+    .await
+    .unwrap();
+    let (data_file_paths, puffin_file_paths, puffin_deletion, positional_deletion) =
+        decode_serialized_read_state_for_testing(bytes);
+    assert_eq!(data_file_paths.len(), 1);
+    let record_batches = read_all_batches(&data_file_paths[0]).await;
+    let expected_arrow_batch = RecordBatch::try_new(
+        create_test_arrow_schema(),
+        vec![
+            Arc::new(Int32Array::from(vec![1])),
+            Arc::new(StringArray::from(vec!["Alice Johnson".to_string()])),
+            Arc::new(StringArray::from(vec!["alice@example.com".to_string()])),
+            Arc::new(Int32Array::from(vec![30])),
+        ],
+    )
+    .unwrap();
+    assert_eq!(record_batches, vec![expected_arrow_batch]);
+
+    assert!(puffin_file_paths.is_empty());
+    assert!(puffin_deletion.is_empty());
+    assert!(positional_deletion.is_empty());
+
+    scan_table_end(
+        &mut moonlink_stream,
+        DATABASE.to_string(),
+        TABLE.to_string(),
+    )
+    .await
+    .unwrap();
+
+    // Cleanup shared directory.
+    cleanup_directory(&get_moonlink_backend_dir()).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_optimize_table_on_full_mode() {
+    run_optimize_table_test("full").await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_optimize_table_on_index_mode() {
+    run_optimize_table_test("index").await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_optimize_table_on_data_mode() {
+    run_optimize_table_test("data").await;
 }
 
 /// Test basic table creation, insertion and query.
