@@ -71,8 +71,10 @@ fn bench_write(c: &mut Criterion) {
                     },
                     ..Default::default()
                 };
-                let table_config =
+                let mut table_config =
                     MooncakeTableConfig::new(temp_dir.path().to_str().unwrap().to_string());
+                table_config.row_identity = IdentityProp::SinglePrimitiveKey(0);
+
                 // TODO(Paul): May need to tie this to the actual mooncake table ID in the future.
                 let wal_config = WalConfig::default_wal_config_local("1", temp_dir.path());
                 let wal_manager = WalManager::new(&wal_config);
@@ -81,7 +83,6 @@ fn bench_write(c: &mut Criterion) {
                     "test_table".to_string(),
                     1,
                     temp_dir.path().to_path_buf(),
-                    IdentityProp::SinglePrimitiveKey(0),
                     iceberg_table_config,
                     table_config,
                     wal_manager,
@@ -128,8 +129,10 @@ fn bench_write(c: &mut Criterion) {
                     },
                     ..Default::default()
                 };
-                let table_config =
+                let mut table_config =
                     MooncakeTableConfig::new(temp_dir.path().to_str().unwrap().to_string());
+                table_config.row_identity = IdentityProp::SinglePrimitiveKey(0);
+
                 // TODO(Paul): May need to tie this to the actual mooncake table ID in the future.
                 let wal_config = WalConfig::default_wal_config_local("1", temp_dir.path());
                 let wal_manager = WalManager::new(&wal_config);
@@ -138,7 +141,6 @@ fn bench_write(c: &mut Criterion) {
                     "test_table".to_string(),
                     1,
                     temp_dir.path().to_path_buf(),
-                    IdentityProp::SinglePrimitiveKey(0),
                     iceberg_table_config,
                     table_config,
                     wal_manager,
@@ -188,8 +190,10 @@ fn bench_write(c: &mut Criterion) {
                     },
                     ..Default::default()
                 };
-                let table_config =
+                let mut table_config =
                     MooncakeTableConfig::new(temp_dir.path().to_str().unwrap().to_string());
+                table_config.row_identity = IdentityProp::SinglePrimitiveKey(0);
+
                 // TODO(Paul): May need to tie this to the actual mooncake table ID in the future.
                 let wal_config = WalConfig::default_wal_config_local("1", temp_dir.path());
                 let wal_manager = WalManager::new(&wal_config);
@@ -199,7 +203,6 @@ fn bench_write(c: &mut Criterion) {
                         "test_table".to_string(),
                         1,
                         temp_dir.path().to_path_buf(),
-                        IdentityProp::SinglePrimitiveKey(0),
                         iceberg_table_config,
                         table_config,
                         wal_manager,

@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use crate::Result;
+use moonlink::row::IdentityProp;
 use moonlink::MooncakeTableId;
 use moonlink::{
     AccessorConfig, DataCompactionConfig, FileIndexMergeConfig, IcebergTableConfig,
@@ -10,7 +11,7 @@ use moonlink::{
 use serde::{Deserialize, Serialize};
 
 /// Mooncake table config.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Default)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct MooncakeConfig {
     /// Whether background regular index merge is enabled.
     #[serde(default)]
@@ -19,11 +20,36 @@ pub struct MooncakeConfig {
     #[serde(default)]
     pub skip_data_compaction: bool,
     /// Whether this is an append-only table (no indexes, no deletes).
-    #[serde(default)]
+    #[serde(default = "MooncakeConfig::default_append_only")]
     pub append_only: bool,
+    /// Row identity of the table.
+    #[serde(default = "MooncakeConfig::default_row_identity")]
+    pub row_identity: IdentityProp,
+}
+
+impl Default for MooncakeConfig {
+    fn default() -> Self {
+        Self {
+            skip_index_merge: false,
+            skip_data_compaction: false,
+            append_only: MooncakeConfig::default_append_only(),
+            row_identity: MooncakeConfig::default_row_identity(),
+        }
+    }
 }
 
 impl MooncakeConfig {
+    // Notice, default value for the table config should be a valid combination.
+    const DEFAULT_APPEND_ONLY: bool = true;
+    const DEFAULT_ROW_IDENTITY: IdentityProp = IdentityProp::None;
+
+    pub fn default_append_only() -> bool {
+        Self::DEFAULT_APPEND_ONLY
+    }
+    pub fn default_row_identity() -> IdentityProp {
+        Self::DEFAULT_ROW_IDENTITY
+    }
+
     /// Convert to mooncake table config.
     pub(crate) fn take_as_mooncake_table_config(
         self,
@@ -44,6 +70,7 @@ impl MooncakeConfig {
         mooncake_table_config.file_index_config = index_merge_config;
         mooncake_table_config.data_compaction_config = data_compaction_config;
         mooncake_table_config.append_only = self.append_only;
+        mooncake_table_config.row_identity = self.row_identity;
         mooncake_table_config
     }
 }
@@ -55,6 +82,7 @@ pub struct TableConfig {
     #[serde(rename = "mooncake")]
     #[serde(default)]
     pub mooncake_config: MooncakeConfig,
+
     /// Iceberg storage config.
     #[serde(rename = "iceberg")]
     #[serde(default)]
@@ -125,7 +153,8 @@ mod tests {
             mooncake_config: MooncakeConfig {
                 skip_index_merge: false,
                 skip_data_compaction: false,
-                append_only: false,
+                append_only: true,
+                row_identity: IdentityProp::None,
             },
             iceberg_config: Some(AccessorConfig::new_with_storage_config(
                 moonlink::StorageConfig::FileSystem {
@@ -177,7 +206,8 @@ mod tests {
             mooncake_config: MooncakeConfig {
                 skip_index_merge: true,
                 skip_data_compaction: false,
-                append_only: false,
+                append_only: true,
+                row_identity: IdentityProp::None,
             },
             iceberg_config: Some(AccessorConfig::new_with_storage_config(
                 moonlink::StorageConfig::FileSystem {
@@ -238,7 +268,8 @@ mod tests {
             mooncake_config: MooncakeConfig {
                 skip_index_merge: true,
                 skip_data_compaction: false,
-                append_only: false,
+                append_only: true,
+                row_identity: IdentityProp::None,
             },
             iceberg_config: Some(AccessorConfig::new_with_storage_config(
                 moonlink::StorageConfig::Gcs {
@@ -309,7 +340,8 @@ mod tests {
             mooncake_config: MooncakeConfig {
                 skip_index_merge: true,
                 skip_data_compaction: false,
-                append_only: false,
+                append_only: true,
+                row_identity: IdentityProp::None,
             },
             iceberg_config: Some(AccessorConfig::new_with_storage_config(
                 moonlink::StorageConfig::S3 {
@@ -356,6 +388,7 @@ mod tests {
                 skip_index_merge: true,
                 skip_data_compaction: true,
                 append_only: true,
+                row_identity: IdentityProp::None,
             },
             iceberg_config: Some(AccessorConfig::new_with_storage_config(
                 moonlink::StorageConfig::FileSystem {

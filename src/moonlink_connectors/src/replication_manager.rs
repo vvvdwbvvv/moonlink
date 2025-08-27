@@ -57,7 +57,7 @@ impl ReplicationManager {
         src_uri: &str,
         mooncake_table_id: MooncakeTableId,
         table_name: &str,
-        moonlink_table_config: MoonlinkTableConfig,
+        moonlink_table_config: &mut MoonlinkTableConfig,
         read_state_filepath_remap: ReadStateFilepathRemap,
         is_recovery: bool,
     ) -> Result<()> {

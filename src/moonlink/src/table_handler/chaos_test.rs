@@ -833,7 +833,6 @@ impl TestEnvironment {
         // TODO(hjiang): Synchronize the background task and gracefully shutdown.
         let table_metadata_replay = ReplayTableMetadata {
             config: mooncake_table_metadata.config.clone(),
-            identity,
             local_filesystem_optimization_enabled: config.local_filesystem_optimization_enabled,
             storage_config: config.storage_config.clone(),
         };
