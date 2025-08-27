@@ -151,7 +151,7 @@ pub async fn build_table_components(
             table_components
                 .moonlink_table_config
                 .iceberg_table_config
-                .accessor_config
+                .data_accessor_config
                 .clone(),
         )),
     )

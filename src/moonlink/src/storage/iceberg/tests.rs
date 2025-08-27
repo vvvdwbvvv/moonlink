@@ -542,7 +542,9 @@ async fn test_store_and_load_snapshot_impl(iceberg_table_config: IcebergTableCon
     assert_eq!(snapshot.indices.file_indices.len(), 1);
     validate_recovered_snapshot(
         &snapshot,
-        &iceberg_table_config.accessor_config.get_root_path(),
+        &iceberg_table_config
+            .metadata_accessor_config
+            .get_warehouse_uri(),
         filesystem_accessor.as_ref(),
     )
     .await;
@@ -636,7 +638,9 @@ async fn test_store_and_load_snapshot_impl(iceberg_table_config: IcebergTableCon
     assert_eq!(snapshot.indices.file_indices.len(), 1);
     validate_recovered_snapshot(
         &snapshot,
-        &iceberg_table_config.accessor_config.get_root_path(),
+        &iceberg_table_config
+            .metadata_accessor_config
+            .get_warehouse_uri(),
         filesystem_accessor.as_ref(),
     )
     .await;
@@ -693,7 +697,9 @@ async fn test_store_and_load_snapshot_impl(iceberg_table_config: IcebergTableCon
     assert!(snapshot.indices.file_indices.is_empty());
     validate_recovered_snapshot(
         &snapshot,
-        &iceberg_table_config.accessor_config.get_root_path(),
+        &iceberg_table_config
+            .metadata_accessor_config
+            .get_warehouse_uri(),
         filesystem_accessor.as_ref(),
     )
     .await;
@@ -852,7 +858,9 @@ async fn test_empty_snapshot_load_impl(iceberg_table_config: IcebergTableConfig)
     assert!(snapshot.flush_lsn.is_none());
     validate_recovered_snapshot(
         &snapshot,
-        &iceberg_table_config.accessor_config.get_root_path(),
+        &iceberg_table_config
+            .metadata_accessor_config
+            .get_warehouse_uri(),
         filesystem_accessor.as_ref(),
     )
     .await;
@@ -954,7 +962,9 @@ async fn test_recover_from_failed_snapshot_impl(iceberg_table_config: IcebergTab
     // Craft such situation: there's only initial metadata file (with version 0).
     let version_hint = format!(
         "{}/{}/{}/metadata/{}",
-        iceberg_table_config.accessor_config.get_root_path(),
+        iceberg_table_config
+            .metadata_accessor_config
+            .get_warehouse_uri(),
         ICEBERG_TEST_NAMESPACE,
         ICEBERG_TEST_TABLE,
         VERSION_HINT_FILENAME
@@ -1071,7 +1081,9 @@ async fn test_index_merge_and_create_snapshot_impl(iceberg_table_config: Iceberg
     assert_eq!(snapshot.flush_lsn.unwrap(), 3);
     validate_recovered_snapshot(
         &snapshot,
-        &iceberg_table_config.accessor_config.get_root_path(),
+        &iceberg_table_config
+            .metadata_accessor_config
+            .get_warehouse_uri(),
         filesystem_accessor.as_ref(),
     )
     .await;
@@ -1106,7 +1118,9 @@ async fn test_index_merge_and_create_snapshot_impl(iceberg_table_config: Iceberg
     assert_eq!(snapshot.flush_lsn.unwrap(), 5);
     validate_recovered_snapshot(
         &snapshot,
-        &iceberg_table_config.accessor_config.get_root_path(),
+        &iceberg_table_config
+            .metadata_accessor_config
+            .get_warehouse_uri(),
         filesystem_accessor.as_ref(),
     )
     .await;
@@ -1231,7 +1245,9 @@ async fn test_data_compaction_and_create_snapshot_impl(iceberg_table_config: Ice
     assert_eq!(snapshot.flush_lsn.unwrap(), 3);
     validate_recovered_snapshot(
         &snapshot,
-        &iceberg_table_config.accessor_config.get_root_path(),
+        &iceberg_table_config
+            .metadata_accessor_config
+            .get_warehouse_uri(),
         filesystem_accessor.as_ref(),
     )
     .await;
@@ -1272,7 +1288,9 @@ async fn test_data_compaction_and_create_snapshot_impl(iceberg_table_config: Ice
     assert_eq!(snapshot.flush_lsn.unwrap(), 5);
     validate_recovered_snapshot(
         &snapshot,
-        &iceberg_table_config.accessor_config.get_root_path(),
+        &iceberg_table_config
+            .metadata_accessor_config
+            .get_warehouse_uri(),
         filesystem_accessor.as_ref(),
     )
     .await;
@@ -1392,7 +1410,9 @@ async fn test_data_compaction_append_only_and_create_snapshot_impl(
     assert_eq!(snapshot.flush_lsn.unwrap(), 2);
     validate_recovered_snapshot(
         &snapshot,
-        &iceberg_table_config.accessor_config.get_root_path(),
+        &iceberg_table_config
+            .metadata_accessor_config
+            .get_warehouse_uri(),
         filesystem_accessor.as_ref(),
     )
     .await;
@@ -1527,7 +1547,9 @@ async fn test_data_compaction_by_deletion_and_create_snapshot_impl(
     assert_eq!(snapshot.flush_lsn.unwrap(), 8);
     validate_recovered_snapshot(
         &snapshot,
-        &iceberg_table_config.accessor_config.get_root_path(),
+        &iceberg_table_config
+            .metadata_accessor_config
+            .get_warehouse_uri(),
         filesystem_accessor.as_ref(),
     )
     .await;
@@ -2093,7 +2115,9 @@ async fn test_async_iceberg_snapshot_impl(iceberg_table_config: IcebergTableConf
     assert!(deletion_vector_1.puffin_deletion_blob.is_none());
     validate_recovered_snapshot(
         &snapshot,
-        &iceberg_table_config.accessor_config.get_root_path(),
+        &iceberg_table_config
+            .metadata_accessor_config
+            .get_warehouse_uri(),
         filesystem_accessor.as_ref(),
     )
     .await;
@@ -2133,7 +2157,9 @@ async fn test_async_iceberg_snapshot_impl(iceberg_table_config: IcebergTableConf
 
     validate_recovered_snapshot(
         &snapshot,
-        &iceberg_table_config.accessor_config.get_root_path(),
+        &iceberg_table_config
+            .metadata_accessor_config
+            .get_warehouse_uri(),
         filesystem_accessor.as_ref(),
     )
     .await;
@@ -2300,7 +2326,9 @@ async fn mooncake_table_snapshot_persist_impl(iceberg_table_config: IcebergTable
     check_deletion_vector_consistency_for_snapshot(&snapshot).await;
     validate_recovered_snapshot(
         &snapshot,
-        &iceberg_table_config.accessor_config.get_root_path(),
+        &iceberg_table_config
+            .metadata_accessor_config
+            .get_warehouse_uri(),
         filesystem_accessor.as_ref(),
     )
     .await;
@@ -2374,7 +2402,9 @@ async fn mooncake_table_snapshot_persist_impl(iceberg_table_config: IcebergTable
     check_deletion_vector_consistency_for_snapshot(&snapshot).await;
     validate_recovered_snapshot(
         &snapshot,
-        &iceberg_table_config.accessor_config.get_root_path(),
+        &iceberg_table_config
+            .metadata_accessor_config
+            .get_warehouse_uri(),
         filesystem_accessor.as_ref(),
     )
     .await;
@@ -2436,7 +2466,9 @@ async fn mooncake_table_snapshot_persist_impl(iceberg_table_config: IcebergTable
     check_deletion_vector_consistency_for_snapshot(&snapshot).await;
     validate_recovered_snapshot(
         &snapshot,
-        &iceberg_table_config.accessor_config.get_root_path(),
+        &iceberg_table_config
+            .metadata_accessor_config
+            .get_warehouse_uri(),
         filesystem_accessor.as_ref(),
     )
     .await;
