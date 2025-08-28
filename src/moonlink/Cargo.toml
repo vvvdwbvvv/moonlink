@@ -62,6 +62,7 @@ iceberg = { workspace = true }
 itertools = { workspace = true }
 lru = { workspace = true }
 memmap2 = "0.9"
+moka = { workspace = true }
 moonlink_error = { path = "../moonlink_error" }
 moonlink_table_metadata = { path = "../moonlink_table_metadata" }
 more-asserts = { workspace = true }
