@@ -333,7 +333,7 @@ mod tests {
     use super::*;
     use crate::row::RowValue;
     use arrow::datatypes::{DataType, Field};
-    use arrow_array::{Int32Array, StringArray, TimestampMicrosecondArray};
+    use arrow_array::{Int16Array, Int32Array, StringArray, TimestampMicrosecondArray};
     use std::collections::HashMap;
 
     // TODO(hjiang): Add unit test for ColumnStoreBuffer with deletion, and check record batch content.
@@ -348,7 +348,7 @@ mod tests {
                 "PARQUET:field_id".to_string(),
                 "2".to_string(),
             )])),
-            Field::new("age", DataType::Int32, false).with_metadata(HashMap::from([(
+            Field::new("age", DataType::Int16, false).with_metadata(HashMap::from([(
                 "PARQUET:field_id".to_string(),
                 "3".to_string(),
             )])),
@@ -415,7 +415,7 @@ mod tests {
                         "John".to_string(),
                         "Jane".to_string(),
                     ])),
-                    Arc::new(Int32Array::from(vec![30, 25])),
+                    Arc::new(Int16Array::from(vec![30, 25])),
                     Arc::new(TimestampMicrosecondArray::from(vec![
                         1618876800000000,
                         1618876800000000,
@@ -441,7 +441,7 @@ mod tests {
                 vec![
                     Arc::new(Int32Array::from(vec![1])),
                     Arc::new(StringArray::from(vec!["John".to_string()])),
-                    Arc::new(Int32Array::from(vec![30])),
+                    Arc::new(Int16Array::from(vec![30])),
                     Arc::new(TimestampMicrosecondArray::from(vec![1618876800000000])),
                 ],
             )
@@ -463,7 +463,7 @@ mod tests {
                 vec![
                     Arc::new(Int32Array::from(vec![3])),
                     Arc::new(StringArray::from(vec!["Bob"])),
-                    Arc::new(Int32Array::from(vec![40])),
+                    Arc::new(Int16Array::from(vec![40])),
                     Arc::new(TimestampMicrosecondArray::from(vec![1618876800000000])),
                 ],
             )
