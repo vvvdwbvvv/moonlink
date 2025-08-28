@@ -1,5 +1,7 @@
 use super::test_utils::*;
 use super::*;
+use crate::storage::iceberg::base_iceberg_snapshot_fetcher::BaseIcebergSnapshotFetcher;
+use crate::storage::iceberg::iceberg_snapshot_fetcher::IcebergSnapshotFetcher;
 use crate::storage::iceberg::table_manager::MockTableManager;
 use crate::storage::mooncake_table::table_creation_test_utils::*;
 use crate::storage::mooncake_table::table_operation_test_utils::*;
@@ -1288,43 +1290,46 @@ async fn test_ongoing_flush_lsns_tracking() -> Result<()> {
     // Add data and start multiple flushes with monotonically increasing LSNs
     append_rows(&mut table, vec![test_row(1, "A", 20)])?;
     table.commit(1);
-    let disk_slice_1 = flush_table_and_sync_no_apply(&mut table, &mut event_completion_rx, 5)
-        .await
-        .expect("Disk slice 1 should be present");
+    let disk_slice_1 =
+        flush_table_and_sync_no_apply(&mut table, &mut event_completion_rx, /*lsn=*/ 1)
+            .await
+            .expect("Disk slice 1 should be present");
 
     append_rows(&mut table, vec![test_row(2, "B", 21)])?;
     table.commit(2);
-    let disk_slice_2 = flush_table_and_sync_no_apply(&mut table, &mut event_completion_rx, 10)
-        .await
-        .expect("Disk slice 2 should be present");
+    let disk_slice_2 =
+        flush_table_and_sync_no_apply(&mut table, &mut event_completion_rx, /*lsn=*/ 2)
+            .await
+            .expect("Disk slice 2 should be present");
 
     append_rows(&mut table, vec![test_row(3, "C", 22)])?;
     table.commit(3);
-    let disk_slice_3 = flush_table_and_sync_no_apply(&mut table, &mut event_completion_rx, 15)
-        .await
-        .expect("Disk slice 3 should be present");
+    let disk_slice_3 =
+        flush_table_and_sync_no_apply(&mut table, &mut event_completion_rx, /*lsn=*/ 3)
+            .await
+            .expect("Disk slice 3 should be present");
 
     // Verify all LSNs are tracked
-    assert!(table.ongoing_flush_lsns.contains_key(&5));
-    assert!(table.ongoing_flush_lsns.contains_key(&10));
-    assert!(table.ongoing_flush_lsns.contains_key(&15));
+    assert!(table.ongoing_flush_lsns.contains_key(&1));
+    assert!(table.ongoing_flush_lsns.contains_key(&2));
+    assert!(table.ongoing_flush_lsns.contains_key(&3));
     assert_eq!(table.ongoing_flush_lsns.len(), 3);
 
-    // Verify min is correctly calculated (should be 5)
-    assert_eq!(table.get_min_ongoing_flush_lsn(), 5);
+    // Verify min is correctly calculated (should be 1)
+    assert_eq!(table.get_min_ongoing_flush_lsn(), 1);
 
-    // Complete flush with LSN 10 (out of order completion)
+    // Complete flush with LSN 2 (out of order completion)
     table.apply_flush_result(disk_slice_2, uuid::Uuid::new_v4() /*placeholder*/);
-    assert!(table.ongoing_flush_lsns.contains_key(&5));
-    assert!(!table.ongoing_flush_lsns.contains_key(&10));
-    assert!(table.ongoing_flush_lsns.contains_key(&15));
-    assert_eq!(table.get_min_ongoing_flush_lsn(), 5); // Still 5
+    assert!(table.ongoing_flush_lsns.contains_key(&1));
+    assert!(!table.ongoing_flush_lsns.contains_key(&2));
+    assert!(table.ongoing_flush_lsns.contains_key(&3));
+    assert_eq!(table.get_min_ongoing_flush_lsn(), 1); // Still 1
 
-    // Complete flush with LSN 5
+    // Complete flush with LSN 1
     table.apply_flush_result(disk_slice_1, uuid::Uuid::new_v4() /*placeholder*/);
-    assert!(!table.ongoing_flush_lsns.contains_key(&5));
-    assert!(table.ongoing_flush_lsns.contains_key(&15));
-    assert_eq!(table.get_min_ongoing_flush_lsn(), 15); // Now 15
+    assert!(!table.ongoing_flush_lsns.contains_key(&1));
+    assert!(table.ongoing_flush_lsns.contains_key(&3));
+    assert_eq!(table.get_min_ongoing_flush_lsn(), 3); // Now 3
 
     // Complete last flush
     table.apply_flush_result(disk_slice_3, uuid::Uuid::new_v4() /*placeholder*/);
@@ -2960,4 +2965,83 @@ async fn test_streaming_batch_id_assignment() -> Result<()> {
     assert_eq!(table.get_min_ongoing_flush_lsn(), u64::MAX);
 
     Ok(())
+}
+
+/// Testing scenario:
+/// - Three ongoing flushes, two with flush LSN 13, another with flush LSN 16
+/// - The completion order goes with 13, 16, 13
+/// - Check whether flush LSN is 16 for iceberg snapshot
+#[tokio::test]
+async fn test_late_arriving_high_flush_lsn() {
+    let context = TestContext::new("late_arriving_high_flush_lsn");
+    let mut table = test_table(
+        &context,
+        "late_arriving_high_flush_lsn",
+        IdentityProp::FullRow,
+    )
+    .await;
+    let (event_completion_tx, mut event_completion_rx) = mpsc::channel(100);
+    table.register_table_notify(event_completion_tx).await;
+
+    let xact_id_1 = 1;
+    let xact_id_2 = 2;
+    let lsn_1 = 13;
+    let lsn_2 = 16;
+
+    let flush_event_ids = [
+        uuid::Uuid::new_v4(),
+        uuid::Uuid::new_v4(),
+        uuid::Uuid::new_v4(),
+    ];
+
+    // First flush operation.
+    table
+        .append_in_stream_batch(test_row(1, "A", 10), xact_id_1)
+        .unwrap();
+    table
+        .flush_stream(xact_id_1, /*lsn=*/ None, flush_event_ids[0])
+        .unwrap();
+
+    // Second flush operation.
+    table
+        .commit_transaction_stream(xact_id_1, lsn_1, flush_event_ids[1])
+        .unwrap();
+
+    // Third flush operation.
+    table
+        .append_in_stream_batch(test_row(2, "B", 20), xact_id_2)
+        .unwrap();
+    table
+        .commit_transaction_stream(xact_id_2, lsn_2, flush_event_ids[2])
+        .unwrap();
+
+    // Validate all streaming LSN are tracked.
+    assert!(table.ongoing_flush_lsns.contains_key(&lsn_1));
+    assert!(table.ongoing_flush_lsns.contains_key(&lsn_2));
+    assert_eq!(table.get_min_ongoing_flush_lsn(), lsn_1);
+
+    // Block wait all three flushes.
+    let mut flush_results =
+        get_flush_results(&mut event_completion_rx, /*expected_flushes=*/ 3).await;
+
+    // Apply the flush result out of order.
+    let disk_slice = flush_results.remove(&flush_event_ids[0]).unwrap();
+    table.apply_stream_flush_result(xact_id_1, disk_slice, flush_event_ids[0]);
+
+    let disk_slice = flush_results.remove(&flush_event_ids[2]).unwrap();
+    table.apply_stream_flush_result(xact_id_2, disk_slice, flush_event_ids[2]);
+
+    let disk_slice = flush_results.remove(&flush_event_ids[1]).unwrap();
+    table.apply_stream_flush_result(xact_id_1, disk_slice, flush_event_ids[1]);
+
+    // Create mooncake and iceberg snapshot, so we could check flush LSN.
+    create_mooncake_and_persist_for_test(&mut table, &mut event_completion_rx).await;
+    let iceberg_table_config = test_iceberg_table_config(&context, "late_arriving_high_flush_lsn");
+    let iceberg_snapshot_fetcher = IcebergSnapshotFetcher::new(iceberg_table_config).unwrap();
+    let flush_lsn = iceberg_snapshot_fetcher
+        .get_flush_lsn()
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(flush_lsn, lsn_2);
 }

@@ -1,8 +1,8 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::mpsc::Receiver;
 
-#[cfg(test)]
 use crate::row::MoonlinkRow;
 use crate::storage::io_utils;
 use crate::storage::mooncake_table::disk_slice::DiskSliceWriter;
@@ -24,6 +24,38 @@ use tracing::{debug, error};
 /// Flush
 /// ===============================
 ///
+/// Synchronize on ongoing flushes and return a map of <event id, disk slice>.
+pub(crate) async fn get_flush_results(
+    receiver: &mut Receiver<TableEvent>,
+    expected_flushes: usize,
+) -> HashMap<uuid::Uuid, DiskSliceWriter> {
+    let mut flush_results = HashMap::new();
+    for _ in 0..expected_flushes {
+        let cur_flush_result = receiver.recv().await.unwrap();
+        match cur_flush_result {
+            TableEvent::FlushResult {
+                event_id,
+                xact_id: _,
+                flush_result,
+            } => match flush_result {
+                Some(Ok(disk_slice)) => {
+                    flush_results.insert(event_id, disk_slice);
+                }
+                Some(Err(e)) => {
+                    error!(error = ?e, "failed to flush disk slice");
+                }
+                None => {
+                    debug!("Flush result is none, disk slice was empty");
+                }
+            },
+            _ => {
+                panic!("Expected FlushResult as first event, but got others.");
+            }
+        }
+    }
+    flush_results
+}
+
 /// Flush mooncake, block wait its completion and reflect result to mooncake table.
 #[cfg(test)]
 pub(crate) async fn flush_table_and_sync(
@@ -124,7 +156,6 @@ pub(crate) async fn flush_stream_and_sync_no_apply(
 }
 
 /// Commit transaction stream, block wait its completion and reflect result to mooncake table.
-#[cfg(test)]
 pub(crate) async fn commit_transaction_stream_and_sync(
     table: &mut MooncakeTable,
     receiver: &mut Receiver<TableEvent>,
@@ -163,7 +194,6 @@ pub(crate) async fn commit_transaction_stream_and_sync(
 /// ===============================
 ///
 /// Test util function to block wait delete request, and check whether matches expected data files.
-#[cfg(test)]
 pub(crate) async fn sync_delete_evicted_files(
     receiver: &mut Receiver<TableEvent>,
     mut expected_files_to_delete: Vec<String>,
