@@ -5,6 +5,7 @@ use arrow::datatypes::Schema;
 use arrow_array::RecordBatch;
 use moonlink_error::{ErrorStatus, ErrorStruct};
 use tokio::sync::mpsc;
+use tokio::sync::Mutex;
 
 use crate::pg_replicate::conversions::table_row::TableRow;
 use crate::Result;
@@ -18,6 +19,10 @@ pub struct InitialCopyWriterConfig {
     pub target_file_size_bytes: usize,
     /// Max number of rows per Arrow RecordBatch before flushing to the writer.
     pub max_rows_per_batch: usize,
+    /// Number of parallel writer tasks to consume from the batch queue.
+    pub num_writer_tasks: usize,
+    /// Capacity of the bounded channel between producer and writers.
+    pub batch_channel_capacity: usize,
 }
 
 impl Default for InitialCopyWriterConfig {
@@ -27,6 +32,9 @@ impl Default for InitialCopyWriterConfig {
             target_file_size_bytes: DiskSliceWriterConfig::default_disk_slice_parquet_file_size(),
             // Align batch size with mooncake table default batch size
             max_rows_per_batch: MooncakeTableConfig::default_batch_size(),
+            // Default to no parallelism
+            num_writer_tasks: 1,
+            batch_channel_capacity: 16,
         }
     }
 }
@@ -60,6 +68,21 @@ impl BatchReceiver {
     /// Receive the next RecordBatch from the channel. Returns None if closed.
     pub async fn recv(&mut self) -> Option<RecordBatch> {
         self.0.recv().await
+    }
+}
+
+/// Shared receiver wrapper to enable multiple writer tasks to consume from a single queue.
+#[derive(Clone)]
+pub struct SharedBatchReceiver(Arc<Mutex<BatchReceiver>>);
+
+impl SharedBatchReceiver {
+    pub fn new(rx: BatchReceiver) -> Self {
+        Self(Arc::new(Mutex::new(rx)))
+    }
+
+    pub async fn recv(&self) -> Option<RecordBatch> {
+        let mut guard = self.0.lock().await;
+        guard.recv().await
     }
 }
 
@@ -126,9 +149,12 @@ impl ParquetFileWriter {
         self.output_dir.join(filename)
     }
 
-    /// Consume RecordBatches and write Parquet files.
-    /// Returns the list of file paths written.
-    pub async fn write_from_channel(mut self, mut rx: BatchReceiver) -> Result<Vec<String>> {
+    /// Consume RecordBatches from a shared receiver and write Parquet files.
+    /// Returns the list of file paths written by this worker.
+    pub async fn write_from_shared(
+        mut self,
+        shared_rx: SharedBatchReceiver,
+    ) -> Result<Vec<String>> {
         use moonlink::get_default_parquet_properties;
         use parquet::arrow::AsyncArrowWriter;
 
@@ -136,7 +162,7 @@ impl ParquetFileWriter {
         let mut writer: Option<AsyncArrowWriter<tokio::fs::File>> = None;
         let mut current_file_path: Option<PathBuf> = None;
 
-        while let Some(batch) = rx.recv().await {
+        while let Some(batch) = shared_rx.recv().await {
             if batch.num_columns() == 0 || batch.num_rows() == 0 {
                 continue;
             }
@@ -211,6 +237,8 @@ mod tests {
             cfg.max_rows_per_batch,
             MooncakeTableConfig::default_batch_size()
         );
+        assert_eq!(cfg.num_writer_tasks, 1);
+        assert_eq!(cfg.batch_channel_capacity, 16);
     }
 
     #[tokio::test]
@@ -301,17 +329,20 @@ mod tests {
     #[tokio::test]
     async fn parquet_writer_writes_and_rotates_per_batch() {
         // Force rotation after every write by setting target size to 0
-        let output_dir =
-            std::env::temp_dir().join(format!("ml_icw_rotate_{}", uuid::Uuid::now_v7()));
+        let tempdir = tempfile::tempdir().unwrap();
+        let output_dir = tempdir.path().to_path_buf();
         let schema = int32_schema();
         let config = InitialCopyWriterConfig {
             target_file_size_bytes: 0,
             max_rows_per_batch: 1024,
+            num_writer_tasks: 4,
+            batch_channel_capacity: 8,
         };
 
         let (tx, rx) = create_batch_channel(8);
         let writer = ParquetFileWriter::new(output_dir.clone(), schema.clone(), config);
-        let handle = tokio::spawn(async move { writer.write_from_channel(rx).await });
+        let shared_rx = SharedBatchReceiver::new(rx);
+        let handle = tokio::spawn(async move { writer.write_from_shared(shared_rx).await });
 
         // Send three small batches
         tx.send(make_batch(&[1])).await.unwrap();
@@ -333,14 +364,15 @@ mod tests {
 
     #[tokio::test]
     async fn parquet_writer_ignores_empty_batches() {
-        let output_dir =
-            std::env::temp_dir().join(format!("ml_icw_empty_{}", uuid::Uuid::now_v7()));
+        let tempdir = tempfile::tempdir().unwrap();
+        let output_dir = tempdir.path().to_path_buf();
         let schema = int32_schema();
         let config = InitialCopyWriterConfig::default();
 
         let (tx, rx) = create_batch_channel(8);
         let writer = ParquetFileWriter::new(output_dir.clone(), schema.clone(), config);
-        let handle = tokio::spawn(async move { writer.write_from_channel(rx).await });
+        let shared_rx = SharedBatchReceiver::new(rx);
+        let handle = tokio::spawn(async move { writer.write_from_shared(shared_rx).await });
 
         // Send an empty batch (0 rows) and a non-empty one
         let empty = RecordBatch::new_empty(schema.clone());
@@ -357,17 +389,20 @@ mod tests {
     #[tokio::test]
     async fn parquet_writer_finalizes_on_channel_close() {
         // Large target size so no rotation happens during writes; file is finalized at the end
-        let output_dir =
-            std::env::temp_dir().join(format!("ml_icw_finalize_{}", uuid::Uuid::now_v7()));
+        let tempdir = tempfile::tempdir().unwrap();
+        let output_dir = tempdir.path().to_path_buf();
         let schema = int32_schema();
         let config = InitialCopyWriterConfig {
             target_file_size_bytes: usize::MAX,
             max_rows_per_batch: 1024,
+            num_writer_tasks: 1,
+            batch_channel_capacity: 4,
         };
 
         let (tx, rx) = create_batch_channel(4);
         let writer = ParquetFileWriter::new(output_dir.clone(), schema.clone(), config);
-        let handle = tokio::spawn(async move { writer.write_from_channel(rx).await });
+        let shared_rx = SharedBatchReceiver::new(rx);
+        let handle = tokio::spawn(async move { writer.write_from_shared(shared_rx).await });
 
         tx.send(make_batch(&[7, 8, 9])).await.unwrap();
         drop(tx);
@@ -375,5 +410,140 @@ mod tests {
         let files = handle.await.unwrap().unwrap();
         assert_eq!(files.len(), 1);
         assert!(Path::new(&files[0]).exists());
+    }
+
+    #[tokio::test]
+    async fn parquet_multi_writer_idle_writers_produce_no_files() {
+        // num_writer_tasks = 4, send exactly 1 non-empty batch; expect exactly 1 file
+        let tempdir = tempfile::tempdir().unwrap();
+        let output_dir = tempdir.path().to_path_buf();
+        let schema = int32_schema();
+        let config = InitialCopyWriterConfig {
+            target_file_size_bytes: usize::MAX, // avoid rotation
+            max_rows_per_batch: 1024,
+            num_writer_tasks: 4,
+            batch_channel_capacity: 4,
+        };
+
+        let (tx, rx) = create_batch_channel(4);
+        let shared_rx = SharedBatchReceiver::new(rx);
+
+        // Spawn 4 writers
+        let mut handles = Vec::new();
+        for _ in 0..config.num_writer_tasks {
+            let writer = ParquetFileWriter::new(output_dir.clone(), schema.clone(), config.clone());
+            let srx = shared_rx.clone();
+            handles.push(tokio::spawn(
+                async move { writer.write_from_shared(srx).await },
+            ));
+        }
+
+        // Send exactly one batch
+        tx.send(make_batch(&[1, 2, 3])).await.unwrap();
+        drop(tx);
+
+        // Collect results
+        let mut files_written = Vec::new();
+        for h in handles {
+            let mut files = h.await.unwrap().unwrap();
+            files_written.append(&mut files);
+        }
+
+        assert_eq!(
+            files_written.len(),
+            1,
+            "only one writer should produce a file"
+        );
+        assert!(Path::new(&files_written[0]).exists());
+    }
+
+    #[tokio::test]
+    async fn parquet_multi_writer_tail_files_bounded_by_writers_and_batches() {
+        // num_writer_tasks = 3, send multiple batches; ensure file count is reasonable (no rotation)
+        let tempdir = tempfile::tempdir().unwrap();
+        let output_dir = tempdir.path().to_path_buf();
+        let schema = int32_schema();
+        let config = InitialCopyWriterConfig {
+            target_file_size_bytes: usize::MAX, // one file per writer that received at least one batch
+            max_rows_per_batch: 2,
+            num_writer_tasks: 3,
+            batch_channel_capacity: 8,
+        };
+
+        let (tx, rx) = create_batch_channel(8);
+        let shared_rx = SharedBatchReceiver::new(rx);
+
+        // Spawn 3 writers
+        let mut handles = Vec::new();
+        for _ in 0..config.num_writer_tasks {
+            let writer = ParquetFileWriter::new(output_dir.clone(), schema.clone(), config.clone());
+            let srx = shared_rx.clone();
+            handles.push(tokio::spawn(
+                async move { writer.write_from_shared(srx).await },
+            ));
+        }
+
+        // Send several batches; distribution across writers is nondeterministic
+        let batches_sent = 5;
+        for i in 0..batches_sent {
+            tx.send(make_batch(&[i, i + 1])).await.unwrap();
+        }
+        drop(tx);
+
+        let mut files_written = Vec::new();
+        for h in handles {
+            let mut files = h.await.unwrap().unwrap();
+            files_written.append(&mut files);
+        }
+
+        // With no rotation, each writer produces at most one file if it received any batch.
+        // So total files is between 1 and min(num_writer_tasks, batches_sent).
+        assert!(
+            !files_written.is_empty(),
+            "at least one writer should produce a file"
+        );
+        assert!(
+            files_written.len() as u32 <= config.num_writer_tasks as u32,
+            "should be at most one file per writer"
+        );
+        assert!(
+            files_written.len() as u32 <= batches_sent as u32,
+            "cannot exceed number of batches"
+        );
+        for f in &files_written {
+            assert!(Path::new(f).exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn parquet_writer_error_propagation_on_invalid_output_dir() {
+        // Create a path that is a file (not a directory); writer should error when trying to create file under it
+        let base = tempfile::tempdir().unwrap();
+        let not_a_dir = base.path().join("not_a_dir");
+        // Create a file at not_a_dir
+        tokio::fs::write(&not_a_dir, b"block").await.unwrap();
+
+        let schema = int32_schema();
+        let config = InitialCopyWriterConfig {
+            target_file_size_bytes: usize::MAX,
+            max_rows_per_batch: 1024,
+            num_writer_tasks: 1,
+            batch_channel_capacity: 2,
+        };
+
+        let (tx, rx) = create_batch_channel(2);
+        let shared_rx = SharedBatchReceiver::new(rx);
+        let writer = ParquetFileWriter::new(not_a_dir.clone(), schema.clone(), config.clone());
+        let handle = tokio::spawn(async move { writer.write_from_shared(shared_rx).await });
+
+        // Send one batch to trigger file creation under a non-directory parent
+        tx.send(make_batch(&[42])).await.unwrap();
+        drop(tx);
+
+        let res = handle.await.unwrap();
+        assert!(
+            res.is_err(),
+            "writer should return error on invalid output dir"
+        );
     }
 }

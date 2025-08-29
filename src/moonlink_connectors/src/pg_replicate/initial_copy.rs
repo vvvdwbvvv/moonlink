@@ -1,6 +1,7 @@
 use crate::pg_replicate::conversions::table_row::TableRow;
 use crate::pg_replicate::initial_copy_writer::{
     create_batch_channel, ArrowBatchBuilder, InitialCopyWriterConfig, ParquetFileWriter,
+    SharedBatchReceiver,
 };
 use crate::pg_replicate::postgres_source::TableCopyStreamError;
 use crate::pg_replicate::postgres_source::{PostgresSource, TableCopyStream};
@@ -42,27 +43,36 @@ where
     let (arrow_schema, _identity_prop) = postgres_schema_to_moonlink_schema(&table_schema);
     let arrow_schema = Arc::new(arrow_schema);
 
+    let mut config = config.unwrap_or_default();
+    // Use 4 parallel writers
+    config.num_writer_tasks = 4;
+
     // Create output directory for initial copy files
     let output_dir = std::env::temp_dir()
         .join("moonlink_initial_copy")
         .join(format!("table_{}", table_schema.src_table_id));
 
     // Create batch channel for RecordBatches
-    let (batch_tx, batch_rx) = create_batch_channel(16); // Channel capacity of 16
-
-    let config = config.unwrap_or_default();
+    let (batch_tx, batch_rx) = create_batch_channel(config.batch_channel_capacity);
 
     // Create Arrow batch builder
     let mut batch_builder = ArrowBatchBuilder::new(arrow_schema.clone(), config.max_rows_per_batch);
 
-    // Create and spawn Parquet file writer
-    let parquet_writer = ParquetFileWriter {
-        output_dir,
-        schema: arrow_schema,
-        config,
-    };
-    let writer_handle =
-        tokio::spawn(async move { parquet_writer.write_from_channel(batch_rx).await });
+    // Create shared receiver and spawn N Parquet writer tasks
+    let shared_rx = SharedBatchReceiver::new(batch_rx);
+    let num_workers = config.num_writer_tasks.max(1);
+    let mut writer_handles = Vec::with_capacity(num_workers);
+    for _ in 0..num_workers {
+        let writer = ParquetFileWriter {
+            output_dir: output_dir.clone(),
+            schema: arrow_schema.clone(),
+            config: config.clone(),
+        };
+        let rx = shared_rx.clone();
+        writer_handles.push(tokio::spawn(
+            async move { writer.write_from_shared(rx).await },
+        ));
+    }
 
     // Stream rows into batches
     pin_mut!(stream);
@@ -90,8 +100,12 @@ where
     // Close channel to signal writer completion
     drop(batch_tx);
 
-    // Wait for writer to finish and get list of files written
-    let files_written = writer_handle.await??;
+    // Wait for all writers to finish and collect file paths
+    let mut files_written: Vec<String> = Vec::new();
+    for handle in writer_handles {
+        let mut files = handle.await??;
+        files_written.append(&mut files);
+    }
 
     tracing::info!(
         "Initial copy completed: {} rows, {} files written",
@@ -269,6 +283,8 @@ mod tests {
         let config = InitialCopyWriterConfig {
             target_file_size_bytes: 1024, // ~1KB
             max_rows_per_batch: 10,
+            num_writer_tasks: 1,
+            batch_channel_capacity: 16,
         };
 
         // Build many rows
@@ -339,5 +355,168 @@ mod tests {
             "unexpected error string: {}",
             err.to_string()
         );
+    }
+
+    // ----------------------------------------------------------------------
+    // Integration tests
+    // ----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn ic_multi_writer_end_to_end() {
+        // 50 rows, small batches, rotate each write to maximize file count
+        let config = InitialCopyWriterConfig {
+            target_file_size_bytes: 0,
+            max_rows_per_batch: 10,
+            num_writer_tasks: 3,
+            batch_channel_capacity: 8,
+        };
+
+        let mut rows = Vec::new();
+        for i in 0..50 {
+            rows.push(Ok(TableRow {
+                values: vec![Cell::I32(i)],
+            }));
+        }
+        let stream = stream::iter(rows);
+        let (tx, mut rx) = mpsc::channel::<TableEvent>(8);
+        let schema = make_test_schema("mw_e2e");
+
+        let _ = copy_table_stream(schema, Box::pin(stream), &tx, 7, Some(config))
+            .await
+            .expect("copy failed");
+
+        let evt = timeout(Duration::from_millis(1000), rx.recv())
+            .await
+            .expect("channel lag")
+            .expect("sender closed");
+        let files = match evt {
+            TableEvent::LoadFiles { files, lsn } => {
+                assert_eq!(lsn, 7);
+                assert!(files.len() >= 3, "expected >= 3 files, got {}", files.len());
+                files
+            }
+            _ => panic!("expected LoadFiles"),
+        };
+        for f in &files {
+            assert!(Path::new(f).exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn ic_empty_with_n_gt_1() {
+        // No rows, 4 writers => LoadFiles empty, and directory should be empty
+        let table_id = 7654u32;
+        let config = InitialCopyWriterConfig {
+            target_file_size_bytes: usize::MAX,
+            max_rows_per_batch: 1024,
+            num_writer_tasks: 4,
+            batch_channel_capacity: 4,
+        };
+
+        let stream =
+            stream::iter(Vec::<std::result::Result<TableRow, TableCopyStreamError>>::new());
+        let (tx, mut rx) = mpsc::channel::<TableEvent>(8);
+        let mut schema = make_test_schema("empty_n");
+        schema.src_table_id = table_id;
+
+        let _ = copy_table_stream(schema, Box::pin(stream), &tx, 0, Some(config))
+            .await
+            .expect("copy failed");
+
+        let evt = timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("channel lag")
+            .expect("sender closed");
+        match evt {
+            TableEvent::LoadFiles { files, lsn } => {
+                assert!(files.is_empty());
+                assert_eq!(lsn, 0);
+            }
+            _ => panic!("expected LoadFiles"),
+        }
+
+        // Check the default directory used by writers
+        let default_dir = std::env::temp_dir()
+            .join("moonlink_initial_copy")
+            .join(format!("table_{}", table_id));
+        if default_dir.exists() {
+            let mut entries = tokio::fs::read_dir(&default_dir).await.unwrap();
+            let mut count = 0;
+            while let Ok(Some(_)) = entries.next_entry().await {
+                count += 1;
+            }
+            assert_eq!(count, 0, "output directory should be empty");
+        }
+    }
+
+    #[tokio::test]
+    async fn ic_writer_error_propagation_via_default_dir_collision() {
+        let table_id = 7777u32;
+        let default_dir = std::env::temp_dir()
+            .join("moonlink_initial_copy")
+            .join(format!("table_{}", table_id));
+        // Ensure parent exists and create a file at the would-be directory path
+        if let Some(parent) = default_dir.parent() {
+            tokio::fs::create_dir_all(parent).await.unwrap();
+        }
+        tokio::fs::write(&default_dir, b"block").await.unwrap();
+
+        let config = InitialCopyWriterConfig {
+            target_file_size_bytes: usize::MAX,
+            max_rows_per_batch: 1024,
+            num_writer_tasks: 2,
+            batch_channel_capacity: 4,
+        };
+
+        let rows = vec![Ok(TableRow {
+            values: vec![Cell::I32(1)],
+        })];
+        let stream = stream::iter(rows);
+        let (tx, _rx) = mpsc::channel::<TableEvent>(8);
+        let mut schema = make_test_schema("err_out_dir_default");
+        schema.src_table_id = table_id;
+
+        let err = copy_table_stream(schema, Box::pin(stream), &tx, 1, Some(config))
+            .await
+            .expect_err("expected failure");
+        let s = err.to_string().to_lowercase();
+        assert!(s.contains("io") || s.contains("parquet") || s.contains("create"));
+    }
+
+    #[tokio::test]
+    async fn ic_backpressure_sanity() {
+        // Channel capacity 1, many rows, small batch size, small rotation threshold
+        let config = InitialCopyWriterConfig {
+            target_file_size_bytes: 0,
+            max_rows_per_batch: 5,
+            num_writer_tasks: 2,
+            batch_channel_capacity: 1,
+        };
+
+        let mut rows = Vec::new();
+        for i in 0..200 {
+            rows.push(Ok(TableRow {
+                values: vec![Cell::I32(i)],
+            }));
+        }
+        let stream = stream::iter(rows);
+        let (tx, mut rx) = mpsc::channel::<TableEvent>(8);
+        let schema = make_test_schema("backpressure");
+
+        let _ = copy_table_stream(schema, Box::pin(stream), &tx, 9, Some(config))
+            .await
+            .expect("copy failed");
+
+        let evt = timeout(Duration::from_millis(2000), rx.recv())
+            .await
+            .expect("channel lag")
+            .expect("sender closed");
+        match evt {
+            TableEvent::LoadFiles { files, lsn } => {
+                assert_eq!(lsn, 9);
+                assert!(!files.is_empty());
+            }
+            _ => panic!("expected LoadFiles"),
+        }
     }
 }
