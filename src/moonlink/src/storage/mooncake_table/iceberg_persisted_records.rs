@@ -29,6 +29,7 @@ impl IcebergPersistedRecords {
             assert!(self.import_result.is_empty());
             assert!(self.index_merge_result.is_empty());
             assert!(self.data_compaction_result.is_empty());
+            assert!(self.data_compaction_result.is_empty());
             return true;
         }
 

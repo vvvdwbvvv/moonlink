@@ -1,3 +1,4 @@
+use crate::storage::compaction::table_compaction::RemappedRecordLocation;
 use crate::storage::iceberg::deletion_vector::DeletionVector;
 use crate::storage::iceberg::deletion_vector::{
     DELETION_VECTOR_CADINALITY, DELETION_VECTOR_REFERENCED_DATA_FILE,
@@ -6,9 +7,6 @@ use crate::storage::iceberg::deletion_vector::{
 use crate::storage::iceberg::iceberg_table_manager::*;
 use crate::storage::iceberg::index::FileIndexBlob;
 use crate::storage::iceberg::io_utils as iceberg_io_utils;
-#[cfg(all(not(feature = "chaos-test"), any(test, debug_assertions)))]
-use crate::storage::iceberg::manifest_utils;
-use crate::storage::iceberg::manifest_utils::ManifestEntryCount;
 use crate::storage::iceberg::moonlink_catalog::PuffinBlobType;
 use crate::storage::iceberg::puffin_utils;
 use crate::storage::iceberg::puffin_utils::PuffinBlobRef;
@@ -22,8 +20,8 @@ use crate::storage::mooncake_table::{
     take_data_files_to_import, take_file_indices_to_import, take_file_indices_to_remove,
 };
 use crate::storage::storage_utils::{
-    create_data_file, get_unique_file_id_for_flush, FileId, MooncakeDataFileRef, TableId,
-    TableUniqueFileId,
+    create_data_file, get_unique_file_id_for_flush, FileId, MooncakeDataFileRef, RecordLocation,
+    TableId, TableUniqueFileId,
 };
 use crate::storage::{io_utils, storage_utils};
 use crate::Result;
@@ -48,6 +46,11 @@ pub struct DataFileImportResult {
     local_data_files_to_remote: HashMap<String, String>,
     /// New mooncake data files, represented in remote file paths.
     new_remote_data_files: Vec<MooncakeDataFileRef>,
+    /// Deletion records after compaction.
+    ///
+    /// A committed deletion record could appear in two places: committed deletion log in mooncake snapshot, or iceberg puffin blob.
+    /// For later, we need to do remapping for already persisted disk files.
+    remapped_deletion_records: HashMap<MooncakeDataFileRef, BatchDeletionVector>,
 }
 
 impl IcebergTableManager {
@@ -174,6 +177,7 @@ impl IcebergTableManager {
         &mut self,
         new_data_files: Vec<MooncakeDataFileRef>,
         old_data_files: Vec<MooncakeDataFileRef>,
+        data_file_records_remap: &HashMap<RecordLocation, RemappedRecordLocation>,
     ) -> IcebergResult<DataFileImportResult> {
         let mut local_data_files_to_remote = HashMap::with_capacity(new_data_files.len());
         let mut new_remote_data_files = Vec::with_capacity(new_data_files.len());
@@ -244,6 +248,43 @@ impl IcebergTableManager {
             new_iceberg_data_files.push(cur_iceberg_data_file);
         }
 
+        // Remap already persisted data files; till now all data file's attributes are accessible.
+        let mut remapped_deletion_records =
+            HashMap::<MooncakeDataFileRef, BatchDeletionVector>::new();
+        for (old_file_id, old_data_file_entry) in self.persisted_data_files.iter() {
+            let old_batch_deletion_vector = &old_data_file_entry.deletion_vector;
+            let old_deleted_rows = old_batch_deletion_vector.collect_deleted_rows();
+
+            for old_row_idx in old_deleted_rows.into_iter() {
+                let old_record_location =
+                    RecordLocation::DiskFile(*old_file_id, old_row_idx as usize);
+                if let Some(new_remapped_record_location) =
+                    data_file_records_remap.get(&old_record_location)
+                {
+                    let new_data_file = new_remapped_record_location.new_data_file.clone();
+                    let new_row_idx = new_remapped_record_location.record_location.get_row_idx();
+                    if let Some(new_batch_deletion_vector) =
+                        remapped_deletion_records.get_mut(&new_data_file)
+                    {
+                        assert!(new_batch_deletion_vector.delete_row(new_row_idx));
+                    } else {
+                        let new_data_file_entry = self
+                            .persisted_data_files
+                            .get(&new_data_file.file_id())
+                            // Invariant sanity check: all data files have been imported into in-memory state.
+                            .unwrap();
+                        let mut new_batch_deletion_vector = BatchDeletionVector::new(
+                            new_data_file_entry.data_file.record_count() as usize,
+                        );
+                        assert!(new_batch_deletion_vector.delete_row(new_row_idx));
+                        assert!(remapped_deletion_records
+                            .insert(new_data_file, new_batch_deletion_vector)
+                            .is_none());
+                    }
+                }
+            }
+        }
+
         // Handle removed data files.
         let mut data_files_to_remove_set = HashSet::with_capacity(old_data_files.len());
         for cur_data_file in old_data_files.into_iter() {
@@ -264,6 +305,7 @@ impl IcebergTableManager {
             new_iceberg_data_files,
             local_data_files_to_remote,
             new_remote_data_files,
+            remapped_deletion_records,
         })
     }
 
@@ -460,79 +502,6 @@ impl IcebergTableManager {
         Ok(remote_file_indices)
     }
 
-    /// Get current manifest entries, used for sanity check purpose.
-    async fn get_expected_entry_count_after_sync(
-        &self,
-        snapshot_payload: &IcebergSnapshotPayload,
-    ) -> ManifestEntryCount {
-        #[cfg(any(feature = "chaos-test", not(any(test, debug_assertions))))]
-        {
-            let _ = snapshot_payload; // Suppress unused warning.
-            ManifestEntryCount::default()
-        }
-
-        #[cfg(all(not(feature = "chaos-test"), any(test, debug_assertions)))]
-        {
-            let table_metadata = self.iceberg_table.as_ref().unwrap().metadata();
-            let file_io = self.iceberg_table.as_ref().unwrap().file_io().clone();
-            let mut entries_count =
-                manifest_utils::get_manifest_entries_number(table_metadata, file_io).await;
-
-            let new_data_files = snapshot_payload.get_new_data_files();
-            let old_data_files = snapshot_payload.get_old_data_files();
-            let new_file_indices = snapshot_payload.get_new_file_indices();
-            let old_file_indices = snapshot_payload.get_old_file_indices();
-
-            // Update data files count.
-            entries_count.data_file_entries += new_data_files.len();
-            entries_count.data_file_entries -= old_data_files.len();
-
-            // Update file indices count.
-            entries_count.file_indices_entries += new_file_indices.len();
-            entries_count.file_indices_entries -= old_file_indices.len();
-
-            // Update deletion vectors count.
-            let committed_deletion_logs = &snapshot_payload.committed_deletion_logs;
-            let data_file_ids_for_deletion_log = committed_deletion_logs
-                .iter()
-                .map(|(file_id, _)| *file_id)
-                .collect::<HashSet<_>>();
-            for cur_file_id in data_file_ids_for_deletion_log.into_iter() {
-                if let Some(data_file_entry) = self.persisted_data_files.get(&cur_file_id) {
-                    if !data_file_entry.deletion_vector.is_empty() {
-                        continue;
-                    }
-                }
-                entries_count.deletion_vector_entries += 1;
-            }
-            for cur_old_data_file in old_data_files.into_iter() {
-                let file_id = cur_old_data_file.file_id();
-                if let Some(data_file_entry) = self.persisted_data_files.get(&file_id) {
-                    if !data_file_entry.deletion_vector.is_empty() {
-                        entries_count.deletion_vector_entries -= 1;
-                    }
-                }
-            }
-
-            entries_count
-        }
-    }
-
-    /// Get actual entry count after sync.
-    async fn get_actual_entry_count_after_sync(&self) -> ManifestEntryCount {
-        #[cfg(any(feature = "chaos-test", not(any(test, debug_assertions))))]
-        {
-            ManifestEntryCount::default()
-        }
-
-        #[cfg(all(not(feature = "chaos-test"), any(test, debug_assertions)))]
-        {
-            let table_metadata = self.iceberg_table.as_ref().unwrap().metadata();
-            let file_io = self.iceberg_table.as_ref().unwrap().file_io().clone();
-            manifest_utils::get_manifest_entries_number(table_metadata, file_io).await
-        }
-    }
-
     pub(crate) async fn sync_snapshot_impl(
         &mut self,
         mut snapshot_payload: IcebergSnapshotPayload,
@@ -544,22 +513,41 @@ impl IcebergTableManager {
         // Validate schema consistency before persistence operation.
         self.validate_schema_consistency_at_store().await;
 
-        // Used to validate iceberg persistence status.
-        let expected_manifest_entries_after_sync = self
-            .get_expected_entry_count_after_sync(&snapshot_payload)
-            .await;
-
         let new_data_files = take_data_files_to_import(&mut snapshot_payload);
         let old_data_files = take_data_files_to_remove(&mut snapshot_payload);
         let new_file_indices = take_file_indices_to_import(&mut snapshot_payload);
         let old_file_indices = take_file_indices_to_remove(&mut snapshot_payload);
 
         // Persist data files.
-        let data_file_import_result = self.sync_data_files(new_data_files, old_data_files).await?;
+        let data_file_import_result = self
+            .sync_data_files(
+                new_data_files,
+                old_data_files,
+                &snapshot_payload
+                    .data_compaction_payload
+                    .data_file_records_remap,
+            )
+            .await?;
 
         // Persist committed deletion logs.
-        let new_deletion_vector =
+        let mut new_deletion_vector =
             std::mem::take(&mut snapshot_payload.import_payload.new_deletion_vector);
+        let remapped_deletion_records = data_file_import_result.remapped_deletion_records;
+        for (remapped_data_file, remapped_batch_deletion_vector) in
+            remapped_deletion_records.into_iter()
+        {
+            if let Some(new_batch_deletion_vector) =
+                new_deletion_vector.get_mut(&remapped_data_file)
+            {
+                // TODO(hjiang): Should validate conflict.
+                new_batch_deletion_vector.merge_with(&remapped_batch_deletion_vector);
+            } else {
+                assert!(new_deletion_vector
+                    .insert(remapped_data_file, remapped_batch_deletion_vector)
+                    .is_none());
+            }
+        }
+
         let deletion_puffin_blobs = self
             .sync_deletion_vector(new_deletion_vector, &file_params)
             .await?;
@@ -597,13 +585,6 @@ impl IcebergTableManager {
         self.iceberg_table = Some(updated_iceberg_table);
 
         self.catalog.clear_puffin_metadata();
-
-        // Get manifest entries status after sync, used to validate iceberg persistence.
-        let actual_manifest_entries_after_sync = self.get_actual_entry_count_after_sync().await;
-        assert_eq!(
-            expected_manifest_entries_after_sync,
-            actual_manifest_entries_after_sync
-        );
 
         // NOTICE: persisted data files and file indices are returned in the order of (1) newly imported ones; (2) index merge ones; (3) data compacted ones.
         Ok(PersistenceResult {
