@@ -501,6 +501,7 @@ impl ChaosState {
             self.next_id += 1;
             return row;
         }
+
         let mut candidates: Vec<(i32, MoonlinkRow)> = self
             .committed_inserted_rows
             .iter()
@@ -600,6 +601,7 @@ impl ChaosState {
         self.try_push_read_snapshot_cmd(&mut choices);
         self.try_push_table_maintenance_cmd(&mut choices);
         if self.txn_state == TxnState::Empty {
+            // Upsert table doesn't support streaming transaction.
             if !self.is_upsert_table {
                 choices.push(EventKind::BeginStreamingTxn);
             }
@@ -1562,14 +1564,65 @@ async fn test_append_only_chaos_on_local_fs_with_data_compaction() {
     chaos_test_impl(env).await;
 }
 
+/// ============================
+/// Upsert table operations
+/// ============================
+///
+/// Chaos test with no background table maintenance enabled.
 #[named]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_upsert_chaos_on_local_fs_with_data_compaction() {
+async fn test_upsert_chaos_with_no_background_maintenance() {
     let iceberg_temp_dir = tempdir().unwrap();
     let root_directory = iceberg_temp_dir.path().to_str().unwrap().to_string();
     let test_env_config = TestEnvConfig {
         test_name: function_name!(),
-        local_filesystem_optimization_enabled: false,
+        local_filesystem_optimization_enabled: true,
+        disk_slice_write_chaos_enabled: false,
+        special_table_option: SpecialTableOption::UpsertDeleteIfExists,
+        maintenance_option: TableMaintenanceOption::NoTableMaintenance,
+        error_injection_enabled: false,
+        event_count: 3500,
+        storage_config: StorageConfig::FileSystem {
+            root_directory,
+            atomic_write_dir: None,
+        },
+    };
+    let env = TestEnvironment::new(test_env_config).await;
+    chaos_test_impl(env).await;
+}
+
+/// Chaos test with index merge enabled by default.
+#[named]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_upsert_chaos_with_index_merge() {
+    let iceberg_temp_dir = tempdir().unwrap();
+    let root_directory = iceberg_temp_dir.path().to_str().unwrap().to_string();
+    let test_env_config = TestEnvConfig {
+        test_name: function_name!(),
+        local_filesystem_optimization_enabled: true,
+        disk_slice_write_chaos_enabled: false,
+        special_table_option: SpecialTableOption::UpsertDeleteIfExists,
+        maintenance_option: TableMaintenanceOption::IndexMerge,
+        error_injection_enabled: false,
+        event_count: 3500,
+        storage_config: StorageConfig::FileSystem {
+            root_directory,
+            atomic_write_dir: None,
+        },
+    };
+    let env = TestEnvironment::new(test_env_config).await;
+    chaos_test_impl(env).await;
+}
+
+/// Chaos test with data compaction enabled by default.
+#[named]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_upsert_chaos_with_data_compaction() {
+    let iceberg_temp_dir = tempdir().unwrap();
+    let root_directory = iceberg_temp_dir.path().to_str().unwrap().to_string();
+    let test_env_config = TestEnvConfig {
+        test_name: function_name!(),
+        local_filesystem_optimization_enabled: true,
         disk_slice_write_chaos_enabled: false,
         special_table_option: SpecialTableOption::UpsertDeleteIfExists,
         maintenance_option: TableMaintenanceOption::DataCompaction,
