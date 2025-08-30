@@ -2,12 +2,12 @@ mod common;
 
 #[cfg(test)]
 mod tests {
-    use crate::common::{ids_from_state, SRC_URI};
+    use crate::common::ids_from_state;
 
     use super::common::{
         assert_scan_ids_eq, crash_and_recover_backend_with_guard, create_backend_from_base_path,
-        current_wal_lsn, get_serialized_table_config, smoke_create_and_insert, TestGuard,
-        TestGuardMode, DATABASE, TABLE,
+        current_wal_lsn, get_database_uri, get_serialized_table_config, smoke_create_and_insert,
+        TestGuard, TestGuardMode, DATABASE, TABLE,
     };
     use moonlink_backend::RowEventOperation;
     use moonlink_backend::{table_status::TableStatus, REST_API_URI};
@@ -28,6 +28,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
     async fn test_moonlink_service() {
+        let uri = get_database_uri();
         let (guard, client) = TestGuard::new(Some("test"), true).await;
         let backend = guard.backend();
         // Till now, table already created at backend.
@@ -37,14 +38,14 @@ mod tests {
             .drop_table(DATABASE.to_string(), TABLE.to_string())
             .await
             .unwrap();
-        smoke_create_and_insert(guard.tmp().unwrap(), backend, &client, SRC_URI).await;
+        smoke_create_and_insert(guard.tmp().unwrap(), backend, &client, &uri).await;
 
         // Second round of table operations.
         backend
             .drop_table(DATABASE.to_string(), TABLE.to_string())
             .await
             .unwrap();
-        smoke_create_and_insert(guard.tmp().unwrap(), backend, &client, SRC_URI).await;
+        smoke_create_and_insert(guard.tmp().unwrap(), backend, &client, &uri).await;
     }
 
     /// Testing scenario: drop a non-existent table shouldn't crash.
@@ -206,6 +207,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
     async fn test_replication_connection_cleanup() {
+        let uri = get_database_uri();
         let (guard, client) = TestGuard::new(Some("repl_test"), true).await;
         let backend = guard.backend();
 
@@ -243,7 +245,7 @@ mod tests {
                 DATABASE.to_string(),
                 TABLE.to_string(),
                 /*table_name=*/ "public.repl_test".to_string(),
-                SRC_URI.to_string(),
+                uri,
                 guard.get_serialized_table_config(),
                 None, /* input_schema */
             )
@@ -352,6 +354,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
     async fn test_recovery() {
+        let uri = get_database_uri();
         let (mut guard, client) = TestGuard::new(Some("recovery"), true).await;
         guard.set_test_mode(TestGuardMode::Crash);
         let backend = guard.backend();
@@ -368,7 +371,7 @@ mod tests {
                 DATABASE.to_string(),
                 TABLE.to_string(),
                 "public.recovery".to_string(),
-                SRC_URI.to_string(),
+                uri,
                 guard.get_serialized_table_config(),
                 None, /* input_schema */
             )
@@ -508,6 +511,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
     async fn test_recovery_with_wal_only() {
+        let uri = get_database_uri();
         let (mut guard, client) = TestGuard::new(Some("recovery"), false).await;
         guard.set_test_mode(TestGuardMode::Crash);
         let backend = guard.backend();
@@ -522,7 +526,7 @@ mod tests {
                 DATABASE.to_string(),
                 TABLE.to_string(),
                 "public.recovery".to_string(),
-                SRC_URI.to_string(),
+                uri,
                 guard.get_serialized_table_config(),
                 None, /* input_schema */
             )
@@ -599,8 +603,9 @@ mod tests {
     async fn test_recovery_with_wal_and_incomplete_pg_replay(#[case] use_iceberg: bool) {
         use crate::common::{connect_to_postgres, create_backend_from_tempdir};
 
+        let uri = get_database_uri();
         let (mut guard, client1) = TestGuard::new(Some("recovery"), false).await;
-        let (mut client2, _) = connect_to_postgres().await;
+        let (mut client2, _) = connect_to_postgres(&uri).await;
 
         guard.set_test_mode(TestGuardMode::Crash);
 
@@ -626,7 +631,7 @@ mod tests {
                 DATABASE.to_string(),
                 TABLE.to_string(),
                 "public.recovery".to_string(),
-                SRC_URI.to_string(),
+                uri.clone(),
                 guard.get_serialized_table_config(),
                 None, /* input_schema */
             )
@@ -674,7 +679,7 @@ mod tests {
         // Shutdown connection, THEN commit transaction while the backend is not running
         // On recovery, both the WAL and postgres should be replaying the same events, but
         // we test here for deduplication of events.
-        guard.backend().shutdown_connection(SRC_URI, false).await;
+        guard.backend().shutdown_connection(&uri, false).await;
         let testing_directory = guard.take_test_directory();
         drop(guard);
         transaction.commit().await.unwrap();
@@ -721,6 +726,7 @@ mod tests {
     async fn test_recovery_with_wal_pg_runs_ahead(#[case] use_iceberg: bool) {
         use crate::common::create_backend_from_tempdir;
 
+        let uri = get_database_uri();
         let (mut guard, client) = TestGuard::new(Some("recovery"), false).await;
         guard.set_test_mode(TestGuardMode::Crash);
         let backend = guard.backend();
@@ -736,7 +742,7 @@ mod tests {
                 DATABASE.to_string(),
                 TABLE.to_string(),
                 "public.recovery".to_string(),
-                SRC_URI.to_string(),
+                uri.clone(),
                 guard.get_serialized_table_config(),
                 None, /* input_schema */
             )
@@ -778,7 +784,7 @@ mod tests {
         }
 
         // Insert more rows while the backend is not running
-        guard.backend().shutdown_connection(SRC_URI, false).await;
+        guard.backend().shutdown_connection(&uri, false).await;
         for i in 20..30 {
             client
                 .simple_query(&format!("INSERT INTO recovery VALUES ({i},'{i}');"))
@@ -807,6 +813,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
     async fn test_recovery_with_wal_and_iceberg_snapshot() {
+        let uri = get_database_uri();
         let (mut guard, client) = TestGuard::new(Some("recovery"), false).await;
         guard.set_test_mode(TestGuardMode::Crash);
         let backend = guard.backend();
@@ -821,7 +828,7 @@ mod tests {
                 DATABASE.to_string(),
                 TABLE.to_string(),
                 "public.recovery".to_string(),
-                SRC_URI.to_string(),
+                uri,
                 guard.get_serialized_table_config(),
                 None, /* input_schema */
             )
