@@ -11,7 +11,7 @@ use moonlink::{
 use serde::{Deserialize, Serialize};
 
 /// Mooncake table config.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct MooncakeConfig {
     /// Whether background regular index merge is enabled.
     #[serde(default)]
@@ -20,42 +20,25 @@ pub struct MooncakeConfig {
     #[serde(default)]
     pub skip_data_compaction: bool,
     /// Whether this is an append-only table (no indexes, no deletes).
-    #[serde(default = "MooncakeConfig::default_append_only")]
-    pub append_only: bool,
+    #[serde(default)]
+    pub append_only: Option<bool>,
     /// Row identity of the table.
-    #[serde(default = "MooncakeConfig::default_row_identity")]
-    pub row_identity: IdentityProp,
-}
-
-impl Default for MooncakeConfig {
-    fn default() -> Self {
-        Self {
-            skip_index_merge: false,
-            skip_data_compaction: false,
-            append_only: MooncakeConfig::default_append_only(),
-            row_identity: MooncakeConfig::default_row_identity(),
-        }
-    }
+    #[serde(default)]
+    pub row_identity: Option<IdentityProp>,
 }
 
 impl MooncakeConfig {
-    // Notice, default value for the table config should be a valid combination.
-    const DEFAULT_APPEND_ONLY: bool = true;
-    const DEFAULT_ROW_IDENTITY: IdentityProp = IdentityProp::None;
-
-    pub fn default_append_only() -> bool {
-        Self::DEFAULT_APPEND_ONLY
-    }
-    pub fn default_row_identity() -> IdentityProp {
-        Self::DEFAULT_ROW_IDENTITY
-    }
-
     /// Return whether config is valid.
     pub fn is_valid(&self) -> bool {
-        if self.append_only && self.row_identity != IdentityProp::None {
+        if self.append_only.is_none() || self.row_identity.is_none() {
             return false;
         }
-        if self.row_identity == IdentityProp::None && !self.append_only {
+
+        if self.append_only.unwrap() && *self.row_identity.as_ref().unwrap() != IdentityProp::None {
+            return false;
+        }
+        if *self.row_identity.as_ref().unwrap() == IdentityProp::None && !self.append_only.unwrap()
+        {
             return false;
         }
         true
@@ -65,7 +48,14 @@ impl MooncakeConfig {
     pub(crate) fn take_as_mooncake_table_config(
         self,
         temp_files_dir: String,
-    ) -> MooncakeTableConfig {
+    ) -> Result<MooncakeTableConfig> {
+        if !self.is_valid() {
+            return Err(Error::invalid_config(format!(
+                "Invalid config for {:?}",
+                &self
+            )));
+        }
+
         let index_merge_config = if self.skip_index_merge {
             FileIndexMergeConfig::disabled()
         } else {
@@ -80,9 +70,9 @@ impl MooncakeConfig {
         let mut mooncake_table_config = MooncakeTableConfig::new(temp_files_dir);
         mooncake_table_config.file_index_config = index_merge_config;
         mooncake_table_config.data_compaction_config = data_compaction_config;
-        mooncake_table_config.append_only = self.append_only;
-        mooncake_table_config.row_identity = self.row_identity;
-        mooncake_table_config
+        mooncake_table_config.append_only = self.append_only.unwrap();
+        mooncake_table_config.row_identity = self.row_identity.unwrap();
+        Ok(mooncake_table_config)
     }
 }
 
@@ -131,14 +121,6 @@ impl TableConfig {
             config.wal_config = Some(AccessorConfig::new_with_storage_config(storage_config));
         }
 
-        // Check whehther config is valid.
-        if !config.is_valid() {
-            // WARNING: table config could contain sensitive information like secrets, we should use customized stringify function, which hides certain information, instead of directly using the raw json string.
-            return Err(Error::invalid_config(format!(
-                "Table config {config:?} is invalid"
-            )));
-        }
-
         Ok(config)
     }
 
@@ -147,11 +129,18 @@ impl TableConfig {
         self,
         temp_files_dir: String,
         mooncake_table_id: &MooncakeTableId,
-    ) -> MoonlinkTableConfig {
-        MoonlinkTableConfig {
+    ) -> Result<MoonlinkTableConfig> {
+        if !self.is_valid() {
+            return Err(Error::invalid_config(format!(
+                "Invalid config for {:?}",
+                &self
+            )));
+        }
+
+        let config = MoonlinkTableConfig {
             mooncake_table_config: self
                 .mooncake_config
-                .take_as_mooncake_table_config(temp_files_dir),
+                .take_as_mooncake_table_config(temp_files_dir)?,
             iceberg_table_config: IcebergTableConfig {
                 namespace: vec![mooncake_table_id.database.clone()],
                 table_name: mooncake_table_id.table.clone(),
@@ -164,7 +153,8 @@ impl TableConfig {
                 self.wal_config.unwrap(),
                 &mooncake_table_id.to_string(),
             ),
-        }
+        };
+        Ok(config)
     }
 }
 
@@ -181,8 +171,8 @@ mod tests {
             mooncake_config: MooncakeConfig {
                 skip_index_merge: false,
                 skip_data_compaction: false,
-                append_only: true,
-                row_identity: IdentityProp::None,
+                append_only: None,
+                row_identity: None,
             },
             iceberg_config: Some(AccessorConfig::new_with_storage_config(
                 moonlink::StorageConfig::FileSystem {
@@ -234,8 +224,8 @@ mod tests {
             mooncake_config: MooncakeConfig {
                 skip_index_merge: true,
                 skip_data_compaction: false,
-                append_only: true,
-                row_identity: IdentityProp::None,
+                append_only: None,
+                row_identity: None,
             },
             iceberg_config: Some(AccessorConfig::new_with_storage_config(
                 moonlink::StorageConfig::FileSystem {
@@ -296,8 +286,8 @@ mod tests {
             mooncake_config: MooncakeConfig {
                 skip_index_merge: true,
                 skip_data_compaction: false,
-                append_only: true,
-                row_identity: IdentityProp::None,
+                append_only: None,
+                row_identity: None,
             },
             iceberg_config: Some(AccessorConfig::new_with_storage_config(
                 moonlink::StorageConfig::Gcs {
@@ -368,8 +358,8 @@ mod tests {
             mooncake_config: MooncakeConfig {
                 skip_index_merge: true,
                 skip_data_compaction: false,
-                append_only: true,
-                row_identity: IdentityProp::None,
+                append_only: None,
+                row_identity: None,
             },
             iceberg_config: Some(AccessorConfig::new_with_storage_config(
                 moonlink::StorageConfig::S3 {
@@ -399,6 +389,7 @@ mod tests {
             {
                 "mooncake": {
                     "append_only": true,
+                    "row_identity": "None",
                     "skip_index_merge": true,
                     "skip_data_compaction": true
                 }
@@ -415,8 +406,8 @@ mod tests {
             mooncake_config: MooncakeConfig {
                 skip_index_merge: true,
                 skip_data_compaction: true,
-                append_only: true,
-                row_identity: IdentityProp::None,
+                append_only: Some(true),
+                row_identity: Some(IdentityProp::None),
             },
             iceberg_config: Some(AccessorConfig::new_with_storage_config(
                 moonlink::StorageConfig::FileSystem {
