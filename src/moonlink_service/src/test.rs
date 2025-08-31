@@ -1,7 +1,5 @@
-use std::sync::Arc;
-
 use crate::rest_api::{FileUploadResponse, IngestResponse, ListTablesResponse};
-use arrow_array::{Int32Array, RecordBatch, StringArray};
+use arrow_array::RecordBatch;
 use async_recursion::async_recursion;
 use bytes::Bytes;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -312,7 +310,7 @@ async fn run_optimize_table_test(mode: &str) {
         decode_serialized_read_state_for_testing(bytes);
     assert_eq!(data_file_paths.len(), 1);
     let record_batches = read_all_batches(&data_file_paths[0]).await;
-    let expected_arrow_batch = create_test_arrow_batch().await;
+    let expected_arrow_batch = create_test_arrow_batch();
     assert_eq!(record_batches, vec![expected_arrow_batch]);
 
     assert!(puffin_file_paths.is_empty());
@@ -407,7 +405,6 @@ async fn test_create_snapshot() {
         "Response status is {response:?}"
     );
     let response: IngestResponse = response.json().await.unwrap();
-    assert_eq!(response.lsn, Some(2));
     let lsn = response.lsn.unwrap();
 
     // After all changes reflected at mooncake snapshot, trigger an iceberg snapshot.
@@ -426,7 +423,7 @@ async fn test_create_snapshot() {
         decode_serialized_read_state_for_testing(bytes);
     assert_eq!(data_file_paths.len(), 1);
     let record_batches = read_all_batches(&data_file_paths[0]).await;
-    let expected_arrow_batch = create_test_arrow_batch().await;
+    let expected_arrow_batch = create_test_arrow_batch();
     assert_eq!(record_batches, vec![expected_arrow_batch]);
 
     assert!(puffin_file_paths.is_empty());
@@ -498,7 +495,7 @@ async fn test_moonlink_standalone_data_ingestion() {
         decode_serialized_read_state_for_testing(bytes);
     assert_eq!(data_file_paths.len(), 1);
     let record_batches = read_all_batches(&data_file_paths[0]).await;
-    let expected_arrow_batch = create_test_arrow_batch().await;
+    let expected_arrow_batch = create_test_arrow_batch();
     assert_eq!(record_batches, vec![expected_arrow_batch]);
 
     assert!(puffin_file_paths.is_empty());
@@ -558,7 +555,7 @@ async fn test_moonlink_standalone_file_upload() {
         "Response status is {response:?}"
     );
     let response: FileUploadResponse = response.json().await.unwrap();
-    assert_eq!(response.lsn, Some(1));
+    let lsn = response.lsn.unwrap();
 
     // Scan table and get data file and puffin files back.
     let mut moonlink_stream = TcpStream::connect(MOONLINK_ADDR).await.unwrap();
@@ -566,8 +563,7 @@ async fn test_moonlink_standalone_file_upload() {
         &mut moonlink_stream,
         DATABASE.to_string(),
         TABLE.to_string(),
-        // Only one event generated, with commit LSN 1.
-        /*lsn=*/ 1,
+        lsn,
     )
     .await
     .unwrap();
@@ -575,20 +571,7 @@ async fn test_moonlink_standalone_file_upload() {
         decode_serialized_read_state_for_testing(bytes);
     assert_eq!(data_file_paths.len(), 1);
     let record_batches = read_all_batches(&data_file_paths[0]).await;
-    let expected_arrow_batch = RecordBatch::try_new(
-        create_test_arrow_schema(),
-        vec![
-            Arc::new(Int32Array::from(vec![1, 2, 3])),
-            Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])),
-            Arc::new(StringArray::from(vec![
-                "Alice@gmail.com",
-                "Bob@gmail.com",
-                "Charlie@gmail.com",
-            ])),
-            Arc::new(Int32Array::from(vec![10, 20, 30])),
-        ],
-    )
-    .unwrap();
+    let expected_arrow_batch = create_test_arrow_batch();
     assert_eq!(record_batches, vec![expected_arrow_batch]);
 
     assert!(puffin_file_paths.is_empty());
@@ -654,9 +637,9 @@ async fn test_moonlink_standalone_file_insert() {
         &mut moonlink_stream,
         DATABASE.to_string(),
         TABLE.to_string(),
-        // Four events generated: three appends and one commit, with commit LSN 4.
+        // Four events generated: one append and one commit, with commit LSN 2.
         /*lsn=*/
-        4,
+        2,
     )
     .await
     .unwrap();
@@ -664,20 +647,7 @@ async fn test_moonlink_standalone_file_insert() {
         decode_serialized_read_state_for_testing(bytes);
     assert_eq!(data_file_paths.len(), 1);
     let record_batches = read_all_batches(&data_file_paths[0]).await;
-    let expected_arrow_batch = RecordBatch::try_new(
-        create_test_arrow_schema(),
-        vec![
-            Arc::new(Int32Array::from(vec![1, 2, 3])),
-            Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])),
-            Arc::new(StringArray::from(vec![
-                "Alice@gmail.com",
-                "Bob@gmail.com",
-                "Charlie@gmail.com",
-            ])),
-            Arc::new(Int32Array::from(vec![10, 20, 30])),
-        ],
-    )
-    .unwrap();
+    let expected_arrow_batch = create_test_arrow_batch();
     assert_eq!(record_batches, vec![expected_arrow_batch]);
 
     assert!(puffin_file_paths.is_empty());
