@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::rest_api::{FileUploadResponse, IngestResponse, ListTablesResponse};
 use arrow_array::{Int32Array, RecordBatch, StringArray};
 use async_recursion::async_recursion;
 use bytes::Bytes;
@@ -8,7 +9,6 @@ use serde_json::json;
 use serial_test::serial;
 use tokio::net::TcpStream;
 
-use crate::rest_api::{FileUploadResponse, ListTablesResponse};
 use crate::test_utils::*;
 use crate::{start_with_config, ServiceConfig, READINESS_PROBE_PORT};
 use moonlink::decode_serialized_read_state_for_testing;
@@ -110,6 +110,16 @@ fn get_optimize_table_payload(database: &str, table: &str, mode: &str) -> serde_
         "database": database,
         "table": table,
         "mode": mode
+    });
+    optimize_table_payload
+}
+
+/// Util function to get create snapshot payload.
+fn get_create_snapshot_payload(database: &str, table: &str, lsn: u64) -> serde_json::Value {
+    let optimize_table_payload = json!({
+        "database": database,
+        "table": table,
+        "lsn": lsn
     });
     optimize_table_payload
 }
@@ -302,16 +312,7 @@ async fn run_optimize_table_test(mode: &str) {
         decode_serialized_read_state_for_testing(bytes);
     assert_eq!(data_file_paths.len(), 1);
     let record_batches = read_all_batches(&data_file_paths[0]).await;
-    let expected_arrow_batch = RecordBatch::try_new(
-        create_test_arrow_schema(),
-        vec![
-            Arc::new(Int32Array::from(vec![1])),
-            Arc::new(StringArray::from(vec!["Alice Johnson".to_string()])),
-            Arc::new(StringArray::from(vec!["alice@example.com".to_string()])),
-            Arc::new(Int32Array::from(vec![30])),
-        ],
-    )
-    .unwrap();
+    let expected_arrow_batch = create_test_arrow_batch().await;
     assert_eq!(record_batches, vec![expected_arrow_batch]);
 
     assert!(puffin_file_paths.is_empty());
@@ -346,6 +347,102 @@ async fn test_optimize_table_on_index_mode() {
 #[serial]
 async fn test_optimize_table_on_data_mode() {
     run_optimize_table_test("data").await;
+}
+
+/// Util function to create snapshot via REST API.
+async fn create_snapshot(client: &reqwest::Client, database: &str, table: &str, lsn: u64) {
+    let payload = get_create_snapshot_payload(database, table, lsn);
+    let crafted_src_table_name = format!("{database}.{table}");
+    let response = client
+        .post(format!(
+            "{REST_ADDR}/tables/{crafted_src_table_name}/snapshot"
+        ))
+        .header("content-type", "application/json")
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "Response status is {response:?}"
+    );
+}
+
+/// Test Create Snapshot
+#[tokio::test]
+#[serial]
+async fn test_create_snapshot() {
+    cleanup_directory(&get_moonlink_backend_dir()).await;
+    let config = get_service_config();
+    tokio::spawn(async move {
+        start_with_config(config).await.unwrap();
+    });
+    test_readiness_probe().await;
+
+    // Create test table.
+    let client = reqwest::Client::new();
+    create_table(&client, DATABASE, TABLE).await;
+
+    // Ingest some data.
+    let insert_payload = json!({
+        "operation": "insert",
+        "request_mode": "sync",
+        "data": {
+            "id": 1,
+            "name": "Alice Johnson",
+            "email": "alice@example.com",
+            "age": 30
+        }
+    });
+    let crafted_src_table_name = format!("{DATABASE}.{TABLE}");
+    let response = client
+        .post(format!("{REST_ADDR}/ingest/{crafted_src_table_name}"))
+        .header("content-type", "application/json")
+        .json(&insert_payload)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "Response status is {response:?}"
+    );
+    let response: IngestResponse = response.json().await.unwrap();
+    assert_eq!(response.lsn, Some(2));
+    let lsn = response.lsn.unwrap();
+
+    // After all changes reflected at mooncake snapshot, trigger an iceberg snapshot.
+    create_snapshot(&client, DATABASE, TABLE, lsn).await;
+
+    let mut moonlink_stream = TcpStream::connect(MOONLINK_ADDR).await.unwrap();
+    let bytes = scan_table_begin(
+        &mut moonlink_stream,
+        DATABASE.to_string(),
+        TABLE.to_string(),
+        /*lsn=*/ lsn,
+    )
+    .await
+    .unwrap();
+    let (data_file_paths, puffin_file_paths, puffin_deletion, positional_deletion) =
+        decode_serialized_read_state_for_testing(bytes);
+    assert_eq!(data_file_paths.len(), 1);
+    let record_batches = read_all_batches(&data_file_paths[0]).await;
+    let expected_arrow_batch = create_test_arrow_batch().await;
+    assert_eq!(record_batches, vec![expected_arrow_batch]);
+
+    assert!(puffin_file_paths.is_empty());
+    assert!(puffin_deletion.is_empty());
+    assert!(positional_deletion.is_empty());
+
+    scan_table_end(
+        &mut moonlink_stream,
+        DATABASE.to_string(),
+        TABLE.to_string(),
+    )
+    .await
+    .unwrap();
+
+    // Cleanup shared directory.
+    cleanup_directory(&get_moonlink_backend_dir()).await;
 }
 
 /// Test basic table creation, insertion and query.
@@ -401,16 +498,7 @@ async fn test_moonlink_standalone_data_ingestion() {
         decode_serialized_read_state_for_testing(bytes);
     assert_eq!(data_file_paths.len(), 1);
     let record_batches = read_all_batches(&data_file_paths[0]).await;
-    let expected_arrow_batch = RecordBatch::try_new(
-        create_test_arrow_schema(),
-        vec![
-            Arc::new(Int32Array::from(vec![1])),
-            Arc::new(StringArray::from(vec!["Alice Johnson".to_string()])),
-            Arc::new(StringArray::from(vec!["alice@example.com".to_string()])),
-            Arc::new(Int32Array::from(vec![30])),
-        ],
-    )
-    .unwrap();
+    let expected_arrow_batch = create_test_arrow_batch().await;
     assert_eq!(record_batches, vec![expected_arrow_batch]);
 
     assert!(puffin_file_paths.is_empty());
