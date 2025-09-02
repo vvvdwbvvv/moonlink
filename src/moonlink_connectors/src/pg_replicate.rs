@@ -228,6 +228,7 @@ impl PostgresConnection {
         event_sender: mpsc::Sender<TableEvent>,
         is_recovery: bool,
         commit_lsn_tx: watch::Sender<u64>,
+        table_base_path: &str,
     ) -> Result<(bool)> {
         let src_table_id = schema.src_table_id;
         // Create a dedicated source for the copy
@@ -254,18 +255,19 @@ impl PostgresConnection {
                 .get_table_copy_stream(&schema.table_name, &schema.column_schemas)
                 .await
                 .expect("failed to get table copy stream");
-            let res = copy_table_stream(
+            copy_table_stream(
                 schema.clone(),
                 stream,
                 &event_sender,
                 start_lsn.into(),
+                table_base_path,
                 None,
             )
-            .await;
-
-            if let Err(e) = res {
-                error!(error = ?e, table_id = src_table_id, "failed to copy table");
-            }
+            .await
+            .expect(&format!(
+                "failed to copy table for src_table_id: {}",
+                src_table_id
+            ));
 
             // Commit the transaction
             copy_source
@@ -515,6 +517,7 @@ impl PostgresConnection {
                 table_resources.event_sender.clone(),
                 is_recovery,
                 commit_lsn_tx_for_copy,
+                table_base_path,
             )
             .await?;
 
