@@ -597,7 +597,6 @@ pub(crate) async fn replay(replay_filepath: &str) {
                 assert!(ongoing_iceberg_snapshot_id.insert(snapshot_initiation_event.uuid));
                 let payload = {
                     let mut guard = pending_iceberg_snapshot_payloads_clone.lock().await;
-
                     guard.remove(&snapshot_initiation_event.uuid).unwrap()
                 };
                 table.persist_iceberg_snapshot(payload);
@@ -610,9 +609,14 @@ pub(crate) async fn replay(replay_filepath: &str) {
                         guard.remove(&snapshot_completion_event.uuid)
                     };
                     if let Some(completed_iceberg_snapshot) = completed_iceberg_snapshot_event {
-                        table.set_iceberg_snapshot_res(
-                            completed_iceberg_snapshot.iceberg_snapshot_result,
-                        );
+                        let iceberg_snapshot_result =
+                            completed_iceberg_snapshot.iceberg_snapshot_result;
+                        io_utils::delete_local_files(
+                            &iceberg_snapshot_result.evicted_files_to_delete,
+                        )
+                        .await
+                        .unwrap();
+                        table.set_iceberg_snapshot_res(iceberg_snapshot_result);
                         break;
                     }
                     // Otherwise block until the corresponding flush event completes.
@@ -688,6 +692,11 @@ pub(crate) async fn replay(replay_filepath: &str) {
                     if let Some(completed_data_compaction) = completed_data_compaction_event {
                         let data_compaction_result =
                             completed_data_compaction.data_compaction_result;
+                        io_utils::delete_local_files(
+                            &data_compaction_result.evicted_files_to_delete,
+                        )
+                        .await
+                        .unwrap();
                         table.set_data_compaction_res(data_compaction_result);
                         break;
                     }
