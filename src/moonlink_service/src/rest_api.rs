@@ -1,3 +1,4 @@
+use arrow_schema::Schema;
 use axum::{
     extract::{Path, State},
     http::{Method, StatusCode},
@@ -51,6 +52,16 @@ pub enum RequestMode {
 #[derive(Debug, Serialize)]
 pub struct ErrorResponse {
     pub message: String,
+}
+
+/// ====================
+/// Get table schema
+/// ====================
+///
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GetTableSchemaResponse {
+    /// Table schema.
+    pub schema: Schema,
 }
 
 /// ====================
@@ -217,6 +228,7 @@ pub fn create_router(state: ApiState) -> Router {
         .route("/tables", get(list_tables))
         .route("/tables/{table}", post(create_table))
         .route("/tables/{table}", delete(drop_table))
+        .route("/schema/{database}/{table}", get(fetch_schema))
         .route("/ingest/{table}", post(ingest_data_json))
         .route("/ingestpb/{table}", post(ingest_data_protobuf))
         .route("/upload/{table}", post(upload_files))
@@ -424,13 +436,13 @@ async fn upload_files(
 }
 
 async fn optimize_table(
-    Path(table): Path<String>,
+    Path(src_table_name): Path<String>,
     State(state): State<ApiState>,
     Json(payload): Json<OptimizeTableRequest>,
 ) -> Result<Json<OptimizeTableResponse>, (StatusCode, Json<ErrorResponse>)> {
     debug!(
         "Received table optimize request for '{}': {:?}",
-        table, payload
+        src_table_name, payload
     );
     match state
         .backend
@@ -449,7 +461,38 @@ async fn optimize_table(
                 Json(ErrorResponse {
                     message: format!(
                         "Failed to optimize table {} with ID {}.{}: {}",
-                        table, payload.database, payload.table, e
+                        src_table_name, payload.database, payload.table, e
+                    ),
+                }),
+            ))
+        }
+    }
+}
+
+/// Fetch schema for the requested table.
+async fn fetch_schema(
+    Path((database, table)): Path<(String, String)>,
+    State(state): State<ApiState>,
+) -> Result<Json<GetTableSchemaResponse>, (StatusCode, Json<ErrorResponse>)> {
+    debug!(
+        "Received fetch table schema request for '{}.{}'",
+        database, table
+    );
+    match state
+        .backend
+        .get_table_schema(database.clone(), table.clone())
+        .await
+    {
+        Ok(schema) => Ok(Json(GetTableSchemaResponse {
+            schema: schema.as_ref().clone(),
+        })),
+        Err(e) => {
+            let status_code = get_backend_error_status_code(&e);
+            Err((
+                status_code,
+                Json(ErrorResponse {
+                    message: format!(
+                        "Failed to get table schema for table {database}.{table}: {e}"
                     ),
                 }),
             ))
