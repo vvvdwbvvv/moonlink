@@ -149,7 +149,8 @@ impl ObjectStorageCacheInternal {
     /// Unreference the given cache entry.
     pub(super) fn unreference(&mut self, file_id: TableUniqueFileId) -> Vec<String> {
         let cache_entry_wrapper = self.non_evictable_cache.get_mut(&file_id);
-        let cache_entry_wrapper = cache_entry_wrapper.unwrap();
+        let cache_entry_wrapper = cache_entry_wrapper
+            .unwrap_or_else(|| panic!("No reference count for file id {file_id:?}"));
         cache_entry_wrapper.reference_count -= 1;
 
         // Aggregate cache entries to delete.
@@ -356,7 +357,6 @@ impl ObjectStorageCache {
         let config = ObjectStorageCacheConfig::default_for_test(temp_dir);
         Self::new(config)
     }
-
     #[cfg(feature = "bench")]
     pub fn default_for_bench() -> Self {
         let config = ObjectStorageCacheConfig::default_for_bench();
@@ -506,6 +506,20 @@ impl CacheTrait for ObjectStorageCache {
     async fn try_delete_cache_entry(&self, file_id: TableUniqueFileId) -> InlineEvictedFiles {
         let mut guard = self.cache.write().await;
         guard.delete_cache_entry(file_id, /*panic_if_non_existent=*/ false)
+    }
+
+    async fn increment_reference_count(&self, cache_handle: &NonEvictableHandle) {
+        let mut guard = self.cache.write().await;
+        let value = guard.non_evictable_cache.get_mut(&cache_handle.file_id);
+        if let Some(value) = value {
+            ma::assert_gt!(value.reference_count, 0);
+            value.reference_count += 1;
+            return;
+        }
+        panic!(
+            "Requested to increment reference count for file id {:?} and file path {:?}, but not pinned in cache.",
+            cache_handle.file_id, cache_handle.get_cache_filepath(),
+        );
     }
 }
 
