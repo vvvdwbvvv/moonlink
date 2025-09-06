@@ -33,6 +33,8 @@ pub struct ServiceConfig {
     pub data_server_uri: Option<String>,
     /// Used for REST API as ingestion source.
     pub rest_api_port: Option<u16>,
+    /// Used for otel data ingestion.
+    pub otel_api_port: Option<u16>,
     /// Used for moonlink standalone deployment.
     pub tcp_port: Option<u16>,
 }
@@ -120,6 +122,21 @@ pub async fn start_with_config(config: ServiceConfig) -> Result<()> {
         (None, None)
     };
 
+    // Optionally start otel HTTP endpoint.
+    let (otel_api_handle, otel_api_shutdown_signal) = if let Some(port) = config.otel_api_port {
+        let otel_state = otel::service::OtelState {};
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            if let Err(e) = otel::service::start_otel_service(otel_state, port, shutdown_rx).await {
+                error!("OTEL service failed: {}", e);
+            }
+            info!("Starting OTLP/HTTP metrics starts at port {port}");
+        });
+        (Some(handle), Some(shutdown_tx))
+    } else {
+        (None, None)
+    };
+
     // Optionally start TCP server.
     let tcp_api_handle = if let Some(port) = config.tcp_port {
         let backend_clone = backend.clone();
@@ -155,6 +172,14 @@ pub async fn start_with_config(config: ServiceConfig) -> Result<()> {
         handle.await?;
     }
 
+    if let Some(handle) = otel_api_handle {
+        otel_api_shutdown_signal
+            .expect("OTEL HTTP API shutdown sender supposed to be valid")
+            .send(())
+            .unwrap();
+        handle.await?;
+    }
+
     if let Some(handle) = tcp_api_handle {
         handle.abort();
     }
@@ -165,8 +190,11 @@ pub async fn start_with_config(config: ServiceConfig) -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(test, feature = "standalone-test"))]
-mod test;
+#[cfg(all(test, any(feature = "standalone-test", feature = "otel-integration")))]
+mod test_guard;
+
+#[cfg(all(test, any(feature = "standalone-test", feature = "otel-integration")))]
+mod test_utils;
 
 #[cfg(all(test, feature = "standalone-test"))]
-mod test_utils;
+mod test;
