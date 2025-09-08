@@ -1,13 +1,16 @@
 use arrow::datatypes::Schema as ArrowSchema;
 use arrow::datatypes::{DataType, Field};
 use arrow_array::{Int32Array, RecordBatch, StringArray};
+use bytes::Bytes;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::AsyncArrowWriter;
 use serde_json::json;
-
-use crate::{ServiceConfig, READINESS_PROBE_PORT};
-
 use std::collections::HashMap;
 use std::sync::Arc;
+
+use crate::rest_api::ListTablesResponse;
+use crate::{ServiceConfig, READINESS_PROBE_PORT};
+use moonlink_backend::table_status::TableStatus;
 
 /// Moonlink backend directory.
 pub(crate) fn get_moonlink_backend_dir() -> String {
@@ -23,12 +26,18 @@ pub(crate) fn get_nginx_addr() -> String {
     std::env::var("NGINX_ADDR").unwrap_or_else(|_| NGINX_ADDR.to_string())
 }
 
+/// REST API port.
+pub(crate) const REST_API_PORT: u16 = 3030;
+/// OTEL API port.
+pub(crate) const OTEL_API_PORT: u16 = 3435;
+/// TCP port.
+pub(crate) const TCP_PORT: u16 = 3031;
 /// Local nginx server IP/port address.
 pub(crate) const NGINX_ADDR: &str = "http://nginx.local:80";
 /// Local moonlink REST API IP/port address.
-pub(crate) const REST_ADDR: &str = "http://127.0.0.1:3030";
+pub(crate) const REST_ADDR: &str = const_format::formatcp!("http://127.0.0.1:{}", REST_API_PORT);
 /// Local moonlink server IP/port address.
-pub(crate) const MOONLINK_ADDR: &str = "127.0.0.1:3031";
+pub(crate) const MOONLINK_ADDR: &str = const_format::formatcp!("127.0.0.1:{}", TCP_PORT);
 /// Test database name.
 pub(crate) const DATABASE: &str = "test-database";
 /// Test table name.
@@ -41,14 +50,14 @@ pub(crate) fn get_service_config() -> ServiceConfig {
     ServiceConfig {
         base_path: moonlink_backend_dir.clone(),
         data_server_uri: Some(nginx_addr),
-        rest_api_port: Some(3030),
-        otel_api_port: Some(3435),
-        tcp_port: Some(3031),
+        rest_api_port: Some(REST_API_PORT),
+        otel_api_port: Some(OTEL_API_PORT),
+        tcp_port: Some(TCP_PORT),
     }
 }
 
-/// Send request to readiness endpoint.
-pub(crate) async fn test_readiness_probe() {
+/// Send request to readiness endpoint and wait until the server is ready.
+pub(crate) async fn wait_for_server_ready() {
     let url = format!("http://127.0.0.1:{READINESS_PROBE_PORT}/ready");
     loop {
         if let Ok(resp) = reqwest::get(&url).await {
@@ -273,4 +282,233 @@ pub(crate) async fn generate_parquet_file(directory: &str) -> String {
     writer.write(&batch).await.unwrap();
     writer.close().await.unwrap();
     file_path_str
+}
+
+/// Util function to get table creation payload.
+fn get_create_table_payload(database: &str, table: &str) -> serde_json::Value {
+    let create_table_payload = json!({
+        "database": database,
+        "table": table,
+        "schema": [
+            {"name": "id", "data_type": "int32", "nullable": false},
+            {"name": "name", "data_type": "string", "nullable": false},
+            {"name": "email", "data_type": "string", "nullable": true},
+            {"name": "age", "data_type": "int32", "nullable": true}
+        ],
+        "table_config": {
+            "mooncake": {
+                "append_only": true,
+                "row_identity": "None"
+            }
+        }
+    });
+    create_table_payload
+}
+
+/// Optional nested schema payload for testing nested struct/list without adding a new test.
+fn get_create_table_payload_nested(database: &str, table: &str) -> serde_json::Value {
+    json!({
+        "database": database,
+        "table": table,
+        "schema": [
+            {"name": "id", "data_type": "int32", "nullable": false},
+            {"name": "user", "data_type": "struct", "nullable": true, "fields": [
+                {"name": "name", "data_type": "string", "nullable": true},
+                {"name": "age", "data_type": "int32", "nullable": true},
+                {"name": "emails", "data_type": "list", "nullable": true, "item": {"name": "email", "data_type": "string", "nullable": true}},
+                {"name": "location", "data_type": "struct", "nullable": true, "fields": [
+                    {"name": "lat", "data_type": "float64", "nullable": true},
+                    {"name": "lon", "data_type": "float64", "nullable": true}
+                ]}
+            ]},
+            {"name": "events", "data_type": "list", "nullable": true, "item": {"name": "ts", "data_type": "int64", "nullable": true}}
+        ],
+        "table_config": {"mooncake": {"append_only": true, "row_identity": "None"}}
+    })
+}
+
+/// Util function to get table drop payload.
+fn get_drop_table_payload(database: &str, table: &str) -> serde_json::Value {
+    let drop_table_payload = json!({
+        "database": database,
+        "table": table
+    });
+    drop_table_payload
+}
+
+/// Util function to get table optimize payload.
+pub(crate) fn get_optimize_table_payload(
+    database: &str,
+    table: &str,
+    mode: &str,
+) -> serde_json::Value {
+    let optimize_table_payload = json!({
+        "database": database,
+        "table": table,
+        "mode": mode
+    });
+    optimize_table_payload
+}
+
+/// Util function to get create snapshot payload.
+pub(crate) fn get_create_snapshot_payload(
+    database: &str,
+    table: &str,
+    lsn: u64,
+) -> serde_json::Value {
+    let snapshot_creation_payload = json!({
+        "database": database,
+        "table": table,
+        "lsn": lsn
+    });
+    snapshot_creation_payload
+}
+
+/// Util function to get table flush payload.
+pub(crate) fn get_flush_table_payload(database: &str, table: &str, lsn: u64) -> serde_json::Value {
+    let flush_table_payload = json!({
+        "database": database,
+        "table": table,
+        "lsn": lsn
+    });
+    flush_table_payload
+}
+
+/// Util function to create table via REST API.
+pub(crate) async fn create_table(
+    client: &reqwest::Client,
+    database: &str,
+    table: &str,
+    nested: bool,
+) {
+    // REST API doesn't allow duplicate source table name.
+    let crafted_src_table_name = format!("{database}.{table}");
+
+    // Use nested schema when explicitly requested to keep tests lightweight and explicit.
+    let payload = if nested {
+        get_create_table_payload_nested(database, table)
+    } else {
+        get_create_table_payload(database, table)
+    };
+    let response = client
+        .post(format!("{REST_ADDR}/tables/{crafted_src_table_name}"))
+        .header("content-type", "application/json")
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "Response status is {response:?}"
+    );
+}
+
+/// Util function to drop table via REST API.
+pub(crate) async fn drop_table(client: &reqwest::Client, database: &str, table: &str) {
+    let payload = get_drop_table_payload(database, table);
+    let crafted_src_table_name = format!("{database}.{table}");
+    let response = client
+        .delete(format!("{REST_ADDR}/tables/{crafted_src_table_name}"))
+        .header("content-type", "application/json")
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "Response status is {response:?}"
+    );
+}
+
+/// Util function to optimize table via REST API.
+pub(crate) async fn optimize_table(
+    client: &reqwest::Client,
+    database: &str,
+    table: &str,
+    mode: &str,
+) {
+    let payload = get_optimize_table_payload(database, table, mode);
+    let crafted_src_table_name = format!("{database}.{table}");
+    let response = client
+        .post(format!(
+            "{REST_ADDR}/tables/{crafted_src_table_name}/optimize"
+        ))
+        .header("content-type", "application/json")
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "Response status is {response:?}"
+    );
+}
+
+pub(crate) async fn list_tables(client: &reqwest::Client) -> Vec<TableStatus> {
+    let response = client
+        .get(format!("{REST_ADDR}/tables"))
+        .header("content-type", "application/json")
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "Response status is {response:?}"
+    );
+    let response: ListTablesResponse = response.json().await.unwrap();
+    response.tables
+}
+
+/// Util function to sync flush via REST API.
+pub(crate) async fn flush_table(client: &reqwest::Client, database: &str, table: &str, lsn: u64) {
+    let payload = get_flush_table_payload(database, table, lsn);
+    let crafted_src_table_name = format!("{database}.{table}");
+    let response = client
+        .post(format!("{REST_ADDR}/tables/{crafted_src_table_name}/flush"))
+        .header("content-type", "application/json")
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "Response status is {response:?}"
+    );
+}
+
+/// Util function to load all record batches for the given [`url`].
+pub(crate) async fn read_all_batches(url: &str) -> Vec<RecordBatch> {
+    let resp = reqwest::get(url).await.unwrap();
+    assert!(resp.status().is_success(), "Response status is {resp:?}");
+    let data: Bytes = resp.bytes().await.unwrap();
+    let reader = ParquetRecordBatchReaderBuilder::try_new(data)
+        .unwrap()
+        .build()
+        .unwrap();
+
+    reader.into_iter().map(|b| b.unwrap()).collect()
+}
+
+/// Util function to create snapshot via REST API.
+pub(crate) async fn create_snapshot(
+    client: &reqwest::Client,
+    database: &str,
+    table: &str,
+    lsn: u64,
+) {
+    let payload = get_create_snapshot_payload(database, table, lsn);
+    let crafted_src_table_name = format!("{database}.{table}");
+    let response = client
+        .post(format!(
+            "{REST_ADDR}/tables/{crafted_src_table_name}/snapshot"
+        ))
+        .header("content-type", "application/json")
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "Response status is {response:?}"
+    );
 }

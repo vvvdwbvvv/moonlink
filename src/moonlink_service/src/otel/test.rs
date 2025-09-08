@@ -18,7 +18,7 @@ async fn test_opentelemetry_export() {
     tokio::spawn(async move {
         start_with_config(config).await.unwrap();
     });
-    test_readiness_probe().await;
+    wait_for_server_ready().await;
 
     // Set the tracing inside of otel sdk, otherwise hard to troubleshoot.
     let _ = tracing_subscriber::fmt()
