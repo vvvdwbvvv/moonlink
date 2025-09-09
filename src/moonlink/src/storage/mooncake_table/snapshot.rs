@@ -61,6 +61,13 @@ pub(crate) struct SnapshotTableState {
     // Invariant: all processed deletion records are valid, here we use `Option` simply for an easy way to `move` the record out.
     pub(crate) uncommitted_deletion_log: Vec<Option<ProcessedDeletionRecord>>,
 
+    /// Committed deletion logs are pruned when:
+    /// - It's persisted in iceberg;
+    /// - It's not being compacted, so compaction remap only happens in mooncake snapshot.
+    ///
+    /// Data files which are being compacted.
+    pub(crate) compacting_data_files: HashSet<FileId>,
+
     /// Last commit point
     pub(super) last_commit: RecordLocation,
 
@@ -168,6 +175,7 @@ impl SnapshotTableState {
             table_notify: None,
             committed_deletion_log: Vec::new(),
             uncommitted_deletion_log: Vec::new(),
+            compacting_data_files: HashSet::new(),
             unpersisted_records: UnpersistedRecords::new(table_config),
             non_streaming_batch_id_counter,
         })
@@ -268,8 +276,16 @@ impl SnapshotTableState {
                     new_committed_deletion_log.push(cur_deletion_log);
                 }
                 // Check whether committed deletion logs have been persisted, and prune if persisted.
+                // Notice, all remapping logic should be scoped in snapshot, so if a data file is in compaction, skip pruning the deletion logs.
                 RecordLocation::DiskFile(file_id, row_idx) => {
                     if !committed_deletion_logs.contains(&(*file_id, *row_idx)) {
+                        new_committed_deletion_log.push(cur_deletion_log);
+                        continue;
+                    }
+                    // Persisted committed deletion records fall into two categories:
+                    // - Included in the compaction, which get removed due to "failed" remap;
+                    // - Not included in the compaction, which convert to the newly compacted data files' deletion record after remap.
+                    if self.compacting_data_files.contains(file_id) {
                         new_committed_deletion_log.push(cur_deletion_log);
                     }
                 }
@@ -477,6 +493,9 @@ impl SnapshotTableState {
         let expected_disk_files_count = self.get_expected_disk_files_count(&task);
         // Calculate the expected file indices number after current snapshot update.
         let expected_file_indices_count = self.get_expected_file_indices_count(&task);
+
+        // Update compacting data files, so their committed deletion logs won't get deleted.
+        self.compacting_data_files = std::mem::take(&mut task.compacting_data_files);
 
         // All evicted data files by the object storage cache.
         let mut evicted_data_files_to_delete = vec![];
