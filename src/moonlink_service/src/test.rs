@@ -4,6 +4,9 @@ use serde_json::json;
 use serial_test::serial;
 use tokio::net::TcpStream;
 
+#[cfg(feature = "postgres-integration")]
+use tokio_postgres::NoTls;
+
 use crate::rest_api::{CreateTableResponse, FileUploadResponse, HealthResponse, IngestResponse};
 use crate::start_with_config;
 use crate::test_guard::TestGuard;
@@ -919,4 +922,106 @@ async fn test_schema_invalid_list_missing_item() {
         .await
         .unwrap();
     assert!(!response.status().is_success());
+}
+
+#[cfg(feature = "postgres-integration")]
+#[tokio::test]
+#[serial]
+async fn test_create_table_from_postgres_endpoint() {
+    use crate::rest_api::CreateTableFromPostgresResponse;
+
+    // Integration test for PostgreSQL table mirroring endpoint
+    // This test creates a table in PostgreSQL, then tests mirroring it to Moonlink
+    let _guard = TestGuard::new(&get_moonlink_backend_dir());
+    let config = get_service_config();
+    tokio::spawn(async move {
+        start_with_config(config).await.unwrap();
+    });
+    wait_for_server_ready().await;
+
+    // Set up PostgreSQL connection and create test table
+    let src_uri = "postgresql://postgres:postgres@postgres:5432/postgres?sslmode=disable";
+    let table_name = "postgres_mirror_test";
+    let src_table_name = format!("public.{table_name}");
+
+    // Connect to PostgreSQL and create test table
+    let (client, connection) = tokio_postgres::connect(src_uri, NoTls).await.unwrap();
+    let _connection_handle = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    // Create test table with some data
+    client
+        .simple_query(&format!(
+            "DROP TABLE IF EXISTS {table_name};
+             CREATE TABLE {table_name} (
+                 id BIGINT PRIMARY KEY,
+                 name TEXT,
+                 email TEXT,
+                 created_at TIMESTAMP DEFAULT NOW()
+             );
+             INSERT INTO {table_name} (id, name, email) VALUES 
+                 (1, 'Test User 1', 'test1@example.com'),
+                 (2, 'Test User 2', 'test2@example.com');"
+        ))
+        .await
+        .unwrap();
+
+    // Now test the Moonlink mirroring endpoint
+    let client = reqwest::Client::new();
+    let database = "test_db";
+    let moonlink_table = "postgres_mirror_test";
+
+    let crafted_src_table_name = format!("{database}.{moonlink_table}");
+    let payload =
+        get_create_table_from_postgres_payload(database, moonlink_table, src_uri, &src_table_name);
+
+    let response = client
+        .post(format!(
+            "{REST_ADDR}/tables/{crafted_src_table_name}/from_postgres"
+        ))
+        .header("content-type", "application/json")
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+
+    // Assert successful table creation
+    assert!(
+        response.status().is_success(),
+        "Expected successful table creation, got status: {}, body: {}",
+        response.status(),
+        response.text().await.unwrap_or_default()
+    );
+
+    let response: CreateTableFromPostgresResponse = response.json().await.unwrap();
+    assert_eq!(response.database, database);
+    assert_eq!(response.table, crafted_src_table_name);
+    assert_eq!(response.lsn, 1);
+
+    // Verify the table appears in the tables list
+    let tables_response = client
+        .get(format!("{REST_ADDR}/tables"))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(tables_response.status().is_success());
+    let tables_json: serde_json::Value = tables_response.json().await.unwrap();
+    let tables = tables_json["tables"].as_array().unwrap();
+
+    // Find our newly created table
+    let our_table = tables.iter().find(|t| {
+        t["database"].as_str().unwrap() == database
+            && t["table"].as_str().unwrap() == moonlink_table
+    });
+
+    assert!(
+        our_table.is_some(),
+        "Created table should appear in tables list"
+    );
+
+    // Verify the table has the expected cardinality (2 rows)
+    let cardinality = our_table.unwrap()["cardinality"].as_u64().unwrap();
+    assert_eq!(cardinality, 2, "Table should have 2 rows from initial data");
 }
