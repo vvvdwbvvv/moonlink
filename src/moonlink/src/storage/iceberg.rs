@@ -21,6 +21,8 @@ pub(super) mod parquet_utils;
 pub(super) mod puffin_utils;
 pub(super) mod puffin_writer_proxy;
 
+#[cfg(feature = "catalog-glue")]
+pub(super) mod glue_catalog;
 #[cfg(feature = "catalog-rest")]
 pub(super) mod rest_catalog;
 
@@ -85,3 +87,7 @@ mod catalog_test_impl;
 #[cfg(feature = "catalog-rest")]
 #[cfg(test)]
 mod iceberg_rest_catalog_test;
+
+#[cfg(feature = "catalog-glue")]
+#[cfg(test)]
+mod glue_catalog_test;
