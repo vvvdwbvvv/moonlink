@@ -931,7 +931,7 @@ async fn ingest_data_impl(
                     return Err((
                         StatusCode::BAD_REQUEST,
                         Json(ErrorResponse {
-                            message: format!("Failed to apply field mapping and defaults: {}", e),
+                            message: format!("Failed to apply field mapping and defaults: {e}"),
                         }),
                     ));
                 }
