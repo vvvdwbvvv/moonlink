@@ -921,6 +921,389 @@ async fn test_schema_invalid_list_missing_item() {
     assert!(!response.status().is_success());
 }
 
+#[tokio::test]
+#[serial]
+async fn test_schema_evolution_field_renaming() {
+    let _guard = TestGuard::new(&get_moonlink_backend_dir());
+    let config = get_service_config();
+    tokio::spawn(async move {
+        start_with_config(config).await.unwrap();
+    });
+    wait_for_server_ready().await;
+
+    let client = reqwest::Client::new();
+    let crafted_src_table_name = format!("{DATABASE}.schema_evolution_table");
+
+    // Create table with schema evolution config
+    let payload = json!({
+        "database": DATABASE,
+        "table": "schema_evolution_table",
+        "schema": [
+            {"name": "id", "data_type": "int32", "nullable": false},
+            {"name": "new_field", "data_type": "string", "nullable": false},
+            {"name": "email", "data_type": "string", "nullable": false},
+            {"name": "age", "data_type": "int32", "nullable": false}
+        ],
+        "table_config": {
+            "mooncake": {
+                "append_only": true
+            }
+        },
+        "schema_evolution": {
+            "field_mappings": [
+                {
+                    "current_name": "new_field",
+                    "historical_names": ["old_field"],
+                    "default_value": null
+                }
+            ],
+            "default_values": {}
+        }
+    });
+
+    let response = client
+        .post(format!("{REST_ADDR}/tables/{crafted_src_table_name}"))
+        .header("content-type", "application/json")
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+
+    assert!(
+        response.status().is_success(),
+        "Response status is {response:?}"
+    );
+    let response: CreateTableResponse = response.json().await.unwrap();
+    assert_eq!(response.database, DATABASE);
+    assert_eq!(response.table, "schema_evolution_table");
+
+    // Ingest data using old field name "old_field"
+    let insert_payload = json!({
+        "operation": "insert",
+        "request_mode": "sync",
+        "data": {
+            "id": 1,
+            "old_field": "test_value",  // Using old field name
+            "email": "test@example.com",
+            "age": 25
+        }
+    });
+
+    let response = client
+        .post(format!("{REST_ADDR}/ingest/{crafted_src_table_name}"))
+        .header("content-type", "application/json")
+        .json(&insert_payload)
+        .send()
+        .await
+        .unwrap();
+
+    assert!(
+        response.status().is_success(),
+        "Response status is {response:?}"
+    );
+    let response: IngestResponse = response.json().await.unwrap();
+    let lsn = response.lsn.unwrap();
+
+    // Scan table to verify the data was correctly mapped
+    let mut moonlink_stream = TcpStream::connect(MOONLINK_ADDR).await.unwrap();
+    let bytes = scan_table_begin(
+        &mut moonlink_stream,
+        DATABASE.to_string(),
+        "schema_evolution_table".to_string(),
+        lsn,
+    )
+    .await
+    .unwrap();
+
+    let (data_file_paths, _, _, _) = decode_serialized_read_state_for_testing(bytes);
+    assert_eq!(data_file_paths.len(), 1);
+
+    let record_batches = read_all_batches(&data_file_paths[0]).await;
+    assert_eq!(record_batches.len(), 1);
+
+    let batch = &record_batches[0];
+    let schema = batch.schema();
+    let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    assert!(field_names.contains(&"new_field"));
+    assert!(!field_names.contains(&"old_field"));
+
+    scan_table_end(
+        &mut moonlink_stream,
+        DATABASE.to_string(),
+        "schema_evolution_table".to_string(),
+    )
+    .await
+    .unwrap();
+}
+
+/// Test schema evolution with default values
+#[tokio::test]
+#[serial]
+async fn test_schema_evolution_default_values() {
+    let _guard = TestGuard::new(&get_moonlink_backend_dir());
+    let config = get_service_config();
+    tokio::spawn(async move {
+        start_with_config(config).await.unwrap();
+    });
+    wait_for_server_ready().await;
+
+    let client = reqwest::Client::new();
+    let crafted_src_table_name = format!("{DATABASE}.default_values_table");
+
+    // Create table with schema evolution config including default values
+    let payload = json!({
+        "database": DATABASE,
+        "table": "default_values_table",
+        "schema": [
+            {"name": "id", "data_type": "int32", "nullable": false},
+            {"name": "name", "data_type": "string", "nullable": false},
+            {"name": "created_at", "data_type": "string", "nullable": true},
+            {"name": "version", "data_type": "int32", "nullable": true}
+        ],
+        "table_config": {
+            "mooncake": {
+                "append_only": true
+            }
+        },
+        "schema_evolution": {
+            "field_mappings": [],
+            "default_values": {
+                "created_at": "2024-01-01T00:00:00Z",
+                "version": 1
+            }
+        }
+    });
+
+    let response = client
+        .post(format!("{REST_ADDR}/tables/{crafted_src_table_name}"))
+        .header("content-type", "application/json")
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+
+    assert!(
+        response.status().is_success(),
+        "Response status is {response:?}"
+    );
+
+    // Ingest data without the fields that have default values
+    let insert_payload = json!({
+        "operation": "insert",
+        "request_mode": "sync",
+        "data": {
+            "id": 1,
+            "name": "test_user"
+            // Missing "created_at" and "version" - should get default values
+        }
+    });
+
+    let response = client
+        .post(format!("{REST_ADDR}/ingest/{crafted_src_table_name}"))
+        .header("content-type", "application/json")
+        .json(&insert_payload)
+        .send()
+        .await
+        .unwrap();
+
+    assert!(
+        response.status().is_success(),
+        "Response status is {response:?}"
+    );
+    let response: IngestResponse = response.json().await.unwrap();
+    let lsn = response.lsn.unwrap();
+
+    // Scan table to verify the default values were applied
+    let mut moonlink_stream = TcpStream::connect(MOONLINK_ADDR).await.unwrap();
+    let bytes = scan_table_begin(
+        &mut moonlink_stream,
+        DATABASE.to_string(),
+        "default_values_table".to_string(),
+        lsn,
+    )
+    .await
+    .unwrap();
+
+    let (data_file_paths, _, _, _) = decode_serialized_read_state_for_testing(bytes);
+    assert_eq!(data_file_paths.len(), 1);
+
+    let record_batches = read_all_batches(&data_file_paths[0]).await;
+    assert_eq!(record_batches.len(), 1);
+
+    // Verify all expected fields are present
+    let batch = &record_batches[0];
+    let schema = batch.schema();
+    let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    assert!(field_names.contains(&"id"));
+    assert!(field_names.contains(&"name"));
+    assert!(field_names.contains(&"created_at"));
+    assert!(field_names.contains(&"version"));
+
+    scan_table_end(
+        &mut moonlink_stream,
+        DATABASE.to_string(),
+        "default_values_table".to_string(),
+    )
+    .await
+    .unwrap();
+}
+
+/// Test combined schema evolution with both field renaming and default values
+#[tokio::test]
+#[serial]
+async fn test_schema_evolution_combined() {
+    let _guard = TestGuard::new(&get_moonlink_backend_dir());
+    let config = get_service_config();
+    tokio::spawn(async move {
+        start_with_config(config).await.unwrap();
+    });
+    wait_for_server_ready().await;
+
+    let client = reqwest::Client::new();
+    let crafted_src_table_name = format!("{DATABASE}.combined_evolution_table");
+
+    // Create table with both field mapping and default values
+    let payload = json!({
+        "database": DATABASE,
+        "table": "combined_evolution_table",
+        "schema": [
+            {"name": "user_id", "data_type": "int32", "nullable": false},
+            {"name": "username", "data_type": "string", "nullable": false},
+            {"name": "email", "data_type": "string", "nullable": false},
+            {"name": "created_at", "data_type": "string", "nullable": true},
+            {"name": "is_active", "data_type": "boolean", "nullable": true}
+        ],
+        "table_config": {
+            "mooncake": {
+                "append_only": true
+            }
+        },
+        "schema_evolution": {
+            "field_mappings": [
+                {
+                    "current_name": "user_id",
+                    "historical_names": ["uid"],
+                    "default_value": null
+                },
+                {
+                    "current_name": "username",
+                    "historical_names": ["name"],
+                    "default_value": "anonymous"
+                }
+            ],
+            "default_values": {
+                "created_at": "2024-01-01T00:00:00Z",
+                "is_active": true
+            }
+        }
+    });
+
+    let response = client
+        .post(format!("{REST_ADDR}/tables/{crafted_src_table_name}"))
+        .header("content-type", "application/json")
+        .json(&payload)
+        .send()
+        .await
+        .unwrap();
+
+    assert!(
+        response.status().is_success(),
+        "Response status is {response:?}"
+    );
+
+    // Ingest data using old field names and missing some fields
+    let insert_payload = json!({
+        "operation": "insert",
+        "request_mode": "sync",
+        "data": {
+            "uid": 123,  // Old field name for user_id
+            "name": "john_doe",  // Old field name for username
+            "email": "john@example.com"
+            // Missing "created_at" and "is_active" - should get default values
+        }
+    });
+
+    let response = client
+        .post(format!("{REST_ADDR}/ingest/{crafted_src_table_name}"))
+        .header("content-type", "application/json")
+        .json(&insert_payload)
+        .send()
+        .await
+        .unwrap();
+
+    assert!(
+        response.status().is_success(),
+        "Response status is {response:?}"
+    );
+
+    // Ingest another record missing username to test field-level default
+    let insert_payload2 = json!({
+        "operation": "insert",
+        "request_mode": "sync",
+        "data": {
+            "uid": 456,
+            "email": "jane@example.com"
+            // Missing "name" - should get field-level default "anonymous"
+        }
+    });
+
+    let response = client
+        .post(format!("{REST_ADDR}/ingest/{crafted_src_table_name}"))
+        .header("content-type", "application/json")
+        .json(&insert_payload2)
+        .send()
+        .await
+        .unwrap();
+
+    assert!(
+        response.status().is_success(),
+        "Response status is {response:?}"
+    );
+    let response: IngestResponse = response.json().await.unwrap();
+    let final_lsn = response.lsn.unwrap();
+
+    // Scan table to verify both field mapping and default values worked
+    let mut moonlink_stream = TcpStream::connect(MOONLINK_ADDR).await.unwrap();
+    let bytes = scan_table_begin(
+        &mut moonlink_stream,
+        DATABASE.to_string(),
+        "combined_evolution_table".to_string(),
+        final_lsn,
+    )
+    .await
+    .unwrap();
+
+    let (data_file_paths, _, _, _) = decode_serialized_read_state_for_testing(bytes);
+    assert_eq!(data_file_paths.len(), 1);
+
+    let record_batches = read_all_batches(&data_file_paths[0]).await;
+    assert_eq!(record_batches.len(), 1);
+
+    // Verify schema has the correct field names (not the old ones)
+    let batch = &record_batches[0];
+    let schema = batch.schema();
+    let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+    assert!(field_names.contains(&"user_id"));
+    assert!(field_names.contains(&"username"));
+    assert!(field_names.contains(&"email"));
+    assert!(field_names.contains(&"created_at"));
+    assert!(field_names.contains(&"is_active"));
+    // Verify old field names are not present
+    assert!(!field_names.contains(&"uid"));
+    assert!(!field_names.contains(&"name"));
+
+    // Verify we have 2 rows
+    assert_eq!(batch.num_rows(), 2);
+
+    scan_table_end(
+        &mut moonlink_stream,
+        DATABASE.to_string(),
+        "combined_evolution_table".to_string(),
+    )
+    .await
+    .unwrap();
+}
+
 #[cfg(feature = "postgres-integration")]
 #[tokio::test]
 #[serial]
