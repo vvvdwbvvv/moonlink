@@ -37,6 +37,7 @@ const DEFAULT_REST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 pub struct ApiState {
     /// Reference to the backend for table operations
     pub backend: Arc<moonlink_backend::MoonlinkBackend>,
+    /// Maps from source table name to schema id.
     pub kafka_schema_id_cache: Arc<RwLock<HashMap<String, u64>>>,
 }
 
@@ -466,7 +467,7 @@ async fn create_table(
                     .kafka_schema_id_cache
                     .write()
                     .await
-                    .insert(src_table_name.clone(), 0);
+                    .insert(src_table_name.clone(), 0 /*placeholder*/);
             }
             Ok(Json(CreateTableResponse {
                 database: payload.database.clone(),
@@ -850,7 +851,7 @@ async fn set_avro_schema(
         .kafka_schema_id_cache
         .read()
         .await
-        .get(&payload.table)
+        .get(&src_table_name)
         .is_some_and(|id| *id == payload.schema_id)
     {
         return Ok(Json(SetAvroSchemaResponse {
@@ -885,7 +886,7 @@ async fn set_avro_schema(
                 .kafka_schema_id_cache
                 .write()
                 .await
-                .insert(payload.table.clone(), payload.schema_id);
+                .insert(src_table_name.clone(), payload.schema_id);
             Ok(Json(SetAvroSchemaResponse {
                 database: payload.database,
                 table: payload.table,
