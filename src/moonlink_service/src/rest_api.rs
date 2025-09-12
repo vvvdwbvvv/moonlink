@@ -13,9 +13,13 @@ use moonlink_backend::{
     EventRequest, FileEventOperation, FileEventRequest, FlushRequest, IngestRequestPayload,
     RowEventOperation, RowEventRequest, SnapshotRequest, REST_API_URI,
 };
-use moonlink_connectors::rest_ingest::schema_util::{build_arrow_schema, FieldSchema};
+use moonlink_connectors::rest_ingest::schema_util::{
+    build_arrow_schema, FieldSchema, SchemaEvolutionConfig,
+};
 use moonlink_error::ErrorStatus;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -33,11 +37,35 @@ const DEFAULT_REST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 pub struct ApiState {
     /// Reference to the backend for table operations
     pub backend: Arc<moonlink_backend::MoonlinkBackend>,
+    /// Schema evolution configurations per table
+    pub schema_evolution_configs: Arc<tokio::sync::RwLock<HashMap<String, SchemaEvolutionConfig>>>,
 }
 
 impl ApiState {
     pub fn new(backend: Arc<moonlink_backend::MoonlinkBackend>) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            schema_evolution_configs: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Store schema evolution config for a table
+    pub async fn set_schema_evolution_config(
+        &self,
+        table_key: String,
+        config: SchemaEvolutionConfig,
+    ) {
+        let mut configs = self.schema_evolution_configs.write().await;
+        configs.insert(table_key, config);
+    }
+
+    /// Get schema evolution config for a table
+    pub async fn get_schema_evolution_config(
+        &self,
+        table_key: &str,
+    ) -> Option<SchemaEvolutionConfig> {
+        let configs = self.schema_evolution_configs.read().await;
+        configs.get(table_key).cloned()
     }
 }
 
@@ -82,6 +110,7 @@ pub struct CreateTableRequest {
     pub table: String,
     pub schema: Vec<FieldSchema>,
     pub table_config: TableConfig,
+    pub schema_evolution: Option<SchemaEvolutionConfig>,
 }
 
 /// Response structure for table creation
@@ -90,6 +119,68 @@ pub struct CreateTableResponse {
     pub database: String,
     pub table: String,
     pub lsn: u64,
+}
+
+/// Apply field name mapping and default values for backward compatibility
+fn apply_field_mapping_and_defaults(
+    mut data: Value,
+    schema_evolution: Option<&SchemaEvolutionConfig>,
+) -> Result<Value, String> {
+    let Some(evolution_config) = schema_evolution else {
+        return Ok(data);
+    };
+
+    let mut name_mapping = HashMap::new();
+    let mut field_defaults = HashMap::new();
+
+    for mapping in &evolution_config.field_mappings {
+        for hist_name in &mapping.historical_names {
+            name_mapping.insert(hist_name.clone(), mapping.current_name.clone());
+        }
+        if let Some(def_val) = &mapping.default_value {
+            field_defaults.insert(mapping.current_name.clone(), def_val.clone());
+        }
+    }
+
+    for (k, v) in &evolution_config.default_values {
+        field_defaults.entry(k.clone()).or_insert(v.clone());
+    }
+
+    match &mut data {
+        Value::Object(obj) => {
+            // Rename fields in place
+            for old_name in obj
+                .keys()
+                .filter_map(|k| name_mapping.get(k).map(|new| (k.clone(), new.clone())))
+                .collect::<Vec<_>>()
+            {
+                if let Some(value) = obj.remove(&old_name.0) {
+                    if obj.contains_key(&old_name.1) {
+                        return Err(format!(
+                            "Conflict: both old field '{}' and new '{}' exist",
+                            old_name.0, old_name.1
+                        ));
+                    }
+                    obj.insert(old_name.1, value);
+                }
+            }
+
+            // Add defaults for missing fields
+            for (name, def_val) in &field_defaults {
+                if !obj.contains_key(name) {
+                    obj.insert(name.clone(), def_val.clone());
+                }
+            }
+        }
+        Value::Array(arr) => {
+            for item in arr.iter_mut() {
+                *item = apply_field_mapping_and_defaults(item.clone(), Some(evolution_config))?;
+            }
+        }
+        _ => return Err("Data must be an object or array of objects".to_string()),
+    }
+
+    Ok(data)
 }
 
 /// ====================
@@ -372,6 +463,14 @@ async fn create_table(
         .await
     {
         Ok(()) => {
+            // Store schema evolution config if provided
+            if let Some(schema_evolution) = payload.schema_evolution {
+                let table_key = format!("{}.{}", payload.database, payload.table);
+                state
+                    .set_schema_evolution_config(table_key, schema_evolution)
+                    .await;
+            }
+
             info!(
                 "Successfully created table '{}' with ID {}:{}",
                 src_table_name, payload.database, payload.table,
@@ -789,7 +888,7 @@ async fn ingest_data_json(
 async fn ingest_data_impl(
     src_table_name: String,
     state: ApiState,
-    payload: IngestRequestInternal,
+    mut payload: IngestRequestInternal,
 ) -> Result<Json<IngestResponse>, (StatusCode, Json<ErrorResponse>)> {
     debug!(
         "Received ingestion request for table '{}': {:?}",
@@ -813,6 +912,32 @@ async fn ingest_data_impl(
             ));
         }
     };
+
+    // Apply field mapping and default values for JSON payloads if schema evolution config exists
+    if let IngestRequestPayload::Json(ref mut json_data) = payload.data {
+        // Try to get schema evolution config for this table
+        let schema_evolution = state.get_schema_evolution_config(&src_table_name).await;
+
+        if let Some(ref evolution_config) = schema_evolution {
+            match apply_field_mapping_and_defaults(json_data.clone(), Some(evolution_config)) {
+                Ok(mapped_data) => {
+                    *json_data = mapped_data;
+                    debug!(
+                        "Applied field mapping and default values for table '{}'",
+                        src_table_name
+                    );
+                }
+                Err(e) => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            message: format!("Failed to apply field mapping and defaults: {}", e),
+                        }),
+                    ));
+                }
+            }
+        }
+    }
 
     // Create REST request
     let (tx, mut rx) = mpsc::channel(1);

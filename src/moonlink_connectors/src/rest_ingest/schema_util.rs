@@ -13,6 +13,25 @@ pub struct FieldSchema {
     pub item: Option<Box<FieldSchema>>, // for list/array
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FieldMapping {
+    /// Current field name
+    pub current_name: String,
+    /// List of historical field names that should map to current_name
+    pub historical_names: Vec<String>,
+    /// Default value to use when field is missing (JSON value)
+    pub default_value: Option<serde_json::Value>,
+}
+
+/// Schema evolution configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SchemaEvolutionConfig {
+    /// Field mappings for renamed fields
+    pub field_mappings: Vec<FieldMapping>,
+    /// Default values for new fields that don't exist in old data
+    pub default_values: HashMap<String, serde_json::Value>,
+}
+
 #[derive(thiserror::Error, Debug)]
 pub enum SchemaBuildError {
     #[error("invalid decimal type: {0}")]
