@@ -5,6 +5,7 @@ use crate::storage::iceberg::catalog_utils::{
 };
 use crate::storage::iceberg::iceberg_table_config::GlueCatalogConfig;
 use crate::storage::iceberg::io_utils as iceberg_io_utils;
+use crate::storage::iceberg::puffin_writer_proxy::PuffinBlobMetadataProxy;
 use crate::storage::iceberg::table_commit_proxy::TableCommitProxy;
 use crate::storage::iceberg::table_update_proxy::TableUpdateProxy;
 use crate::StorageConfig;
@@ -232,6 +233,18 @@ impl Catalog for GlueCatalog {
 
 #[async_trait]
 impl PuffinWrite for GlueCatalog {
+    fn record_puffin_metadata(
+        &mut self,
+        puffin_filepath: String,
+        puffin_metadata: Vec<PuffinBlobMetadataProxy>,
+        puffin_blob_type: PuffinBlobType,
+    ) {
+        self.table_update_proxy.record_puffin_metadata(
+            puffin_filepath,
+            puffin_metadata,
+            puffin_blob_type,
+        );
+    }
     async fn record_puffin_metadata_and_close(
         &mut self,
         puffin_filepath: String,
