@@ -121,7 +121,12 @@ pub struct CreateTableFromPostgresResponse {
 /// Request structure for table drop.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DropTableRequest {
+    #[serde(rename = "database")]
+    #[serde(default)]
     pub database: String,
+
+    #[serde(rename = "table")]
+    #[serde(default)]
     pub table: String,
 }
 
