@@ -4728,6 +4728,7 @@ dependencies = [
 name = "moonlink_service"
 version = "0.0.1"
 dependencies = [
+ "anyhow",
  "apache-avro 0.20.0",
  "arrow",
  "arrow-array",
