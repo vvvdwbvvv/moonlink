@@ -260,6 +260,7 @@ impl TableHandler {
                         let replication_lsn = *replication_lsn_rx.borrow();
                         let persisted_table_lsn = table_handler_state
                             .get_persisted_table_lsn(last_iceberg_snapshot_lsn, replication_lsn);
+
                         if persisted_table_lsn >= requested_lsn {
                             table_handler_state.notify_persisted_table_lsn(persisted_table_lsn);
                             continue;
@@ -1026,3 +1027,6 @@ mod chaos_replay;
 #[cfg(test)]
 #[cfg(feature = "chaos-test")]
 mod regression;
+
+#[cfg(feature = "profile-test")]
+pub mod profile_test;

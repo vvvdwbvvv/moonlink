@@ -255,7 +255,7 @@ impl TableHandlerState {
         iceberg_snapshot_lsn: Option<u64>,
         replication_lsn: u64,
     ) -> u64 {
-        // Case-1: there're no activities in the current table, but replication LSN already covers requested LSN.
+        // Case-1: there're no activities in the current table, replication LSN indicates current status.
         if iceberg_snapshot_lsn.is_none() && self.table_consistent_view_lsn.is_none() {
             return replication_lsn;
         }
