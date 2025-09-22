@@ -255,7 +255,7 @@ impl TableHandlerState {
         iceberg_snapshot_lsn: Option<u64>,
         replication_lsn: u64,
     ) -> u64 {
-        // Case-1: there're no activities in the current table, but replication LSN already covers requested LSN.
+        // Case-1: there're no activities in the current table, replication LSN indicates current status.
         if iceberg_snapshot_lsn.is_none() && self.table_consistent_view_lsn.is_none() {
             return replication_lsn;
         }
@@ -302,40 +302,18 @@ impl TableHandlerState {
         }
     }
 
-    /// Return whether should force to create a mooncake and iceberg snapshot, based on the new coming commit LSN.
-    pub(crate) fn should_force_snapshot_by_commit_lsn(
-        commit_lsn: u64,
-        min_ongoing_flush_lsn: u64,
-        table_maintenance_process_status: &MaintenanceProcessStatus,
-        largest_force_snapshot_lsn: Option<u64>,
-        mooncake_snapshot_ongoing: bool,
-    ) -> bool {
-        // No force snasphot if already mooncake snapshot ongoing.
-        if mooncake_snapshot_ongoing {
-            return false;
-        }
-
-        // No force snapshot if pending flush LSNs < commit LSN.
-        if min_ongoing_flush_lsn < commit_lsn {
-            return false;
-        }
-
-        // Case-1: there're completed but not persisted table maintenance changes.
-        if *table_maintenance_process_status == MaintenanceProcessStatus::ReadyToPersist {
-            return true;
-        }
-
-        // Case-2: there're pending force snapshot requests.
-        if let Some(largest_requested_lsn) = largest_force_snapshot_lsn {
-            return largest_requested_lsn <= commit_lsn && !mooncake_snapshot_ongoing;
-        }
-
-        false
-    }
-
     /// Return whether there're pending force snapshot requests.
     pub(crate) fn has_pending_force_snapshot_request(&self) -> bool {
         self.largest_force_snapshot_lsn.is_some()
+    }
+
+    pub(crate) fn should_force_flush(&self, commit_lsn: u64, existing_flush_lsn: u64) -> bool {
+        if let Some(largest_force_snapshot_lsn) = self.largest_force_snapshot_lsn {
+            commit_lsn >= largest_force_snapshot_lsn
+                && existing_flush_lsn < largest_force_snapshot_lsn
+        } else {
+            false
+        }
     }
 
     /// Return whether there's background tasks ongoing.

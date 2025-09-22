@@ -24,12 +24,12 @@ pub use storage::{
     AccessorConfig, AwsSecurityConfig, BaseFileSystemAccess, BaseIcebergSnapshotFetcher,
     CacheTrait, CloudSecurityConfig, DataCompactionConfig, DiskSliceWriterConfig,
     EventSyncReceiver, FileIndexMergeConfig, FileSystemAccessor, FsChaosConfig, FsRetryConfig,
-    FsTimeoutConfig, IcebergCatalogConfig, IcebergFileCatalogConfig, IcebergPersistenceConfig,
-    IcebergSnapshotFetcher, IcebergTableConfig, IcebergTableManager, MooncakeTable,
-    MooncakeTableConfig, MoonlinkSecretType, MoonlinkTableConfig, MoonlinkTableSecret,
-    ObjectStorageCache, ObjectStorageCacheConfig, PersistentWalMetadata, SnapshotReadOutput,
-    StorageConfig, TableEventManager, TableManager, TableSnapshotStatus, TableStatusReader,
-    WalConfig, WalManager, WalTransactionState,
+    FsThrottleConfig, FsTimeoutConfig, IcebergCatalogConfig, IcebergFileCatalogConfig,
+    IcebergPersistenceConfig, IcebergSnapshotFetcher, IcebergTableConfig, IcebergTableManager,
+    MooncakeTable, MooncakeTableConfig, MoonlinkSecretType, MoonlinkTableConfig,
+    MoonlinkTableSecret, ObjectStorageCache, ObjectStorageCacheConfig, PersistentWalMetadata,
+    SnapshotReadOutput, StorageConfig, TableEventManager, TableManager, TableSnapshotStatus,
+    TableStatusReader, WalConfig, WalManager, WalTransactionState,
 };
 pub use table_handler::TableHandler;
 pub use table_handler_timer::TableHandlerTimer;
@@ -43,3 +43,8 @@ pub use union_read::{decode_read_state_for_testing, decode_serialized_read_state
 pub use storage::GlobalIndex;
 #[cfg(feature = "bench")]
 pub use storage::GlobalIndexBuilder;
+
+#[cfg(feature = "profile-test")]
+pub use table_handler::profile_test::{
+    test_append_only_table_profile_on_local_fs, test_normal_profile_on_local_fs,
+};
