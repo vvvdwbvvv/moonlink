@@ -27,6 +27,7 @@ use super::iceberg::puffin_utils::PuffinBlobRef;
 use super::index::{FileIndex, MemIndex, MooncakeIndex};
 use super::storage_utils::{MooncakeDataFileRef, RawDeletionRecord, RecordLocation};
 use crate::error::Result;
+use crate::observability::SnapshotCreationStats;
 use crate::row::{IdentityProp, MoonlinkRow};
 use crate::storage::cache::object_storage::base_cache::CacheTrait;
 use crate::storage::compaction::compactor::{CompactionBuilder, CompactionFileParams};
@@ -70,6 +71,7 @@ pub(crate) use snapshot::SnapshotTableState;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 use table_snapshot::{IcebergSnapshotImportResult, IcebergSnapshotIndexMergeResult};
 #[cfg(test)]
 use tokio::sync::mpsc::Receiver;
@@ -497,6 +499,9 @@ pub struct MooncakeTable {
     /// To avoid losing LSNs, we need to keep track of early completed unrecorded LSNs as well.
     pub completed_unrecorded_flush_lsns: BTreeSet<u64>,
 
+    /// snapshot stats
+    snapshot_stats: Arc<SnapshotCreationStats>,
+
     /// Table replay sender.
     event_replay_tx: Option<mpsc::UnboundedSender<MooncakeTableEvent>>,
 }
@@ -603,6 +608,7 @@ impl MooncakeTable {
             ongoing_flush_lsns: BTreeMap::new(),
             completed_unrecorded_flush_lsns: BTreeSet::new(),
             event_replay_tx: None,
+            snapshot_stats: SnapshotCreationStats::new(),
         })
     }
 
@@ -1073,16 +1079,19 @@ impl MooncakeTable {
 
         let min_ongoing_flush_lsn = self.get_min_ongoing_flush_lsn();
         next_snapshot_task.min_ongoing_flush_lsn = min_ongoing_flush_lsn;
+
+        let table_notify = self.table_notify.as_ref().unwrap().clone();
+        let snapshot_stats = self.snapshot_stats.clone();
+        let mooncake_table_id = self.metadata.mooncake_table_id.clone();
         // Create a detached task, whose completion will be notified separately.
-        tokio::task::spawn(
-            Self::create_snapshot_async(
-                cur_snapshot,
-                next_snapshot_task,
-                opt,
-                self.table_notify.as_ref().unwrap().clone(),
-            )
-            .instrument(info_span!("create_snapshot_async")),
-        );
+        tokio::task::spawn(async move {
+            let start = Instant::now();
+            Self::create_snapshot_async(cur_snapshot, next_snapshot_task, opt, table_notify)
+                .instrument(info_span!("create_snapshot_async"))
+                .await;
+            let time = start.elapsed().as_millis() as u64;
+            snapshot_stats.update(time, mooncake_table_id);
+        });
     }
 
     /// Notify mooncake snapshot as completed.
