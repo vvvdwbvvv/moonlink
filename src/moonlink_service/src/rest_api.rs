@@ -194,9 +194,11 @@ pub struct CreateTableFromPostgresResponse {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DropTableRequest {
     #[serde(rename = "database")]
+    #[serde(default)]
     pub database: String,
 
     #[serde(rename = "table")]
+    #[serde(default)]
     pub table: String,
 }
 
