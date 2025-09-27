@@ -1,9 +1,12 @@
 FROM mcr.microsoft.com/devcontainers/rust:latest
 
 RUN apt update \
- && apt install -y python3-pip \
+ && apt install -y \
+    python3-pip \
+    mold \
  && apt install -y mold \
- && rm -rf /var/lib/apt/lists/*
+ && rm -rf /var/lib/apt/lists/* \
+ && ln -fs /usr/bin/mold /usr/bin/ld
 
 USER vscode
 

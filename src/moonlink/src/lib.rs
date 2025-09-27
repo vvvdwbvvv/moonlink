@@ -1,6 +1,7 @@
 pub mod error;
 pub mod event_sync;
 pub mod mooncake_table_id;
+mod observability;
 pub mod row;
 mod storage;
 pub(crate) mod table_handler;
@@ -34,7 +35,7 @@ pub use storage::{
 pub use table_handler::TableHandler;
 pub use table_handler_timer::TableHandlerTimer;
 pub use table_notify::TableEvent;
-pub use union_read::{ReadState, ReadStateFilepathRemap, ReadStateManager, VisibilityLsn};
+pub use union_read::{ReadState, ReadStateFilepathRemap, ReadStateManager};
 
 #[cfg(any(test, feature = "test-utils"))]
 pub use union_read::{decode_read_state_for_testing, decode_serialized_read_state_for_testing};
@@ -46,5 +47,6 @@ pub use storage::GlobalIndexBuilder;
 
 #[cfg(feature = "profile-test")]
 pub use table_handler::profile_test::{
-    test_append_only_table_profile_on_local_fs, test_normal_profile_on_local_fs,
+    test_append_only_table_profile_on_local_fs, test_no_iceberg_persistence_on_local_fs,
+    test_normal_profile_on_local_fs,
 };

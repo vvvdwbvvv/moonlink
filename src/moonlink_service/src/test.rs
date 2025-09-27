@@ -912,7 +912,7 @@ async fn stress_test_kafka_avro_stress_ingest() {
     let create_table_payload = serde_json::json!({
         "database": DATABASE,
         "table": TABLE,
-        "avro_schema": avro_schema_json,
+        "avro_schema": serde_json::from_str::<serde_json::Value>(avro_schema_json).unwrap(),
         "table_config": {
             "mooncake": {
                 "append_only": true,
@@ -1169,7 +1169,7 @@ async fn stress_test_kafka_stress_10min_long_running() {
     let create_table_payload = json!({
         "database": DATABASE,
         "table": table_name,
-        "avro_schema": avro_schema_json,
+        "avro_schema": serde_json::from_str::<serde_json::Value>(avro_schema_json).unwrap(),
         "table_config": {
             "mooncake": {
                 "append_only": true,

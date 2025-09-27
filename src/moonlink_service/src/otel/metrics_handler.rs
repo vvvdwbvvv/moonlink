@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 /// Handler to process metrics ingestion.
 use crate::error::{Error, Result};
+use crate::otel::metric_type::MetricsType;
 use crate::otel::otel_schema::otlp_metrics_gsh_schema;
 use crate::otel::otel_to_moonlink_pb;
 use crate::rest_api::ListTablesResponse;
@@ -12,14 +13,21 @@ use moonlink_proto::moonlink as moonlink_pb;
 use opentelemetry_proto::tonic::collector::metrics::v1::{
     ExportMetricsServiceRequest, ExportMetricsServiceResponse,
 };
+use opentelemetry_proto::tonic::metrics::v1::{metric::Data, HistogramDataPoint, NumberDataPoint};
 use serde_json::json;
 use tokio::sync::Mutex;
-use tracing::error;
+use tracing::{error, warn};
 
 /// Database which manages all moonlink internal metrics.
 const DATABASE: &str = "__reserved_moonlink_internal_metrics__";
 /// Metrics attributes key for mooncake table id.
 const MOONCAKE_TABLE_ID_KEY: &str = "moonlink.mooncake_table_id";
+struct WrappedExportRequest {
+    /// Mooncake table which the request being routed to.
+    target_mooncake_table_id: String,
+    metric_type: MetricsType,
+    request: ExportMetricsServiceRequest,
+}
 
 #[derive(Clone)]
 pub(crate) struct MetricsHandler {
@@ -43,49 +51,104 @@ fn anyvalue_as_str(v: &opentelemetry_proto::tonic::common::v1::AnyValue) -> Opti
     }
 }
 
-/// Util function to deterministically get table name.
-fn get_metrics_table_name(moonlink_table_name: &str, metrics_type: &str) -> String {
-    format!("{moonlink_table_name}.{metrics_type}")
+// A helper trait so we can unify NumberDataPoint and HistogramDataPoint.
+trait HasAttributes {
+    fn get_attributes(&self) -> &Vec<opentelemetry_proto::tonic::common::v1::KeyValue>;
+}
+impl HasAttributes for NumberDataPoint {
+    fn get_attributes(&self) -> &Vec<opentelemetry_proto::tonic::common::v1::KeyValue> {
+        &self.attributes
+    }
+}
+impl HasAttributes for HistogramDataPoint {
+    fn get_attributes(&self) -> &Vec<opentelemetry_proto::tonic::common::v1::KeyValue> {
+        &self.attributes
+    }
 }
 
-/// Util function to get metrics table name from the request.
-fn get_metrics_table_name_from_request(req: &ExportMetricsServiceRequest) -> String {
+// Push data points into [`result`] map.
+fn handle_data_points<T>(
+    service_name: &str,
+    metric_name: &str,
+    metric_type: MetricsType,
+    dps: &[T],
+    req: &ExportMetricsServiceRequest,
+    wrapped_export_requests: &mut Vec<WrappedExportRequest>,
+) where
+    T: HasAttributes,
+{
+    for dp in dps {
+        for attr in dp.get_attributes() {
+            if attr.key == MOONCAKE_TABLE_ID_KEY {
+                if let Some(value) = &attr.value {
+                    if let Some(mooncake_table_id) = anyvalue_as_str(value) {
+                        let target_mooncake_table_id = format!(
+                            "{service_name}.{mooncake_table_id}.{metric_type}.{metric_name}"
+                        );
+                        wrapped_export_requests.push(WrappedExportRequest {
+                            target_mooncake_table_id,
+                            metric_type: metric_type.clone(),
+                            request: req.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Get metrics data points map, which maps from mooncake table id to otel export request.
+fn get_export_requests(req: &ExportMetricsServiceRequest) -> Vec<WrappedExportRequest> {
+    let mut wrapped_export_requests = Vec::new();
+
+    let mut service_name = "unknown_service";
     for rm in &req.resource_metrics {
+        if let Some(resource) = &rm.resource {
+            for attr in &resource.attributes {
+                if attr.key == "service.name" {
+                    if let Some(value) = &attr.value {
+                        if let Some(s) = anyvalue_as_str(value) {
+                            service_name = s;
+                        }
+                    }
+                }
+            }
+        }
+
         for sm in &rm.scope_metrics {
             for metric in &sm.metrics {
+                let metric_name = &metric.name;
+
                 match &metric.data {
-                    Some(opentelemetry_proto::tonic::metrics::v1::metric::Data::Gauge(g)) => {
-                        for dp in &g.data_points {
-                            for attr in &dp.attributes {
-                                if attr.key == MOONCAKE_TABLE_ID_KEY {
-                                    let attr_value = attr.value.as_ref().unwrap();
-                                    let mooncake_table_id = anyvalue_as_str(attr_value).unwrap();
-                                    return get_metrics_table_name(mooncake_table_id, "gauge");
-                                }
-                            }
-                        }
+                    Some(Data::Gauge(g)) => {
+                        handle_data_points(
+                            service_name,
+                            metric_name,
+                            MetricsType::Gauge,
+                            &g.data_points,
+                            req,
+                            &mut wrapped_export_requests,
+                        );
                     }
-                    Some(opentelemetry_proto::tonic::metrics::v1::metric::Data::Sum(s)) => {
-                        for dp in &s.data_points {
-                            for attr in &dp.attributes {
-                                if attr.key == MOONCAKE_TABLE_ID_KEY {
-                                    let attr_value = attr.value.as_ref().unwrap();
-                                    let mooncake_table_id = anyvalue_as_str(attr_value).unwrap();
-                                    return get_metrics_table_name(mooncake_table_id, "sum");
-                                }
-                            }
-                        }
+                    Some(Data::Sum(s)) => {
+                        handle_data_points(
+                            service_name,
+                            metric_name,
+                            MetricsType::Sum,
+                            &s.data_points,
+                            req,
+                            &mut wrapped_export_requests,
+                        );
                     }
-                    Some(opentelemetry_proto::tonic::metrics::v1::metric::Data::Histogram(h)) => {
-                        for dp in &h.data_points {
-                            for attr in &dp.attributes {
-                                if attr.key == MOONCAKE_TABLE_ID_KEY {
-                                    let attr_value = attr.value.as_ref().unwrap();
-                                    let mooncake_table_id = anyvalue_as_str(attr_value).unwrap();
-                                    return get_metrics_table_name(mooncake_table_id, "histogram");
-                                }
-                            }
-                        }
+                    Some(Data::Histogram(h)) => {
+                        handle_data_points(
+                            service_name,
+                            metric_name,
+                            MetricsType::Histogram,
+                            &h.data_points,
+                            req,
+                            &mut wrapped_export_requests,
+                        );
                     }
                     _ => {}
                 }
@@ -93,7 +156,11 @@ fn get_metrics_table_name_from_request(req: &ExportMetricsServiceRequest) -> Str
         }
     }
 
-    panic!("Cannot find mooncake table id from the data points");
+    if wrapped_export_requests.is_empty() {
+        warn!("Cannot find mooncake table id from the data points");
+    }
+
+    wrapped_export_requests
 }
 
 impl MetricsHandler {
@@ -131,7 +198,11 @@ impl MetricsHandler {
     }
 
     /// Create a mooncake table for once, if it hasn't been created.
-    async fn create_table_for_once(&self, mooncake_table_id: &str) -> Result<()> {
+    async fn create_table_for_once(
+        &self,
+        mooncake_table_id: &str,
+        metric_type: &MetricsType,
+    ) -> Result<()> {
         let crafted_src_table_name = format!("{DATABASE}.{mooncake_table_id}");
         // Fake REST ingestion.
         let serialized_table_config = json!({
@@ -141,6 +212,7 @@ impl MetricsHandler {
             }
         })
         .to_string();
+        let table_schema = otlp_metrics_gsh_schema(metric_type);
 
         // Table creation for duplicate table name leads to error, so intentionally place table creation under critical section.
         // Performance is not a big concern here, since it only happens when new table metrics are received.
@@ -157,7 +229,7 @@ impl MetricsHandler {
                     crafted_src_table_name,
                     REST_API_URI.to_string(),
                     serialized_table_config,
-                    Some(otlp_metrics_gsh_schema()),
+                    Some(table_schema),
                 )
                 .await?;
             assert!(guard.insert(mooncake_table_id.to_string()));
@@ -200,13 +272,23 @@ impl MetricsHandler {
         &self,
         request: ExportMetricsServiceRequest,
     ) -> Result<ExportMetricsServiceResponse> {
-        // TODO(hjiang): Currently only supports metrics from one single table.
-        let mooncake_table_id = get_metrics_table_name_from_request(&request);
-        self.create_table_for_once(&mooncake_table_id).await?;
-
-        let moonlink_row_pbs = otel_to_moonlink_pb::export_metrics_to_moonlink_rows(&request);
-        for cur_row_pb in moonlink_row_pbs.into_iter() {
-            self.insert_row(&mooncake_table_id, cur_row_pb).await;
+        let wrapped_export_requests = get_export_requests(&request);
+        for cur_wrapped_export_request in wrapped_export_requests.into_iter() {
+            self.create_table_for_once(
+                &cur_wrapped_export_request.target_mooncake_table_id,
+                &cur_wrapped_export_request.metric_type,
+            )
+            .await?;
+            let moonlink_row_pbs = otel_to_moonlink_pb::export_metrics_to_moonlink_rows(
+                &cur_wrapped_export_request.request,
+            );
+            for cur_row_pb in moonlink_row_pbs.into_iter() {
+                self.insert_row(
+                    &cur_wrapped_export_request.target_mooncake_table_id,
+                    cur_row_pb,
+                )
+                .await;
+            }
         }
         Ok(ExportMetricsServiceResponse::default())
     }

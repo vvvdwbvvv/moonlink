@@ -1,7 +1,6 @@
 use crate::event_sync::create_table_event_syncer;
 use crate::row::{IdentityProp, MoonlinkRow, RowValue};
 use crate::storage::mooncake_table::table_event_manager::TableEventManager;
-use crate::storage::mooncake_table::TableMetadata;
 use crate::storage::mooncake_table::TableMetadata as MooncakeTableMetadata;
 use crate::storage::storage_utils::TableId;
 use crate::storage::MooncakeTable;
@@ -10,7 +9,7 @@ use crate::table_handler_timer::create_table_handler_timers;
 use crate::union_read::ReadStateManager;
 use crate::{
     BaseFileSystemAccess, CacheTrait, DataCompactionConfig, DiskSliceWriterConfig,
-    FileIndexMergeConfig, FileSystemAccessor, VisibilityLsn, WalConfig, WalManager,
+    FileIndexMergeConfig, FileSystemAccessor, IcebergPersistenceConfig, WalConfig, WalManager,
 };
 use crate::{IcebergTableConfig, ObjectStorageCache, ObjectStorageCacheConfig, StorageConfig};
 
@@ -34,6 +33,8 @@ const ICEBERG_TEST_NAMESPACE: &str = "namespace";
 const ICEBERG_TEST_TABLE: &str = "test_table";
 /// Test constant for table id.
 const TEST_TABLE_ID: TableId = TableId(0);
+/// Pprof profiling frequency.
+const PPROF_PROFILE_FREQ: i32 = 99;
 
 /// Create a test moonlink row.
 fn create_row(id: i32, name: &str, age: i32) -> MoonlinkRow {
@@ -279,6 +280,8 @@ enum SpecialTableOption {
     UpsertDeleteIfExists,
     /// Append only.
     AppendOnly,
+    /// Disable iceberg snapshot.
+    NoIcebergSnapshot,
 }
 
 #[derive(Clone, Debug)]
@@ -305,9 +308,9 @@ struct TestEnvironment {
     table_handler: TableHandler,
     event_sender: mpsc::Sender<TableEvent>,
     wal_flush_lsn_rx: watch::Receiver<u64>,
-    last_visibility_lsn_tx: watch::Sender<VisibilityLsn>,
+    last_commit_lsn_tx: watch::Sender<u64>,
     replication_lsn_tx: watch::Sender<u64>,
-    mooncake_table_metadata: Arc<TableMetadata>,
+    mooncake_table_metadata: Arc<MooncakeTableMetadata>,
     iceberg_table_config: IcebergTableConfig,
 }
 
@@ -324,8 +327,11 @@ impl TestEnvironment {
             chaos_config: None,
         };
         let identity = IdentityProp::Keys(vec![0]);
+        let iceberg_persistence_config =
+            create_iceberg_persistence_config(config.special_table_option.clone());
         let mooncake_table_metadata = create_test_table_metadata_for_profile(
             table_temp_dir.path().to_str().unwrap().to_string(),
+            iceberg_persistence_config,
             disk_slice_write_config,
             identity.clone(),
         );
@@ -348,16 +354,13 @@ impl TestEnvironment {
         )
         .await;
         let (replication_lsn_tx, replication_lsn_rx) = watch::channel(0u64);
-        let (visibility_tx, visibility_rx) = watch::channel(VisibilityLsn {
-            commit_lsn: 0,
-            replication_lsn: 0,
-        });
+        let (last_commit_lsn_tx, last_commit_lsn_rx) = watch::channel(0u64);
         let read_state_filepath_remap =
             std::sync::Arc::new(|local_filepath: String| local_filepath);
         let read_state_manager = ReadStateManager::new(
             &table,
             replication_lsn_rx.clone(),
-            visibility_rx,
+            last_commit_lsn_rx,
             read_state_filepath_remap,
         );
         let (table_event_sync_sender, table_event_sync_receiver) = create_table_event_syncer();
@@ -387,7 +390,7 @@ impl TestEnvironment {
             event_sender,
             wal_flush_lsn_rx,
             replication_lsn_tx,
-            last_visibility_lsn_tx: visibility_tx,
+            last_commit_lsn_tx,
             mooncake_table_metadata,
             iceberg_table_config,
         }
@@ -456,8 +459,25 @@ fn create_test_filesystem_accessor(
     ))
 }
 
+fn create_iceberg_persistence_config(
+    special_table_option: SpecialTableOption,
+) -> IcebergPersistenceConfig {
+    if special_table_option == SpecialTableOption::NoIcebergSnapshot {
+        IcebergPersistenceConfig {
+            new_data_file_count: usize::MAX,
+            new_committed_deletion_log: usize::MAX,
+            new_compacted_data_file_count: usize::MAX,
+            old_compacted_data_file_count: usize::MAX,
+            old_merged_file_indices_count: usize::MAX,
+        }
+    } else {
+        IcebergPersistenceConfig::default()
+    }
+}
+
 fn create_test_table_metadata_for_profile(
     local_table_directory: String,
+    iceberg_persistence_config: IcebergPersistenceConfig,
     disk_slice_write_config: DiskSliceWriterConfig,
     identity: IdentityProp,
 ) -> Arc<MooncakeTableMetadata> {
@@ -465,6 +485,7 @@ fn create_test_table_metadata_for_profile(
     config.batch_size = 4096;
     config.mem_slice_size = config.batch_size * 8;
     config.disk_slice_writer_config = disk_slice_write_config;
+    config.persistence_config = iceberg_persistence_config;
     config.append_only = identity == IdentityProp::None;
     config.row_identity = identity;
     config.snapshot_deletion_record_count = 1000;
@@ -480,7 +501,7 @@ fn create_test_table_metadata_for_profile(
         index_block_final_size: 1 << 29, // 512MiB
     };
     Arc::new(MooncakeTableMetadata {
-        name: ICEBERG_TEST_TABLE.to_string(),
+        mooncake_table_id: ICEBERG_TEST_TABLE.to_string(),
         table_id: 0,
         schema: create_test_arrow_schema(),
         config,
@@ -492,7 +513,7 @@ async fn profile_test_impl(env: TestEnvironment) {
     let test_env_config = env.test_env_config.clone();
     let event_sender = env.event_sender.clone();
     let mut table_event_manager = env.table_event_manager;
-    let last_visibility_lsn_tx = env.last_visibility_lsn_tx;
+    let last_commit_lsn_tx = env.last_commit_lsn_tx;
     let replication_lsn_tx = env.replication_lsn_tx.clone();
 
     let mut state = ProfileState::new(
@@ -512,23 +533,28 @@ async fn profile_test_impl(env: TestEnvironment) {
     }
     println!("Random event generation over, start ingestion.");
 
-    let guard = pprof::ProfilerGuard::new(100).unwrap();
+    // Start collecting profile with pprof.
+    let profile_target_file = format!(
+        "/tmp/{}-{}.svg",
+        env.test_env_config.test_name,
+        uuid::Uuid::new_v4()
+    );
+    println!("Profile target file is {profile_target_file}");
+    let guard = pprof::ProfilerGuard::new(PPROF_PROFILE_FREQ).unwrap();
+
     let task = tokio::spawn(async move {
         let mut ingested_event_count = 0;
         while let Some(cur_event) = table_events.pop_front() {
             // For commit events, need to set up corresponding replication and commit LSN.
             if let TableEvent::Commit { lsn, .. } = cur_event {
                 replication_lsn_tx.send(lsn).unwrap();
-                last_visibility_lsn_tx
-                    .send(VisibilityLsn {
-                        commit_lsn: lsn,
-                        replication_lsn: lsn,
-                    })
-                    .unwrap();
+                last_commit_lsn_tx.send(lsn).unwrap();
                 event_sender.send(cur_event).await.unwrap();
 
                 ingested_event_count += 1;
-                if ingested_event_count > 500 {
+                if ingested_event_count > 500
+                    && test_env_config.special_table_option != SpecialTableOption::NoIcebergSnapshot
+                {
                     let rx = table_event_manager.initiate_snapshot(lsn).await;
                     TableEventManager::synchronize_force_snapshot_request(rx, lsn)
                         .await
@@ -562,8 +588,7 @@ async fn profile_test_impl(env: TestEnvironment) {
     }
 
     if let Ok(report) = guard.report().build() {
-        let file =
-            std::fs::File::create(format!("/tmp/{}.svg", env.test_env_config.test_name)).unwrap();
+        let file = std::fs::File::create(profile_target_file).unwrap();
         report.flamegraph(file).unwrap();
     }
 }
@@ -595,6 +620,25 @@ pub async fn test_append_only_table_profile_on_local_fs() {
         test_name: function_name!().to_string(),
         special_table_option: SpecialTableOption::AppendOnly,
         event_count: 50000,
+        storage_config: StorageConfig::FileSystem {
+            root_directory,
+            atomic_write_dir: None,
+        },
+    };
+    let env = TestEnvironment::new(test_env_config).await;
+    profile_test_impl(env).await;
+}
+
+/// Profile test for no iceberg persistence situation, which is meant to check ingestion and mooncake snapshot only profiling.
+/// Also useful to tune iceberg persistence configs.
+#[named]
+pub async fn test_no_iceberg_persistence_on_local_fs() {
+    let iceberg_temp_dir = tempdir().unwrap();
+    let root_directory = iceberg_temp_dir.path().to_str().unwrap().to_string();
+    let test_env_config = TestEnvConfig {
+        test_name: function_name!().to_string(),
+        special_table_option: SpecialTableOption::NoIcebergSnapshot,
+        event_count: 100000,
         storage_config: StorageConfig::FileSystem {
             root_directory,
             atomic_write_dir: None,
