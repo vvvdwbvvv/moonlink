@@ -179,7 +179,6 @@ pub struct CreateTableFromPostgresRequest {
     pub src_table_name: String,
 
     #[serde(rename = "table_config")]
-    #[serde(default)]
     pub table_config: TableConfig,
 }
 
@@ -349,6 +348,8 @@ pub struct FileUploadRequest {
     #[serde(default)]
     pub storage_config: StorageConfig,
     /// Whether to enable synchronous mode.
+    #[serde(rename = "request_mode")]
+    #[serde(default)]
     pub request_mode: RequestMode,
 }
 
