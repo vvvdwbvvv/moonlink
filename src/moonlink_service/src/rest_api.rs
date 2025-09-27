@@ -272,7 +272,7 @@ pub struct IngestRequest {
     #[serde(rename = "data")]
     pub data: serde_json::Value,
     /// Whether to enable synchronous mode.
-    #[serde(rename = "darequest_modeta")]
+    #[serde(rename = "request_mode")]
     pub request_mode: RequestMode,
 }
 
