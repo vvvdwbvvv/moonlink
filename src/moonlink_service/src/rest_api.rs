@@ -55,10 +55,11 @@ impl ApiState {
 /// ====================
 ///
 /// Request mode.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum RequestMode {
     /// Only issues request, but not block wait its completion.
+    #[default]
     Async,
     /// Block wait request completion.
     Sync,
@@ -273,6 +274,7 @@ pub struct IngestRequest {
     pub data: serde_json::Value,
     /// Whether to enable synchronous mode.
     #[serde(rename = "request_mode")]
+    #[serde(default)]
     pub request_mode: RequestMode,
 }
 
@@ -286,6 +288,7 @@ pub struct IngestProtobufRequest {
     pub data: Vec<u8>,
     /// Whether to enable synchronous mode.
     #[serde(rename = "request_mode")]
+    #[serde(default)]
     pub request_mode: RequestMode,
 }
 
