@@ -325,6 +325,7 @@ pub struct FileUploadRequest {
     pub storage_config: StorageConfig,
     /// Whether to enable synchronous mode.
     #[serde(rename = "request_mode")]
+    #[serde(default)]
     pub request_mode: RequestMode,
 }
 
