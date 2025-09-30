@@ -1,4 +1,6 @@
 use crate::observability::iceberg_persistence::{IcebergPersistenceStage, IcebergPersistenceStats};
+use crate::observability::iceberg_table_recovery::IcebergTableRecoveryStats;
+use crate::observability::latency_exporter::BaseLatencyExporter;
 use crate::storage::cache::object_storage::base_cache::CacheTrait;
 use crate::storage::filesystem::accessor::base_filesystem_accessor::BaseFileSystemAccess;
 use crate::storage::iceberg::catalog_utils;
@@ -259,6 +261,10 @@ impl TableManager for IcebergTableManager {
     }
 
     async fn load_snapshot_from_table(&mut self) -> Result<(u32, MooncakeSnapshot)> {
+        // Start recording iceberg recovery latency
+        let recovery_stats =
+            IcebergTableRecoveryStats::new(self.mooncake_table_metadata.mooncake_table_id.clone());
+        let _guard = recovery_stats.start();
         let snapshot = self.load_snapshot_from_table_impl().await?;
         Ok(snapshot)
     }
