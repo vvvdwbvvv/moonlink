@@ -80,6 +80,18 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - uses: dtolnay/rust-toolchain@stable
+        id: toolchain
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ steps.toolchain.outputs.cachekey }}
+
+      - uses: rui314/setup-mold@v1
+        with:
+          mold-version: 2.40.3
+          make-default: true
+
       # ─────────────────────── Start Fake GCS Server ──────────────────────────
       - name: Start Fake GCS Server
         timeout-minutes: 2
@@ -149,6 +161,9 @@ jobs:
               RUST_BACKTRACE=1 cargo test test_s3_chaos --features=chaos-test,storage-s3 -p moonlink -- --nocapture
     steps:
       - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        id: toolchain
 
       - uses: swatinem/rust-cache@v2
         with:
@@ -222,6 +237,18 @@ jobs:
               RUST_BACKTRACE=1 cargo test -p moonlink --features=catalog-glue,storage-s3
     steps:
       - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        id: toolchain
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ steps.toolchain.outputs.cachekey }}
+
+      - uses: rui314/setup-mold@v1
+        with:
+          mold-version: 2.40.3
+          make-default: true
 
       # ─────────────────────── Start Fake S3 Server ──────────────────────────
       - name: Start Fake S3 Server
@@ -336,6 +363,18 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - uses: dtolnay/rust-toolchain@stable
+        id: toolchain
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ steps.toolchain.outputs.cachekey }}
+
+      - uses: rui314/setup-mold@v1
+        with:
+          mold-version: 2.40.3
+          make-default: true
+
       # ─────────────────────── Start Iceberg-rest ──────────────────────────
       - name: Start Iceberg-rest-fixture
         run: |
@@ -441,6 +480,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - uses: dtolnay/rust-toolchain@stable
+        id: toolchain
+
       - uses: swatinem/rust-cache@v2
         with:
           shared-key: ${{ steps.toolchain.outputs.cachekey }}
@@ -473,6 +515,18 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - uses: dtolnay/rust-toolchain@stable
+        id: toolchain
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ steps.toolchain.outputs.cachekey }}
+
+      - uses: rui314/setup-mold@v1
+        with:
+          mold-version: 2.40.3
+          make-default: true
+
       - name: Start chaos test
         timeout-minutes: 10
         run: |
@@ -495,6 +549,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        id: toolchain
 
       - uses: swatinem/rust-cache@v2
         with:
@@ -528,6 +585,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - uses: dtolnay/rust-toolchain@stable
+        id: toolchain
+
       - uses: swatinem/rust-cache@v2
         with:
           shared-key: ${{ steps.toolchain.outputs.cachekey }}
@@ -559,6 +619,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        id: toolchain
 
       - uses: swatinem/rust-cache@v2
         with:
@@ -592,6 +655,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - uses: dtolnay/rust-toolchain@stable
+        id: toolchain
+
       - uses: swatinem/rust-cache@v2
         with:
           shared-key: ${{ steps.toolchain.outputs.cachekey }}
@@ -624,6 +690,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - uses: dtolnay/rust-toolchain@stable
+        id: toolchain
+
       - uses: swatinem/rust-cache@v2
         with:
           shared-key: ${{ steps.toolchain.outputs.cachekey }}
@@ -645,6 +714,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        id: toolchain
 
       - uses: swatinem/rust-cache@v2
         with:
