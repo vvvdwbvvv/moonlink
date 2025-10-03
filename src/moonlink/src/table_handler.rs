@@ -129,29 +129,29 @@ impl TableHandler {
         handler_event_replay_tx: Option<mpsc::UnboundedSender<TableEvent>>,
         mut table: MooncakeTable,
     ) {
-        let iceberg_snapshot_lsn = table.get_iceberg_snapshot_lsn();
+        let persistence_snapshot_lsn = table.get_persistence_snapshot_lsn();
         // Here we indicate that highest completion lsn of 0 indicates that we have not seen any completed WAL events yet.
         let wal_highest_completion_lsn = table.get_wal_highest_completion_lsn();
         let wal_curr_file_number = table.get_wal_curr_file_number();
 
         let initial_persistence_lsn = if wal_curr_file_number > 0 {
-            if let Some(iceberg_snapshot_lsn) = iceberg_snapshot_lsn {
+            if let Some(persistence_snapshot_lsn) = persistence_snapshot_lsn {
                 Some(std::cmp::max(
-                    iceberg_snapshot_lsn,
+                    persistence_snapshot_lsn,
                     wal_highest_completion_lsn,
                 ))
             } else {
                 Some(wal_highest_completion_lsn)
             }
         } else {
-            iceberg_snapshot_lsn
+            persistence_snapshot_lsn
         };
 
         let mut table_handler_state = TableHandlerState::new(
             event_sync_sender.table_maintenance_completion_tx.clone(),
             event_sync_sender.force_snapshot_completion_tx.clone(),
             initial_persistence_lsn,
-            iceberg_snapshot_lsn,
+            persistence_snapshot_lsn,
         );
 
         // Used to clean up mooncake table status, and send completion notification.
@@ -256,10 +256,12 @@ impl TableHandler {
 
                         // Fast-path: if iceberg snapshot requirement is already satisfied, notify directly.
                         let requested_lsn = requested_lsn.unwrap();
-                        let last_iceberg_snapshot_lsn = table.get_iceberg_snapshot_lsn();
+                        let last_persistence_snapshot_lsn = table.get_persistence_snapshot_lsn();
                         let replication_lsn = *replication_lsn_rx.borrow();
-                        let persisted_table_lsn = table_handler_state
-                            .get_persisted_table_lsn(last_iceberg_snapshot_lsn, replication_lsn);
+                        let persisted_table_lsn = table_handler_state.get_persisted_table_lsn(
+                            last_persistence_snapshot_lsn,
+                            replication_lsn,
+                        );
 
                         if persisted_table_lsn >= requested_lsn {
                             table_handler_state.notify_persisted_table_lsn(persisted_table_lsn);
@@ -387,7 +389,7 @@ impl TableHandler {
                         }
 
                         if table_handler_state.has_pending_force_snapshot_request()
-                            && !table_handler_state.iceberg_snapshot_ongoing
+                            && !table_handler_state.persistence_snapshot_ongoing
                         {
                             // flush if needed
                             if let Some(commit_lsn) = table_handler_state.table_consistent_view_lsn
@@ -411,7 +413,7 @@ impl TableHandler {
                                 if let SpecialTableState::AlterTable { .. } =
                                     table_handler_state.special_table_state
                                 {
-                                    table.force_empty_iceberg_payload();
+                                    table.force_empty_persistence_payload();
                                 }
                                 assert!(table.try_create_mooncake_snapshot(
                                     table_handler_state.get_mooncake_snapshot_option(
@@ -433,19 +435,19 @@ impl TableHandler {
                             );
                     }
                     TableEvent::RegularIcebergSnapshot {
-                        mut iceberg_snapshot_payload,
+                        mut persistence_snapshot_payload,
                     } => {
                         // Update table maintenance status.
-                        if iceberg_snapshot_payload.contains_table_maintenance_payload()
+                        if persistence_snapshot_payload.contains_table_maintenance_payload()
                             && table_handler_state.table_maintenance_process_status
                                 == MaintenanceProcessStatus::ReadyToPersist
                         {
                             table_handler_state.table_maintenance_process_status =
                                 MaintenanceProcessStatus::InPersist;
                         }
-                        table_handler_state.iceberg_snapshot_ongoing = true;
+                        table_handler_state.persistence_snapshot_ongoing = true;
                         if table_handler_state
-                            .should_complete_alter_table(iceberg_snapshot_payload.flush_lsn)
+                            .should_complete_alter_table(persistence_snapshot_payload.flush_lsn)
                         {
                             if let SpecialTableState::AlterTable {
                                 ref mut alter_table_request,
@@ -454,7 +456,7 @@ impl TableHandler {
                             {
                                 let new_table_metadata =
                                     table.alter_table(alter_table_request.take().unwrap());
-                                iceberg_snapshot_payload.new_table_schema =
+                                persistence_snapshot_payload.new_table_schema =
                                     Some(new_table_metadata);
                             } else {
                                 unreachable!("alter table request is not set");
@@ -463,7 +465,7 @@ impl TableHandler {
                             Self::process_blocked_events(&mut table, &mut table_handler_state)
                                 .await;
                         }
-                        table.persist_iceberg_snapshot(iceberg_snapshot_payload);
+                        table.persist_iceberg_snapshot(persistence_snapshot_payload);
                     }
                     TableEvent::MooncakeTableSnapshotResult {
                         mooncake_snapshot_result,
@@ -505,15 +507,15 @@ impl TableHandler {
                         if TableHandlerState::can_initiate_iceberg_snapshot(
                             mooncake_snapshot_result.commit_lsn,
                             min_pending_flush_lsn,
-                            table_handler_state.iceberg_snapshot_result_consumed,
-                            table_handler_state.iceberg_snapshot_ongoing,
+                            table_handler_state.persistence_snapshot_result_consumed,
+                            table_handler_state.persistence_snapshot_ongoing,
                         ) {
-                            if let Some(iceberg_snapshot_payload) =
-                                mooncake_snapshot_result.iceberg_snapshot_payload
+                            if let Some(persistence_snapshot_payload) =
+                                mooncake_snapshot_result.persistence_snapshot_payload
                             {
                                 table_handler_event_sender
                                     .send(TableEvent::RegularIcebergSnapshot {
-                                        iceberg_snapshot_payload,
+                                        persistence_snapshot_payload,
                                     })
                                     .await
                                     .unwrap();
@@ -606,11 +608,11 @@ impl TableHandler {
                             }
                         }
                     }
-                    TableEvent::IcebergSnapshotResult {
-                        iceberg_snapshot_result,
+                    TableEvent::PersistenceSnapshotResult {
+                        persistence_snapshot_result,
                     } => {
-                        table_handler_state.iceberg_snapshot_ongoing = false;
-                        match iceberg_snapshot_result {
+                        table_handler_state.persistence_snapshot_ongoing = false;
+                        match persistence_snapshot_result {
                             Ok(snapshot_res) => {
                                 // Record iceberg snapshot completion.
                                 // Notice: operation completion record should be the first thing to do on event notification, and contains all information.
@@ -640,8 +642,8 @@ impl TableHandler {
                                     .flush_lsn_tx
                                     .send(iceberg_flush_lsn)
                                     .unwrap();
-                                table.set_iceberg_snapshot_res(snapshot_res);
-                                table_handler_state.iceberg_snapshot_result_consumed = false;
+                                table.set_persistence_snapshot_res(snapshot_res);
+                                table_handler_state.persistence_snapshot_result_consumed = false;
 
                                 // Notify all waiters with LSN satisfied.
                                 let replication_lsn = *replication_lsn_rx.borrow();
@@ -795,7 +797,7 @@ impl TableHandler {
                             if rows_persisted == 0
                                 && table_handler_state.has_pending_force_snapshot_request()
                             {
-                                table.force_empty_iceberg_payload();
+                                table.force_empty_persistence_payload();
                             }
                         }
                         Some(Err(e)) => {

@@ -3,8 +3,8 @@ mod batch_ingestion;
 pub mod data_batches;
 pub(crate) mod delete_vector;
 mod disk_slice;
-mod iceberg_persisted_records;
 mod mem_slice;
+mod persisted_records;
 mod persistence_buffer;
 pub(crate) mod replay;
 mod shared_array;
@@ -41,19 +41,19 @@ use crate::storage::iceberg::iceberg_table_manager::IcebergTableManager;
 use crate::storage::iceberg::table_manager::{PersistenceFileParams, TableManager};
 use crate::storage::index::persisted_bucket_hash_map::GlobalIndexBuilder;
 use crate::storage::mooncake_table::batch_id_counter::BatchIdCounter;
-use crate::storage::mooncake_table::iceberg_persisted_records::IcebergPersistedRecords;
+use crate::storage::mooncake_table::persisted_records::PersistedRecords;
 use crate::storage::mooncake_table::replay::replay_events;
 use crate::storage::mooncake_table::replay::replay_events::MooncakeTableEvent;
 use crate::storage::mooncake_table::shared_array::SharedRowBufferSnapshot;
 use crate::storage::mooncake_table::snapshot::MooncakeSnapshotOutput;
 pub use crate::storage::mooncake_table::snapshot_read_output::ReadOutput as SnapshotReadOutput;
 #[cfg(test)]
-pub(crate) use crate::storage::mooncake_table::table_snapshot::IcebergSnapshotDataCompactionPayload;
+pub(crate) use crate::storage::mooncake_table::table_snapshot::PersistenceSnapshotDataCompactionPayload;
 pub(crate) use crate::storage::mooncake_table::table_snapshot::{
     take_data_files_to_import, take_data_files_to_remove, take_file_indices_to_import,
     take_file_indices_to_remove, FileIndiceMergePayload, FileIndiceMergeResult,
-    IcebergSnapshotDataCompactionResult, IcebergSnapshotImportPayload,
-    IcebergSnapshotIndexMergePayload, IcebergSnapshotPayload, IcebergSnapshotResult,
+    PersistenceSnapshotDataCompactionResult, PersistenceSnapshotImportPayload,
+    PersistenceSnapshotIndexMergePayload, PersistenceSnapshotPayload, PersistenceSnapshotResult,
 };
 use crate::storage::mooncake_table_config::MooncakeTableConfig;
 use crate::storage::snapshot_options::MaintenanceOption;
@@ -72,7 +72,7 @@ pub(crate) use snapshot::SnapshotTableState;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use table_snapshot::{IcebergSnapshotImportResult, IcebergSnapshotIndexMergeResult};
+use table_snapshot::{PersistenceSnapshotImportResult, PersistenceSnapshotIndexMergeResult};
 #[cfg(test)]
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::{self, Sender};
@@ -265,7 +265,7 @@ pub struct SnapshotTask {
     new_streaming_xact: Vec<TransactionStreamOutput>,
 
     /// Schema change, or force snapshot.
-    force_empty_iceberg_payload: bool,
+    force_empty_persistence_payload: bool,
 
     /// Committed deletion records, which have been persisted into iceberg, and should be pruned from mooncake snapshot.
     committed_deletion_logs: HashSet<(FileId, usize /*row idx*/)>,
@@ -282,7 +282,7 @@ pub struct SnapshotTask {
 
     /// ---- States have been recorded by mooncake snapshot, and persisted into iceberg table ----
     /// These persisted items will be reflected to mooncake snapshot in the next invocation of periodic mooncake snapshot operation.
-    iceberg_persisted_records: IcebergPersistedRecords,
+    persisted_records: PersistedRecords,
 
     /// Minimum LSN of ongoing flushes.
     min_ongoing_flush_lsn: u64,
@@ -305,7 +305,7 @@ impl SnapshotTask {
             new_largest_flush_lsn: None,
             new_commit_point: None,
             new_streaming_xact: Vec::new(),
-            force_empty_iceberg_payload: false,
+            force_empty_persistence_payload: false,
             // Committed deletion logs which have been persisted, and should be pruned from mooncake snapshot.
             committed_deletion_logs: HashSet::new(),
             // Index merge related fields.
@@ -313,8 +313,8 @@ impl SnapshotTask {
             // Data compaction related fields.
             compacting_data_files: HashSet::new(),
             data_compaction_result: DataCompactionResult::default(),
-            // Iceberg persistence result.
-            iceberg_persisted_records: IcebergPersistedRecords::default(),
+            // Persistence result.
+            persisted_records: PersistedRecords::default(),
             min_ongoing_flush_lsn: u64::MAX,
         }
     }
@@ -341,7 +341,7 @@ impl SnapshotTask {
         if !self.data_compaction_result.is_empty() {
             return false;
         }
-        if !self.iceberg_persisted_records.is_empty() {
+        if !self.persisted_records.is_empty() {
             return false;
         }
         true
@@ -350,7 +350,7 @@ impl SnapshotTask {
     pub fn should_create_snapshot(&self) -> bool {
         // If mooncake has new transaction commits.
         (self.commit_lsn_baseline > 0 && self.commit_lsn_baseline != self.prev_commit_lsn_baseline)
-            || self.force_empty_iceberg_payload
+            || self.force_empty_persistence_payload
         // If mooncake table has completed streaming transactions.
             || !self.new_streaming_xact.is_empty()
         // If mooncake table accumulated large enough writes.
@@ -359,9 +359,9 @@ impl SnapshotTask {
                 >= self.mooncake_table_config.snapshot_deletion_record_count()
             // If iceberg snapshot is already performed, update mooncake snapshot accordingly.
             // On local filesystem, potentially we could double storage as soon as possible.
-            || !self.iceberg_persisted_records.import_result.is_empty()
-            || !self.iceberg_persisted_records.index_merge_result.is_empty()
-            || !self.iceberg_persisted_records.data_compaction_result.is_empty()
+            || !self.persisted_records.import_result.is_empty()
+            || !self.persisted_records.index_merge_result.is_empty()
+            || !self.persisted_records.data_compaction_result.is_empty()
     }
 
     /// Get newly created data files, including both batch write ones and stream write ones.
@@ -424,7 +424,7 @@ impl SnapshotTask {
 #[derive(Clone, Debug, Default)]
 struct BackgroundTaskStatus {
     mooncake_snapshot_ongoing: bool,
-    iceberg_snapshot_ongoing: bool,
+    persistence_snapshot_ongoing: bool,
     index_merge_ongoing: bool,
     data_compaction_ongoing: bool,
 }
@@ -481,7 +481,7 @@ pub struct MooncakeTable {
     /// monotonically increasing.
     last_flush_lsn: Option<u64>,
     /// LSN of the latest iceberg snapshot.
-    last_iceberg_snapshot_lsn: Option<u64>,
+    last_persistence_snapshot_lsn: Option<u64>,
 
     /// Table notifier, which is used to sent multiple types of event completion information.
     table_notify: Option<Sender<TableEvent>>,
@@ -561,12 +561,12 @@ impl MooncakeTable {
         table_metadata.validate();
         let (table_snapshot_watch_sender, table_snapshot_watch_receiver) = watch::channel(u64::MAX);
         let (next_file_id, current_snapshot) = table_manager.load_snapshot_from_table().await?;
-        let last_iceberg_snapshot_lsn = current_snapshot.flush_lsn;
-        if let Some(last_iceberg_snapshot_lsn) = last_iceberg_snapshot_lsn {
+        let last_persistence_snapshot_lsn = current_snapshot.flush_lsn;
+        if let Some(last_persistence_snapshot_lsn) = last_persistence_snapshot_lsn {
             // We should NOT send the wal_highest_completion_lsn, because those events are not applied at this point yet.
             // They will replayed through the event stream, and re-applied to the table.
             table_snapshot_watch_sender
-                .send(last_iceberg_snapshot_lsn)
+                .send(last_persistence_snapshot_lsn)
                 .unwrap();
         }
 
@@ -603,7 +603,7 @@ impl MooncakeTable {
             streaming_batch_id_counter,
             iceberg_table_manager: Some(table_manager),
             last_flush_lsn: None,
-            last_iceberg_snapshot_lsn,
+            last_persistence_snapshot_lsn,
             table_notify: None,
             wal_manager,
             ongoing_flush_lsns: BTreeMap::new(),
@@ -673,84 +673,85 @@ impl MooncakeTable {
 
     /// Assert flush LSN doesn't regress.
     /// There're several cases for equal flush LSN, for example, force snapshot, table maintenance, etc.
-    fn assert_flush_lsn_on_iceberg_snapshot_res(
+    fn assert_flush_lsn_on_persistence_snapshot_res(
         persistence_lsn: Option<u64>,
-        iceberg_snapshot_res: &IcebergSnapshotResult,
+        persistence_snapshot_res: &PersistenceSnapshotResult,
     ) {
-        let flush_lsn = iceberg_snapshot_res.flush_lsn;
+        let flush_lsn = persistence_snapshot_res.flush_lsn;
         assert!(
                 persistence_lsn.is_none()
                     || persistence_lsn.unwrap() <= flush_lsn,
                 "Last iceberg snapshot LSN is {:?}, flush LSN is {:?}, imported data file number is {}, imported puffin file number is {}",
                 persistence_lsn,
                 flush_lsn,
-                iceberg_snapshot_res.import_result.new_data_files.len(),
-                iceberg_snapshot_res.import_result.puffin_blob_ref.len(),
+                persistence_snapshot_res.import_result.new_data_files.len(),
+                persistence_snapshot_res.import_result.puffin_blob_ref.len(),
             );
     }
 
     /// Set iceberg snapshot flush LSN, called after a snapshot operation.
-    pub(crate) fn set_iceberg_snapshot_res(&mut self, iceberg_snapshot_res: IcebergSnapshotResult) {
+    pub(crate) fn set_persistence_snapshot_res(
+        &mut self,
+        persistence_snapshot_res: PersistenceSnapshotResult,
+    ) {
         assert!(
             self.background_task_status_for_validation
-                .iceberg_snapshot_ongoing
+                .persistence_snapshot_ongoing
         );
         self.background_task_status_for_validation
-            .iceberg_snapshot_ongoing = false;
+            .persistence_snapshot_ongoing = false;
 
         // ---- Update mooncake table fields ----
-        let flush_lsn = iceberg_snapshot_res.flush_lsn;
-        Self::assert_flush_lsn_on_iceberg_snapshot_res(
-            self.last_iceberg_snapshot_lsn,
-            &iceberg_snapshot_res,
+        let flush_lsn = persistence_snapshot_res.flush_lsn;
+        Self::assert_flush_lsn_on_persistence_snapshot_res(
+            self.last_persistence_snapshot_lsn,
+            &persistence_snapshot_res,
         );
-        self.last_iceberg_snapshot_lsn = Some(flush_lsn);
+        self.last_persistence_snapshot_lsn = Some(flush_lsn);
 
-        if let Some(new_table_schema) = iceberg_snapshot_res.new_table_schema {
+        if let Some(new_table_schema) = persistence_snapshot_res.new_table_schema {
             assert!(Arc::ptr_eq(&self.metadata, &new_table_schema));
         }
 
         assert!(self.iceberg_table_manager.is_none());
-        self.iceberg_table_manager = Some(iceberg_snapshot_res.table_manager.unwrap());
+        self.iceberg_table_manager = Some(persistence_snapshot_res.table_manager.unwrap());
 
         // ---- Buffer iceberg persisted content to next snapshot task ---
         assert!(self.next_snapshot_task.committed_deletion_logs.is_empty());
         self.next_snapshot_task.committed_deletion_logs =
-            iceberg_snapshot_res.committed_deletion_logs;
+            persistence_snapshot_res.committed_deletion_logs;
 
         assert!(self
             .next_snapshot_task
-            .iceberg_persisted_records
+            .persisted_records
             .flush_lsn
             .is_none());
-        self.next_snapshot_task.iceberg_persisted_records.flush_lsn = Some(flush_lsn);
+        self.next_snapshot_task.persisted_records.flush_lsn = Some(flush_lsn);
 
         assert!(self
             .next_snapshot_task
-            .iceberg_persisted_records
+            .persisted_records
             .import_result
             .is_empty());
-        self.next_snapshot_task
-            .iceberg_persisted_records
-            .import_result = iceberg_snapshot_res.import_result;
+        self.next_snapshot_task.persisted_records.import_result =
+            persistence_snapshot_res.import_result;
 
         assert!(self
             .next_snapshot_task
-            .iceberg_persisted_records
+            .persisted_records
             .index_merge_result
             .is_empty());
-        self.next_snapshot_task
-            .iceberg_persisted_records
-            .index_merge_result = iceberg_snapshot_res.index_merge_result;
+        self.next_snapshot_task.persisted_records.index_merge_result =
+            persistence_snapshot_res.index_merge_result;
 
         assert!(self
             .next_snapshot_task
-            .iceberg_persisted_records
+            .persisted_records
             .data_compaction_result
             .is_empty());
         self.next_snapshot_task
-            .iceberg_persisted_records
-            .data_compaction_result = iceberg_snapshot_res.data_compaction_result;
+            .persisted_records
+            .data_compaction_result = persistence_snapshot_res.data_compaction_result;
     }
 
     /// Set file indices merge result, which will be sync-ed to mooncake and iceberg snapshot in the next periodic snapshot iteration.
@@ -827,12 +828,12 @@ impl MooncakeTable {
     /// Record iceberg snapshot completion result.
     pub(crate) fn record_iceberg_snapshot_completion(
         &self,
-        iceberg_snapshot_res: &IcebergSnapshotResult,
+        persistence_snapshot_res: &PersistenceSnapshotResult,
     ) {
         if let Some(event_replay_tx) = &self.event_replay_tx {
             let table_event = replay_events::create_iceberg_snapshot_event_completion(
-                iceberg_snapshot_res.uuid,
-                iceberg_snapshot_res.flush_lsn,
+                persistence_snapshot_res.uuid,
+                persistence_snapshot_res.flush_lsn,
             );
             event_replay_tx
                 .send(MooncakeTableEvent::IcebergSnapshotCompletion(table_event))
@@ -841,8 +842,8 @@ impl MooncakeTable {
     }
 
     /// Get iceberg snapshot flush LSN.
-    pub fn get_iceberg_snapshot_lsn(&self) -> Option<u64> {
-        self.last_iceberg_snapshot_lsn
+    pub fn get_persistence_snapshot_lsn(&self) -> Option<u64> {
+        self.last_persistence_snapshot_lsn
     }
 
     pub(crate) fn get_state_for_reader(
@@ -1103,8 +1104,8 @@ impl MooncakeTable {
     }
 
     /// Mark next iceberg snapshot as force, even if the payload is empty.
-    pub(crate) fn force_empty_iceberg_payload(&mut self) {
-        self.next_snapshot_task.force_empty_iceberg_payload = true;
+    pub(crate) fn force_empty_persistence_payload(&mut self) {
+        self.next_snapshot_task.force_empty_persistence_payload = true;
     }
 
     pub(crate) fn notify_snapshot_reader(&self, lsn: u64) {
@@ -1136,11 +1137,11 @@ impl MooncakeTable {
     /// * uuid: WAL persistence event unique id.
     #[must_use]
     pub(crate) fn do_wal_persistence_update(&mut self, uuid: uuid::Uuid) -> bool {
-        let latest_iceberg_snapshot_lsn = self.get_iceberg_snapshot_lsn();
+        let latest_persistence_snapshot_lsn = self.get_persistence_snapshot_lsn();
 
         let wal_persistence_update_result = self
             .wal_manager
-            .prepare_persistent_update(latest_iceberg_snapshot_lsn);
+            .prepare_persistent_update(latest_persistence_snapshot_lsn);
 
         if wal_persistence_update_result.should_do_persistence() {
             let event_sender_clone = self.table_notify.as_ref().unwrap().clone();
@@ -1534,7 +1535,7 @@ impl MooncakeTable {
     /// Persist an iceberg snapshot.
     async fn persist_iceberg_snapshot_impl(
         mut iceberg_table_manager: Box<dyn TableManager>,
-        snapshot_payload: IcebergSnapshotPayload,
+        snapshot_payload: PersistenceSnapshotPayload,
         table_notify: Sender<TableEvent>,
         table_auto_incr_ids: std::ops::Range<u32>,
         table_event_id: uuid::Uuid,
@@ -1588,8 +1589,8 @@ impl MooncakeTable {
         // Notify on event error.
         if iceberg_persistence_res.is_err() {
             table_notify
-                .send(TableEvent::IcebergSnapshotResult {
-                    iceberg_snapshot_result: Err(iceberg_persistence_res.unwrap_err()),
+                .send(TableEvent::PersistenceSnapshotResult {
+                    persistence_snapshot_result: Err(iceberg_persistence_res.unwrap_err()),
                 })
                 .await
                 .unwrap();
@@ -1619,13 +1620,13 @@ impl MooncakeTable {
             iceberg_persistence_res.remote_file_indices.len()
         );
 
-        let snapshot_result = IcebergSnapshotResult {
+        let snapshot_result = PersistenceSnapshotResult {
             uuid: table_event_id,
             table_manager: Some(iceberg_table_manager),
             flush_lsn,
             new_table_schema,
             committed_deletion_logs,
-            import_result: IcebergSnapshotImportResult {
+            import_result: PersistenceSnapshotImportResult {
                 new_data_files: iceberg_persistence_res.remote_data_files
                     [0..new_data_files_cutoff_index_1]
                     .to_vec(),
@@ -1634,13 +1635,13 @@ impl MooncakeTable {
                     [0..new_file_indices_cutoff_index_1]
                     .to_vec(),
             },
-            index_merge_result: IcebergSnapshotIndexMergeResult {
+            index_merge_result: PersistenceSnapshotIndexMergeResult {
                 new_file_indices_imported: iceberg_persistence_res.remote_file_indices
                     [new_file_indices_cutoff_index_1..new_file_indices_cutoff_index_2]
                     .to_vec(),
                 old_file_indices_removed: old_file_indices_to_remove_by_index_merge,
             },
-            data_compaction_result: IcebergSnapshotDataCompactionResult {
+            data_compaction_result: PersistenceSnapshotDataCompactionResult {
                 new_data_files_imported: iceberg_persistence_res.remote_data_files
                     [new_data_files_cutoff_index_1..new_data_files_cutoff_index_2]
                     .to_vec(),
@@ -1656,24 +1657,27 @@ impl MooncakeTable {
 
         // Send back completion notification to table handler.
         table_notify
-            .send(TableEvent::IcebergSnapshotResult {
-                iceberg_snapshot_result: Ok(snapshot_result),
+            .send(TableEvent::PersistenceSnapshotResult {
+                persistence_snapshot_result: Ok(snapshot_result),
             })
             .await
             .unwrap();
     }
 
     /// Create an iceberg snapshot.
-    pub(crate) fn persist_iceberg_snapshot(&mut self, snapshot_payload: IcebergSnapshotPayload) {
+    pub(crate) fn persist_iceberg_snapshot(
+        &mut self,
+        snapshot_payload: PersistenceSnapshotPayload,
+    ) {
         // Check invariant: there's at most one ongoing iceberg snapshot.
         let iceberg_table_manager = self.iceberg_table_manager.take().unwrap();
         assert!(
             !self
                 .background_task_status_for_validation
-                .iceberg_snapshot_ongoing
+                .persistence_snapshot_ongoing
         );
         self.background_task_status_for_validation
-            .iceberg_snapshot_ongoing = true;
+            .persistence_snapshot_ongoing = true;
 
         // Create a detached task, whose completion will be notified separately.
         let new_file_ids_to_create = snapshot_payload.get_new_file_ids_num();
@@ -1715,13 +1719,13 @@ mod mooncake_tests {
     #[test]
     fn test_flush_lsn_assertion() {
         // Only iceberg imported result.
-        let iceberg_snapshot_result = IcebergSnapshotResult {
+        let persistence_snapshot_result = PersistenceSnapshotResult {
             uuid: uuid::Uuid::new_v4(),
             table_manager: None,
             flush_lsn: 1,
             new_table_schema: None,
             committed_deletion_logs: HashSet::new(),
-            import_result: IcebergSnapshotImportResult {
+            import_result: PersistenceSnapshotImportResult {
                 new_data_files: vec![create_data_file(
                     /*file_id=*/ 0,
                     "file_path".to_string(),
@@ -1729,26 +1733,26 @@ mod mooncake_tests {
                 puffin_blob_ref: HashMap::new(),
                 new_file_indices: vec![],
             },
-            index_merge_result: IcebergSnapshotIndexMergeResult::default(),
-            data_compaction_result: IcebergSnapshotDataCompactionResult::default(),
+            index_merge_result: PersistenceSnapshotIndexMergeResult::default(),
+            data_compaction_result: PersistenceSnapshotDataCompactionResult::default(),
             evicted_files_to_delete: Vec::new(),
         };
         // Valid snapshot result.
-        MooncakeTable::assert_flush_lsn_on_iceberg_snapshot_res(
+        MooncakeTable::assert_flush_lsn_on_persistence_snapshot_res(
             /*persistence_lsn=*/ None,
-            &iceberg_snapshot_result,
+            &persistence_snapshot_result,
         );
         // Invalid snapshot result.
-        let res_copy = iceberg_snapshot_result.clone();
+        let res_copy = persistence_snapshot_result.clone();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            MooncakeTable::assert_flush_lsn_on_iceberg_snapshot_res(Some(2), &res_copy);
+            MooncakeTable::assert_flush_lsn_on_persistence_snapshot_res(Some(2), &res_copy);
         }));
         assert!(result.is_err());
 
         // Only data compaction result.
-        let mut res_copy = iceberg_snapshot_result.clone();
-        res_copy.import_result = IcebergSnapshotImportResult::default();
-        res_copy.data_compaction_result = IcebergSnapshotDataCompactionResult {
+        let mut res_copy = persistence_snapshot_result.clone();
+        res_copy.import_result = PersistenceSnapshotImportResult::default();
+        res_copy.data_compaction_result = PersistenceSnapshotDataCompactionResult {
             old_data_files_removed: vec![create_data_file(
                 /*file_id=*/ 0,
                 "file_path".to_string(),
@@ -1756,19 +1760,19 @@ mod mooncake_tests {
             ..Default::default()
         };
         // Valid snapshot result.
-        MooncakeTable::assert_flush_lsn_on_iceberg_snapshot_res(
+        MooncakeTable::assert_flush_lsn_on_persistence_snapshot_res(
             /*persistence_lsn=*/ Some(1),
             &res_copy,
         );
         // Invalid snapshot result.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            MooncakeTable::assert_flush_lsn_on_iceberg_snapshot_res(Some(2), &res_copy);
+            MooncakeTable::assert_flush_lsn_on_persistence_snapshot_res(Some(2), &res_copy);
         }));
         assert!(result.is_err());
 
         // Contain both import and data compaction result.
-        let mut res_copy = iceberg_snapshot_result.clone();
-        res_copy.data_compaction_result = IcebergSnapshotDataCompactionResult {
+        let mut res_copy = persistence_snapshot_result.clone();
+        res_copy.data_compaction_result = PersistenceSnapshotDataCompactionResult {
             old_data_files_removed: vec![create_data_file(
                 /*file_id=*/ 0,
                 "file_path".to_string(),
@@ -1776,7 +1780,7 @@ mod mooncake_tests {
             ..Default::default()
         };
         // Valid snapshot result.
-        MooncakeTable::assert_flush_lsn_on_iceberg_snapshot_res(
+        MooncakeTable::assert_flush_lsn_on_persistence_snapshot_res(
             /*persistence_lsn=*/ Some(1),
             &res_copy,
         );

@@ -96,8 +96,8 @@ pub(crate) struct TableHandlerState {
     // - snapshot ongoing = true, result consumed = true: iceberg snapshot is ongoing
     // - snapshot ongoing = false, result consumed = false: iceberg snapshot completes, but wait for mooncake snapshot to consume the result
     //
-    pub(crate) iceberg_snapshot_result_consumed: bool,
-    pub(crate) iceberg_snapshot_ongoing: bool,
+    pub(crate) persistence_snapshot_result_consumed: bool,
+    pub(crate) persistence_snapshot_ongoing: bool,
     // Whether there's an ongoing mooncake snapshot operation.
     pub(crate) mooncake_snapshot_ongoing: bool,
     // Largest pending force snapshot LSN.
@@ -136,18 +136,18 @@ impl TableHandlerState {
         table_maintenance_completion_tx: broadcast::Sender<Result<()>>,
         force_snapshot_completion_tx: watch::Sender<Option<Result<u64>>>,
         initial_persistence_lsn: Option<u64>,
-        iceberg_snapshot_lsn: Option<u64>,
+        persistence_snapshot_lsn: Option<u64>,
     ) -> Self {
         Self {
-            iceberg_snapshot_result_consumed: true,
-            iceberg_snapshot_ongoing: false,
+            persistence_snapshot_result_consumed: true,
+            persistence_snapshot_ongoing: false,
             mooncake_snapshot_ongoing: false,
             initial_persistence_lsn,
             last_unflushed_commit_lsn: None,
             latest_commit_lsn: None,
             special_table_state: SpecialTableState::Normal,
             // Force snapshot fields.
-            table_consistent_view_lsn: iceberg_snapshot_lsn,
+            table_consistent_view_lsn: persistence_snapshot_lsn,
             largest_force_snapshot_lsn: None,
             force_snapshot_completion_tx,
             // Table maintenance fields.
@@ -252,23 +252,23 @@ impl TableHandlerState {
     /// In the above situation, LSN-1 is "iceberg snapshot LSN", while LSN-2 is "persisted table LSN".
     pub(crate) fn get_persisted_table_lsn(
         &self,
-        iceberg_snapshot_lsn: Option<u64>,
+        persistence_snapshot_lsn: Option<u64>,
         replication_lsn: u64,
     ) -> u64 {
         // Case-1: there're no activities in the current table, replication LSN indicates current status.
-        if iceberg_snapshot_lsn.is_none() && self.table_consistent_view_lsn.is_none() {
+        if persistence_snapshot_lsn.is_none() && self.table_consistent_view_lsn.is_none() {
             return replication_lsn;
         }
 
         // Case-2: if there're no updates since last iceberg snapshot, replication LSN indicates persisted table LSN.
-        if iceberg_snapshot_lsn == self.table_consistent_view_lsn {
+        if persistence_snapshot_lsn == self.table_consistent_view_lsn {
             // Notice: replication LSN comes from replication events, so if all events have been processed (i.e., a clean recovery case), replication LSN is 0.
-            return std::cmp::max(replication_lsn, iceberg_snapshot_lsn.unwrap());
+            return std::cmp::max(replication_lsn, persistence_snapshot_lsn.unwrap());
         }
 
         // Case-3: iceberg snapshot LSN indicates the persisted table LSN.
         // No guarantee an iceberg snapshot has been persisted here.
-        iceberg_snapshot_lsn.unwrap_or(0)
+        persistence_snapshot_lsn.unwrap_or(0)
     }
 
     /// Notify the persisted table LSN.
@@ -288,11 +288,11 @@ impl TableHandlerState {
     /// Update requested iceberg snapshot LSNs, if applicable.
     pub(crate) fn update_iceberg_persisted_lsn(
         &mut self,
-        iceberg_snapshot_lsn: u64,
+        persistence_snapshot_lsn: u64,
         replication_lsn: u64,
     ) {
         let persisted_table_lsn =
-            self.get_persisted_table_lsn(Some(iceberg_snapshot_lsn), replication_lsn);
+            self.get_persisted_table_lsn(Some(persistence_snapshot_lsn), replication_lsn);
         self.notify_persisted_table_lsn(persisted_table_lsn);
 
         if let Some(largest_force_snapshot_lsn) = self.largest_force_snapshot_lsn {
@@ -321,7 +321,7 @@ impl TableHandlerState {
         if self.mooncake_snapshot_ongoing {
             return false;
         }
-        if self.iceberg_snapshot_ongoing {
+        if self.persistence_snapshot_ongoing {
             return false;
         }
         if self.wal_persist_ongoing {
@@ -373,13 +373,13 @@ impl TableHandlerState {
         };
     }
 
-    pub(crate) fn should_complete_alter_table(&self, iceberg_snapshot_lsn: u64) -> bool {
+    pub(crate) fn should_complete_alter_table(&self, persistence_snapshot_lsn: u64) -> bool {
         if let SpecialTableState::AlterTable {
             alter_table_lsn, ..
         } = self.special_table_state
         {
-            ma::assert_le!(iceberg_snapshot_lsn, alter_table_lsn);
-            iceberg_snapshot_lsn == alter_table_lsn
+            ma::assert_le!(persistence_snapshot_lsn, alter_table_lsn);
+            persistence_snapshot_lsn == alter_table_lsn
         } else {
             false
         }
@@ -423,11 +423,11 @@ impl TableHandlerState {
     pub(crate) fn can_initiate_iceberg_snapshot(
         flush_lsn: u64,
         min_ongoing_flush_lsn: u64,
-        iceberg_snapshot_result_consumed: bool,
-        iceberg_snapshot_ongoing: bool,
+        persistence_snapshot_result_consumed: bool,
+        persistence_snapshot_ongoing: bool,
     ) -> bool {
-        iceberg_snapshot_result_consumed
-            && !iceberg_snapshot_ongoing
+        persistence_snapshot_result_consumed
+            && !persistence_snapshot_ongoing
             && flush_lsn < min_ongoing_flush_lsn
     }
 
@@ -435,12 +435,12 @@ impl TableHandlerState {
         // Validate iceberg snapshot state before mooncake snapshot creation.
         //
         // Assertion on impossible state.
-        assert!(!self.iceberg_snapshot_ongoing || self.iceberg_snapshot_result_consumed);
+        assert!(!self.persistence_snapshot_ongoing || self.persistence_snapshot_result_consumed);
 
         // If there's pending iceberg snapshot result unconsumed, the following mooncake snapshot will properly handle it.
-        if !self.iceberg_snapshot_result_consumed {
-            self.iceberg_snapshot_result_consumed = true;
-            self.iceberg_snapshot_ongoing = false;
+        if !self.persistence_snapshot_result_consumed {
+            self.persistence_snapshot_result_consumed = true;
+            self.persistence_snapshot_ongoing = false;
         }
     }
 
@@ -469,7 +469,7 @@ impl TableHandlerState {
         }
     }
     fn get_iceberg_snapshot_option(&self) -> IcebergSnapshotOption {
-        if self.iceberg_snapshot_ongoing {
+        if self.persistence_snapshot_ongoing {
             IcebergSnapshotOption::Skip
         } else {
             IcebergSnapshotOption::BestEffort(uuid::Uuid::new_v4())

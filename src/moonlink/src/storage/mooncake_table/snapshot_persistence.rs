@@ -2,11 +2,11 @@ use crate::create_data_file;
 use crate::storage::iceberg::puffin_utils::PuffinBlobRef;
 use crate::storage::index::FileIndex;
 use crate::storage::mooncake_table::snapshot::CommittedDeletionToPersist;
-use crate::storage::mooncake_table::table_snapshot::IcebergSnapshotDataCompactionPayload;
-use crate::storage::mooncake_table::IcebergSnapshotPayload;
+use crate::storage::mooncake_table::table_snapshot::PersistenceSnapshotDataCompactionPayload;
+use crate::storage::mooncake_table::PersistenceSnapshotPayload;
 use crate::storage::mooncake_table::SnapshotTask;
 use crate::storage::mooncake_table::{
-    IcebergSnapshotImportPayload, IcebergSnapshotIndexMergePayload,
+    PersistenceSnapshotImportPayload, PersistenceSnapshotIndexMergePayload,
 };
 use crate::storage::snapshot_options::IcebergSnapshotOption;
 use crate::storage::storage_utils::FileId;
@@ -28,23 +28,23 @@ impl SnapshotTableState {
         self.committed_deletion_log.len() >= deletion_record_snapshot_threshold
     }
 
-    pub(super) fn get_iceberg_snapshot_payload(
+    pub(super) fn get_persistence_snapshot_payload(
         &self,
         opt: &IcebergSnapshotOption,
         flush_lsn: u64,
         committed_deletion_to_persist: CommittedDeletionToPersist,
-    ) -> IcebergSnapshotPayload {
-        IcebergSnapshotPayload {
+    ) -> PersistenceSnapshotPayload {
+        PersistenceSnapshotPayload {
             uuid: opt.get_event_id().unwrap(),
             flush_lsn,
             new_table_schema: None,
             committed_deletion_logs: committed_deletion_to_persist.committed_deletion_logs,
-            import_payload: IcebergSnapshotImportPayload {
+            import_payload: PersistenceSnapshotImportPayload {
                 data_files: self.unpersisted_records.get_unpersisted_data_files(),
                 new_deletion_vector: committed_deletion_to_persist.new_deletions_to_persist,
                 file_indices: self.unpersisted_records.get_unpersisted_file_indices(),
             },
-            index_merge_payload: IcebergSnapshotIndexMergePayload {
+            index_merge_payload: PersistenceSnapshotIndexMergePayload {
                 new_file_indices_to_import: self
                     .unpersisted_records
                     .get_merged_file_indices_to_add(),
@@ -52,7 +52,7 @@ impl SnapshotTableState {
                     .unpersisted_records
                     .get_merged_file_indices_to_remove(),
             },
-            data_compaction_payload: IcebergSnapshotDataCompactionPayload {
+            data_compaction_payload: PersistenceSnapshotDataCompactionPayload {
                 new_data_files_to_import: self
                     .unpersisted_records
                     .get_compacted_data_files_to_add(),
@@ -243,10 +243,10 @@ impl SnapshotTableState {
         // Get persisted data files and file indices.
         // TODO(hjiang): Revisit whether we need separate fields in snapshot task.
         let persisted_data_files = task
-            .iceberg_persisted_records
+            .persisted_records
             .get_data_files_to_reflect_persistence();
         let (index_blocks_to_remove, persisted_file_indices) = task
-            .iceberg_persisted_records
+            .persisted_records
             .get_file_indices_to_reflect_persistence();
 
         // Record data files number and file indices number for persistence reflection, which is not supposed to change.
@@ -268,10 +268,7 @@ impl SnapshotTableState {
         // Step-3: Handle persisted deletion vector.
         let cur_evicted_files = self
             .update_deletion_vector_to_persisted(
-                task.iceberg_persisted_records
-                    .import_result
-                    .puffin_blob_ref
-                    .clone(),
+                task.persisted_records.import_result.puffin_blob_ref.clone(),
             )
             .await;
         evicted_files_to_delete.extend(cur_evicted_files);

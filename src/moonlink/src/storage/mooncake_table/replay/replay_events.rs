@@ -6,10 +6,10 @@ use serde::{Deserialize, Serialize};
 use crate::row::MoonlinkRow;
 use crate::storage::compaction::table_compaction::SingleFileToCompact;
 use crate::storage::iceberg::puffin_utils::PuffinBlobRef;
-use crate::storage::mooncake_table::table_snapshot::IcebergSnapshotDataCompactionPayload;
+use crate::storage::mooncake_table::table_snapshot::PersistenceSnapshotDataCompactionPayload;
 use crate::storage::mooncake_table::{
-    DataCompactionPayload, FileIndiceMergePayload, IcebergSnapshotImportPayload,
-    IcebergSnapshotIndexMergePayload, IcebergSnapshotPayload,
+    DataCompactionPayload, FileIndiceMergePayload, PersistenceSnapshotImportPayload,
+    PersistenceSnapshotIndexMergePayload, PersistenceSnapshotPayload,
 };
 use crate::storage::snapshot_options::MaintenanceOption;
 use crate::storage::snapshot_options::SnapshotOption;
@@ -97,7 +97,7 @@ pub struct MooncakeSnapshotEventCompletion {
 /// Iceberg snapshot
 /// =====================
 ///
-/// For the ease of serde, replay event only stores necessary part of [`IcebergSnapshotImportPayload`].
+/// For the ease of serde, replay event only stores necessary part of [`PersistenceSnapshotImportPayload`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IcebergImportEvent {
     /// New data files to introduce to the iceberg table.
@@ -109,7 +109,7 @@ pub struct IcebergImportEvent {
     pub file_indices: Vec<Vec<FileId>>,
 }
 
-/// For the ease of serde, replay event only stores necessary part of [`IcebergSnapshotIndexMergePayload`].
+/// For the ease of serde, replay event only stores necessary part of [`PersistenceSnapshotIndexMergePayload`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IcebergIndexMergeEvent {
     /// New file indices to import.
@@ -120,7 +120,7 @@ pub struct IcebergIndexMergeEvent {
     pub old_file_indices: Vec<Vec<FileId>>,
 }
 
-/// For the ease of serde, replay event only stores necessary part of [`IcebergSnapshotDataCompactionPayload`].
+/// For the ease of serde, replay event only stores necessary part of [`PersistenceSnapshotDataCompactionPayload`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IcebergDataCompactionEvent {
     /// New data files to import.
@@ -135,7 +135,7 @@ pub struct IcebergDataCompactionEvent {
     pub old_file_indices_to_remove: Vec<Vec<FileId>>,
 }
 
-/// For the ease of serde, replay event only stores necessary part of [`IcebergSnapshotPayload`].
+/// For the ease of serde, replay event only stores necessary part of [`PersistenceSnapshotPayload`].
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct IcebergSnapshotEventInitiation {
     /// Event id.
@@ -308,8 +308,8 @@ pub fn create_mooncake_snapshot_event_completion(
     MooncakeSnapshotEventCompletion { uuid, lsn }
 }
 /// Create iceberg snapshot events.
-pub fn get_iceberg_snapshot_import_payload(
-    payload: &IcebergSnapshotImportPayload,
+pub fn get_persistence_snapshot_import_payload(
+    payload: &PersistenceSnapshotImportPayload,
 ) -> IcebergImportEvent {
     IcebergImportEvent {
         data_files: payload
@@ -336,7 +336,7 @@ pub fn get_iceberg_snapshot_import_payload(
     }
 }
 pub fn get_iceberg_index_merge_payload(
-    payload: &IcebergSnapshotIndexMergePayload,
+    payload: &PersistenceSnapshotIndexMergePayload,
 ) -> IcebergIndexMergeEvent {
     IcebergIndexMergeEvent {
         new_file_indices: payload
@@ -364,7 +364,7 @@ pub fn get_iceberg_index_merge_payload(
     }
 }
 pub fn get_iceberg_data_compaction_payload(
-    payload: &IcebergSnapshotDataCompactionPayload,
+    payload: &PersistenceSnapshotDataCompactionPayload,
 ) -> IcebergDataCompactionEvent {
     IcebergDataCompactionEvent {
         new_data_files_to_import: payload
@@ -403,13 +403,13 @@ pub fn get_iceberg_data_compaction_payload(
 }
 pub fn create_iceberg_snapshot_event_initiation(
     uuid: uuid::Uuid,
-    payload: &IcebergSnapshotPayload,
+    payload: &PersistenceSnapshotPayload,
 ) -> IcebergSnapshotEventInitiation {
     IcebergSnapshotEventInitiation {
         uuid,
         flush_lsn: payload.flush_lsn,
         committed_deletion_logs: payload.committed_deletion_logs.clone(),
-        import_payload: get_iceberg_snapshot_import_payload(&payload.import_payload),
+        import_payload: get_persistence_snapshot_import_payload(&payload.import_payload),
         index_merge_payload: get_iceberg_index_merge_payload(&payload.index_merge_payload),
         data_compaction_payload: get_iceberg_data_compaction_payload(
             &payload.data_compaction_payload,

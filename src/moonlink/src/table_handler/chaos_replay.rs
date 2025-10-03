@@ -10,7 +10,7 @@ use crate::storage::mooncake_table::DiskSliceWriter;
 use crate::storage::mooncake_table::MooncakeTable;
 use crate::storage::mooncake_table::TableMetadata;
 use crate::storage::mooncake_table::{
-    table_creation_test_utils::*, FileIndiceMergeResult, IcebergSnapshotResult,
+    table_creation_test_utils::*, FileIndiceMergeResult, PersistenceSnapshotResult,
 };
 use crate::storage::mooncake_table_config::DiskSliceWriterConfig;
 use crate::table_handler::chaos_table_metadata::ReplayTableMetadata;
@@ -44,7 +44,7 @@ struct CompletedMooncakeSnapshot {
 #[derive(Clone, Debug)]
 struct CompletedIcebergSnapshot {
     /// Result of iceberg snapshot.
-    iceberg_snapshot_result: IcebergSnapshotResult,
+    persistence_snapshot_result: PersistenceSnapshotResult,
 }
 
 #[derive(Clone, Debug)]
@@ -234,10 +234,10 @@ pub(crate) async fn replay(replay_filepath: &str) {
 
     // Pending background tasks to issue.
     // Maps from event id to payload.
-    let pending_iceberg_snapshot_payloads = Arc::new(Mutex::new(HashMap::new()));
+    let pending_persistence_snapshot_payloads = Arc::new(Mutex::new(HashMap::new()));
     let pending_index_merge_payloads = Arc::new(Mutex::new(HashMap::new()));
     let pending_data_compaction_payloads = Arc::new(Mutex::new(HashMap::new()));
-    let pending_iceberg_snapshot_payloads_clone = pending_iceberg_snapshot_payloads.clone();
+    let pending_persistence_snapshot_payloads_clone = pending_persistence_snapshot_payloads.clone();
     let pending_index_merge_payloads_clone = pending_index_merge_payloads.clone();
     let pending_data_compaction_payloads_clone = pending_data_compaction_payloads.clone();
     // TODO(hjiang): For data compaction payloads, if compaction is not taken for this particular payload, we need to decrement reference counts for all pinned files.
@@ -309,15 +309,15 @@ pub(crate) async fn replay(replay_filepath: &str) {
                     };
 
                     // Fill in background tasks payload to fill in.
-                    if let Some(iceberg_snapshot_payload) = &completed_mooncake_snapshot
+                    if let Some(persistence_snapshot_payload) = &completed_mooncake_snapshot
                         .mooncake_snapshot_result
-                        .iceberg_snapshot_payload
+                        .persistence_snapshot_payload
                     {
-                        let mut guard = pending_iceberg_snapshot_payloads.lock().await;
+                        let mut guard = pending_persistence_snapshot_payloads.lock().await;
                         assert!(guard
                             .insert(
-                                iceberg_snapshot_payload.uuid,
-                                iceberg_snapshot_payload.clone()
+                                persistence_snapshot_payload.uuid,
+                                persistence_snapshot_payload.clone()
                             )
                             .is_none());
                     }
@@ -351,16 +351,16 @@ pub(crate) async fn replay(replay_filepath: &str) {
                         .is_none());
                     event_notification.notify_waiters();
                 }
-                TableEvent::IcebergSnapshotResult {
-                    iceberg_snapshot_result,
+                TableEvent::PersistenceSnapshotResult {
+                    persistence_snapshot_result,
                 } => {
-                    let iceberg_snapshot_result = iceberg_snapshot_result.unwrap();
+                    let persistence_snapshot_result = persistence_snapshot_result.unwrap();
                     let mut guard = completed_iceberg_snapshots_clone.lock().await;
                     assert!(guard
                         .insert(
-                            iceberg_snapshot_result.uuid,
+                            persistence_snapshot_result.uuid,
                             CompletedIcebergSnapshot {
-                                iceberg_snapshot_result
+                                persistence_snapshot_result
                             }
                         )
                         .is_none());
@@ -602,7 +602,7 @@ pub(crate) async fn replay(replay_filepath: &str) {
             MooncakeTableEvent::IcebergSnapshotInitiation(snapshot_initiation_event) => {
                 assert!(ongoing_iceberg_snapshot_id.insert(snapshot_initiation_event.uuid));
                 let payload = {
-                    let mut guard = pending_iceberg_snapshot_payloads_clone.lock().await;
+                    let mut guard = pending_persistence_snapshot_payloads_clone.lock().await;
                     guard.remove(&snapshot_initiation_event.uuid).unwrap()
                 };
                 table.persist_iceberg_snapshot(payload);
@@ -615,14 +615,14 @@ pub(crate) async fn replay(replay_filepath: &str) {
                         guard.remove(&snapshot_completion_event.uuid)
                     };
                     if let Some(completed_iceberg_snapshot) = completed_iceberg_snapshot_event {
-                        let iceberg_snapshot_result =
-                            completed_iceberg_snapshot.iceberg_snapshot_result;
+                        let persistence_snapshot_result =
+                            completed_iceberg_snapshot.persistence_snapshot_result;
                         io_utils::delete_local_files(
-                            &iceberg_snapshot_result.evicted_files_to_delete,
+                            &persistence_snapshot_result.evicted_files_to_delete,
                         )
                         .await
                         .unwrap();
-                        table.set_iceberg_snapshot_res(iceberg_snapshot_result);
+                        table.set_persistence_snapshot_res(persistence_snapshot_result);
                         break;
                     }
                     // Otherwise block until the corresponding flush event completes.

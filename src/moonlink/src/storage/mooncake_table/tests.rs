@@ -522,7 +522,7 @@ async fn test_table_recovery() {
     )
     .await
     .unwrap();
-    assert_eq!(recovered_table.last_iceberg_snapshot_lsn.unwrap(), 100);
+    assert_eq!(recovered_table.last_persistence_snapshot_lsn.unwrap(), 100);
 }
 
 /// ---- Mock unit test ----
@@ -626,19 +626,19 @@ async fn test_snapshot_store_failure() {
         .await
         .unwrap();
 
-    let (_, iceberg_snapshot_payload, _, _, evicted_data_files_cache) =
+    let (_, persistence_snapshot_payload, _, _, evicted_data_files_cache) =
         create_mooncake_snapshot_for_test(&mut table, &mut event_completion_rx).await;
     for cur_file in evicted_data_files_cache.into_iter() {
         tokio::fs::remove_file(&cur_file).await.unwrap();
     }
 
-    let iceberg_snapshot_result = create_iceberg_snapshot(
+    let persistence_snapshot_result = create_iceberg_snapshot(
         &mut table,
-        iceberg_snapshot_payload,
+        persistence_snapshot_payload,
         &mut event_completion_rx,
     )
     .await;
-    assert!(iceberg_snapshot_result.is_err());
+    assert!(persistence_snapshot_result.is_err());
 }
 
 #[tokio::test]
@@ -1790,21 +1790,21 @@ async fn test_iceberg_snapshot_blocked_by_ongoing_flushes() -> Result<()> {
     assert!(created, "Mooncake snapshot should be created");
 
     // Wait for mooncake snapshot completion
-    let (commit_lsn, iceberg_snapshot_payload, _, _, _) =
+    let (commit_lsn, persistence_snapshot_payload, _, _, _) =
         sync_mooncake_snapshot(&mut table, &mut event_completion_rx).await;
 
     assert_eq!(commit_lsn, 2, "Should have committed data up to LSN 2");
 
     // Test the table handler constraint logic
-    if let Some(payload) = iceberg_snapshot_payload {
+    if let Some(payload) = persistence_snapshot_payload {
         let min_pending = table.get_min_ongoing_flush_lsn();
 
         // The table handler should block this iceberg snapshot due to pending flushes
         let can_initiate = TableHandlerState::can_initiate_iceberg_snapshot(
             payload.flush_lsn,
             min_pending,
-            true,  // iceberg_snapshot_result_consumed
-            false, // iceberg_snapshot_ongoing
+            true,  // persistence_snapshot_result_consumed
+            false, // persistence_snapshot_ongoing
         );
 
         assert!(!can_initiate,
@@ -1827,11 +1827,11 @@ async fn test_iceberg_snapshot_blocked_by_ongoing_flushes() -> Result<()> {
     });
     assert!(created, "Second mooncake snapshot should be created");
 
-    let (_, iceberg_snapshot_payload, _, _, _) =
+    let (_, persistence_snapshot_payload, _, _, _) =
         sync_mooncake_snapshot(&mut table, &mut event_completion_rx).await;
 
     // Now table handler should allow iceberg snapshot
-    if let Some(payload) = iceberg_snapshot_payload {
+    if let Some(payload) = persistence_snapshot_payload {
         let min_pending = table.get_min_ongoing_flush_lsn();
         let can_initiate = TableHandlerState::can_initiate_iceberg_snapshot(
             payload.flush_lsn,
@@ -1892,11 +1892,11 @@ async fn test_out_of_order_flush_completion_with_iceberg_snapshots() -> Result<(
     });
     assert!(created);
 
-    let (_, iceberg_snapshot_payload, _, _, _) =
+    let (_, persistence_snapshot_payload, _, _, _) =
         sync_mooncake_snapshot(&mut table, &mut event_completion_rx).await;
 
     // Test constraint with min pending flush LSN = 10
-    if let Some(payload) = iceberg_snapshot_payload {
+    if let Some(payload) = persistence_snapshot_payload {
         let can_initiate = TableHandlerState::can_initiate_iceberg_snapshot(
             payload.flush_lsn,
             10, // min_ongoing_flush_lsn

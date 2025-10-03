@@ -37,8 +37,8 @@ use tokio::sync::mpsc::Receiver;
 
 impl MooncakeTable {
     #[cfg(test)]
-    pub(crate) fn set_iceberg_snapshot_lsn(&mut self, lsn: u64) {
-        self.last_iceberg_snapshot_lsn = Some(lsn);
+    pub(crate) fn set_persistence_snapshot_lsn(&mut self, lsn: u64) {
+        self.last_persistence_snapshot_lsn = Some(lsn);
     }
 }
 
