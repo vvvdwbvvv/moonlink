@@ -78,4 +78,12 @@ async fn test_basic_store_and_load() {
     assert_eq!(next_file_id, 1);
     assert_eq!(snapshot.disk_files.len(), 1);
     assert_eq!(snapshot.flush_lsn.unwrap(), TEST_FLUSH_LSN);
+
+    // Drop table and check.
+    delta_table_manager.drop_table().await.unwrap();
+    // Explicitly drop the file handle to release the reference count within the unix filesystem.
+    drop(temp_dir);
+
+    let dir_exists = tokio::fs::try_exists(table_path).await.unwrap();
+    assert!(!dir_exists);
 }
